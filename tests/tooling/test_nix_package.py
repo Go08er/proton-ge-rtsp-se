@@ -34,7 +34,7 @@ class PackageArguments(unittest.TestCase):
     def test_default_uses_pinned_release_not_nixpkgs_src(self):
         result = self.evaluate()
         self.assertTrue(result['url'].endswith('/se2/proton-ge-11-9-rtsp-se2.tar.gz'))
-        self.assertEqual(result['hash'], '@SE2_BINARY_SRI@')
+        self.assertEqual(result['hash'], 'sha256-BWgHn5aFtGR+sxSQ6p5kyk3OyLOuYEaOZrNsXGnbFZE=')
 
     def test_explicit_local_archive(self):
         self.assertEqual(self.evaluate('{ localArchive = "synthetic-local-archive"; }'),

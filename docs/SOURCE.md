@@ -21,7 +21,7 @@ Patches modifying upstream files follow the licenses of those files.
 - Pin: `config/ge-proton11-9-se2.env`; this selects the upstream launcher.
 - Complete GE root gitlinks: `release-manifests/GE-Proton11-9.manifest.tsv`
   (43 registered submodules).
-- All @SE2_SUBMODULE_COUNT@ initialized top-level/nested submodule revisions:
+- All 98 initialized top-level/nested submodule revisions:
   release asset `SUBMODULES.tsv` (source revisions, not a count of compiled
   components).
 - Contrib inputs: `config/ge-build-contrib-01bfbf67-full-ge.tsv` (16 entries).
