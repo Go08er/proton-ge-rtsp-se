@@ -1,0 +1,134 @@
+From: RTSP-on-GE contributors
+Subject: [PATCH] winedmo: Expose the existing MPEG layer 1/2 audio decoder
+
+Register canonical MF MPEG audio in the existing generic audio MFT. The
+pinned FFmpeg MP2 decoder uses the shared MPEG audio callback, which reads
+the layer from each sync frame and already decodes layer 1 or 2. No new
+parser or decoder is introduced; this is for complete demux-framed samples.
+
+Accept self-describing frames without out-of-band data. If callers supply
+MPEG1WAVEFORMAT metadata, require the full extension and layer 1 or 2;
+reject truncated, zero, combined or layer-3 descriptions. Preserve MP3's
+separate subtype/decoder registration and all previous codec policies.
+
+Publish canonical WAVE_FORMAT_MPEG and the correct existing MPEG header
+for both MP1 and MP2. MP1 otherwise escapes as MOV '.mp1', while MP2 had
+no MPEG1WAVEFORMAT allocation. The generated Windows extension is metadata,
+not opaque FFmpeg codec configuration; MPEG sync frames contain the latter.
+
+diff --git a/dlls/msauddecmft/msauddecmft.c b/dlls/msauddecmft/msauddecmft.c
+--- a/dlls/msauddecmft/msauddecmft.c
++++ b/dlls/msauddecmft/msauddecmft.c
+@@ -136,6 +136,7 @@
+         {MFMediaType_Audio, MFAudioFormat_ALAC},
+         {MFMediaType_Audio, MFAudioFormat_ALAW},
+         {MFMediaType_Audio, MFAudioFormat_MULAW},
++        {MFMediaType_Audio, MFAudioFormat_MPEG},
+     };
+     MFT_REGISTER_TYPE_INFO audio_decoder_mft_outputs[] =
+     {
+diff --git a/dlls/winedmo/audio_decoder.c b/dlls/winedmo/audio_decoder.c
+--- a/dlls/winedmo/audio_decoder.c
++++ b/dlls/winedmo/audio_decoder.c
+@@ -372,6 +372,25 @@
+     return a->Format.wFormatTag == b->Format.wFormatTag;
+ }
+ 
++static BOOL valid_mpeg_audio_input(const WAVEFORMATEXTENSIBLE *format, UINT32 size)
++{
++    WORD layer;
++    UINT32 header_size = sizeof(MPEG1WAVEFORMAT) - sizeof(WAVEFORMATEX);
++
++    if (size < sizeof(*format) || format->Format.cbSize < CBSIZE(WAVEFORMATEXTENSIBLE)
++            || !format->Format.nChannels || format->Format.nChannels > 2)
++        return FALSE;
++    /* Complete sync frames carry the layer in-band. If the MF type provides
++     * MPEG1WAVEFORMAT metadata, require the complete header and layer 1 or 2. */
++    if (format->Format.cbSize == CBSIZE(WAVEFORMATEXTENSIBLE))
++        return TRUE;
++    if (format->Format.cbSize < CBSIZE(WAVEFORMATEXTENSIBLE) + header_size
++            || size < sizeof(*format) + header_size)
++        return FALSE;
++    memcpy(&layer, format + 1, sizeof(layer));
++    return layer == ACM_MPEG_LAYER1 || layer == ACM_MPEG_LAYER2;
++}
++
+ static HRESULT WINAPI transform_SetInputType(IMFTransform *iface, DWORD id, IMFMediaType *type, DWORD flags)
+ {
+     struct audio_decoder *decoder = impl_from_IMFTransform(iface);
+@@ -408,6 +427,11 @@
+     if (FAILED(hr = MFCreateWaveFormatExFromMFMediaType(type, (WAVEFORMATEX **)&format, &size,
+             MFWaveFormatExConvertFlag_ForceExtensible)))
+         return hr;
++    if (IsEqualGUID(&format->SubFormat, &MFAudioFormat_MPEG) && !valid_mpeg_audio_input(format, size))
++    {
++        CoTaskMemFree(format);
++        return MF_E_INVALIDMEDIATYPE;
++    }
+     wfx = *format;
+     CoTaskMemFree(format);
+ 
+@@ -417,7 +441,7 @@
+         return MF_E_INVALIDMEDIATYPE;
+ 
+     if (wfx.Format.nChannels >= ARRAY_SIZE(default_channel_mask) || !wfx.Format.nSamplesPerSec
+-            /* Dolby/DTS sync frames and G.711 need no out-of-band config.
++            /* Dolby/DTS/MPEG sync frames and G.711 need no out-of-band config.
+              * ALAC needs the 36-byte QuickTime atom consumed by FFmpeg;
+              * keep all other inputs' existing two-byte requirement. */
+             || (IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_ALAC)
+@@ -427,7 +451,8 @@
+                 && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_Dolby_DDPlus)
+                 && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_DTS)
+                 && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_ALAW)
+-                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_MULAW)))
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_MULAW)
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_MPEG)))
+         return MF_E_INVALIDMEDIATYPE;
+     if (flags & MFT_SET_TYPE_TEST_ONLY)
+         return S_OK;
+@@ -872,6 +897,9 @@
+     {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
+                 .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
+      .SubFormat = {WAVE_FORMAT_MULAW,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {WAVE_FORMAT_MPEG,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}}},
+ };
+ 
+ HRESULT audio_decoder_create(REFIID riid, void **ret)
+diff --git a/dlls/winedmo/unix_media_type.c b/dlls/winedmo/unix_media_type.c
+--- a/dlls/winedmo/unix_media_type.c
++++ b/dlls/winedmo/unix_media_type.c
+@@ -161,6 +161,21 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS mpeg_wave_format_from_codec_params( const AVCodecParameters *params, MPEG1WAVEFORMAT *format,
++                                                   UINT32 *format_size )
++{
++    UINT32 capacity = *format_size;
++
++    *format_size = sizeof(*format);
++    if (*format_size > capacity) return STATUS_BUFFER_TOO_SMALL;
++    /* MPEG audio configuration is in-band. This extension is Windows stream
++     * metadata, not codec extradata; publish the correct canonical layer. */
++    wave_format_ex_init( params, &format->wfx, *format_size, WAVE_FORMAT_MPEG );
++    format->fwHeadLayer = params->codec_id == AV_CODEC_ID_MP1 ? ACM_MPEG_LAYER1 : ACM_MPEG_LAYER2;
++    format->dwHeadBitrate = params->bit_rate;
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS audio_format_from_codec_params( const AVCodecParameters *params, void *format, UINT32 *format_size )
+ {
+     UINT format_tag, wave_format_size = sizeof(WAVEFORMATEX);
+@@ -168,7 +183,8 @@
+     int channels;
+ 
+     if (params->codec_id == AV_CODEC_ID_AAC) return heaac_wave_format_from_codec_params( params, format, format_size );
+-    if (params->codec_id == AV_CODEC_ID_MP1) wave_format_size = sizeof(MPEG1WAVEFORMAT);
++    if (params->codec_id == AV_CODEC_ID_MP1 || params->codec_id == AV_CODEC_ID_MP2)
++        return mpeg_wave_format_from_codec_params( params, format, format_size );
+     if (params->codec_id == AV_CODEC_ID_MP3) wave_format_size = sizeof(MPEGLAYER3WAVEFORMAT);
+     if (params->codec_id == AV_CODEC_ID_WMAV1) wave_format_size = sizeof(MSAUDIO1WAVEFORMAT);
+     if (params->codec_id == AV_CODEC_ID_WMAV2) wave_format_size = sizeof(WMAUDIO2WAVEFORMAT);

@@ -1,0 +1,19 @@
+From: RTSP-on-GE11
+Subject: [PATCH] include: Register the private media presentation-origin header.
+
+Patch 0071 introduced this header without listing it in the global source
+inventory. Fresh Wine makedep therefore rejects its consumers even though
+the compiler can find the file with an already-generated Makefile.
+
+This only registers the existing header; no C or playback behavior changes.
+
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -981,6 +981,7 @@ SOURCES = \
+ 	wine/itss.idl \
+ 	wine/list.h \
+ 	wine/mfinternal.idl \
++	wine/mforigin.h \
+ 	wine/mmsystem16.h \
+ 	wine/mscvpdb.h \
+ 	wine/mssign.h \

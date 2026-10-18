@@ -1,0 +1,63 @@
+Subject: [PATCH] winedmo: latch the ASF first-timestamp decision
+
+A first timestamp at or below 0.2 s never set timestamp_base_set. Playback
+crossing that threshold then acquired a new origin and jumped backwards.
+Latch the first known timestamp even when no correction is needed. Keep
+that zero-base case an identity operation, including negative preroll.
+Preserve the existing threshold and positive-startup correction, using
+saturated subtraction as the HLS path already does.
+
+Keep an already-latched identity decision across seek: a normal source's
+first post-seek sample must not become a new zero. Positive correction bases
+still reset as before; an unknown origin remains unknown. This does not
+reconstruct a common ASF origin, invert a positive correction during seek,
+or fix seeking before the first timestamp. No HLS, RTSP or MP4 timing changes.
+Apply after 0028; source/model tested, not playback.
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -239,20 +239,22 @@
+          * timestamp even though the clip itself starts at zero. Preserve normal
+          * small startup offsets, but rebase obviously late first samples so MF does
+          * not hold video for the first second or more of the clip. */
+-        if (base != INT64_MIN && base > 2000000)
++        if (base != INT64_MIN)
+         {
+-            stream->timestamp_base = base;
++            /* A normal first timestamp is also a decision. Do not rebase
++             * later samples just because playback crosses the threshold. */
++            stream->timestamp_base = base > 2000000 ? base : 0;
+             stream->timestamp_base_set = TRUE;
+         }
+     }
+ 
+-    if (!stream->timestamp_base_set)
++    if (!stream->timestamp_base_set || !stream->timestamp_base)
+         return;
+ 
+     if (sample->pts != AV_NOPTS_VALUE)
+-        sample->pts = max( 0, sample->pts - stream->timestamp_base );
++        sample->pts = max( 0, av_sat_sub64( sample->pts, stream->timestamp_base ) );
+     if (sample->dts != AV_NOPTS_VALUE)
+-        sample->dts = max( 0, sample->dts - stream->timestamp_base );
++        sample->dts = max( 0, av_sat_sub64( sample->dts, stream->timestamp_base ) );
+ }
+ 
+ static void normalize_hls_timestamps( const struct demuxer *demuxer, struct sample *sample )
+@@ -1468,8 +1470,13 @@
+     {
+         av_bsf_flush( demuxer->streams[i].filter );
+         demuxer->streams[i].eos = FALSE;
+-        demuxer->streams[i].timestamp_base = 0;
+-        demuxer->streams[i].timestamp_base_set = FALSE;
++        /* An established identity mapping stays valid after seek. Preserve
++         * the existing reset policy for a nonzero startup correction. */
++        if (demuxer->streams[i].timestamp_base)
++        {
++            demuxer->streams[i].timestamp_base = 0;
++            demuxer->streams[i].timestamp_base_set = FALSE;
++        }
+         demuxer->streams[i].last_pts = INT64_MIN;
+         demuxer->streams[i].next_pts = INT64_MIN;
+         demuxer->streams[i].final_last_pts = INT64_MIN;

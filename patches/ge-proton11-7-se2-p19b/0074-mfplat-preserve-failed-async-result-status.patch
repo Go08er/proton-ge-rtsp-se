@@ -1,0 +1,115 @@
+--- a/dlls/mfplat/main.c
++++ b/dlls/mfplat/main.c
+@@ -6006,6 +6006,8 @@
+     IRtwqAsyncResult *inner_result = (IRtwqAsyncResult *)IRtwqAsyncResult_GetStateNoAddRef(result);
+     RTWQASYNCRESULT *data = (RTWQASYNCRESULT *)inner_result;
+     struct resolver_queued_result *queued_result;
++    IRtwqAsyncResult *caller_result = NULL;
++    HRESULT hr;
+     union
+     {
+         IUnknown *handler;
+@@ -6041,6 +6043,23 @@
+         queued_result->inner_result = inner_result;
+         IRtwqAsyncResult_AddRef(queued_result->inner_result);
+     }
++    else
++    {
++        IUnknown *caller_state = IRtwqAsyncResult_GetStateNoAddRef(inner_result);
++
++        if (FAILED(hr = RtwqCreateAsyncResult(queued_result->object, data->pCallback,
++                caller_state, &caller_result)))
++        {
++            if (queued_result->object) IUnknown_Release(queued_result->object);
++            free(queued_result);
++            return hr;
++        }
++        IRtwqAsyncResult_SetStatus(caller_result, queued_result->hr);
++        /* A failed open has no object. Match End against this exact result,
++         * not against an absent (or shared) object identity. */
++        queued_result->inner_result = caller_result;
++        IRtwqAsyncResult_AddRef(queued_result->inner_result);
++    }
+ 
+     /* Push resolved object type and created object, so we don't have to guess on End*() call. */
+     EnterCriticalSection(&resolver->cs);
+@@ -6051,14 +6070,8 @@
+         SetEvent(data->hEvent);
+     else
+     {
+-        IUnknown *caller_state = IRtwqAsyncResult_GetStateNoAddRef(inner_result);
+-        IRtwqAsyncResult *caller_result;
+-
+-        if (SUCCEEDED(RtwqCreateAsyncResult(queued_result->object, data->pCallback, caller_state, &caller_result)))
+-        {
+-            RtwqInvokeCallback(caller_result);
+-            IRtwqAsyncResult_Release(caller_result);
+-        }
++        RtwqInvokeCallback(caller_result);
++        IRtwqAsyncResult_Release(caller_result);
+     }
+ 
+     return S_OK;
+@@ -6682,27 +6695,35 @@
+         IRtwqAsyncResult *result, MF_OBJECT_TYPE *obj_type, IUnknown **out)
+ {
+     struct resolver_queued_result *queued_result = NULL, *iter;
+-    IUnknown *object;
+-    HRESULT hr;
+-
+-    if (FAILED(hr = IRtwqAsyncResult_GetObject(result, &object)))
+-        return hr;
++    IUnknown *object = NULL;
++    HRESULT object_hr, hr;
++
++    if (!obj_type || !out) return E_POINTER;
++    *obj_type = MF_OBJECT_INVALID;
++    *out = NULL;
++    object_hr = IRtwqAsyncResult_GetObject(result, &object);
+ 
+     EnterCriticalSection(&resolver->cs);
+ 
+     LIST_FOR_EACH_ENTRY(iter, &resolver->pending, struct resolver_queued_result, entry)
+     {
+-        if (iter->inner_result == result || (iter->object == object && iter->origin == origin))
++        if (iter->origin != origin) continue;
++        if (iter->inner_result == result)
+         {
+-            list_remove(&iter->entry);
+             queued_result = iter;
+             break;
+         }
+-    }
++        /* Preserve existing successful-object compatibility, but prefer the
++         * exact result even if an earlier operation returned that same object.
++         * An absent object must never alias another failed operation. */
++        if (!queued_result && SUCCEEDED(object_hr) && object && iter->object == object)
++            queued_result = iter;
++    }
++    if (queued_result) list_remove(&queued_result->entry);
+ 
+     LeaveCriticalSection(&resolver->cs);
+ 
+-    IUnknown_Release(object);
++    if (SUCCEEDED(object_hr) && object) IUnknown_Release(object);
+ 
+     if (queued_result)
+     {
+@@ -6714,7 +6735,7 @@
+         free(queued_result);
+     }
+     else
+-        hr = E_UNEXPECTED;
++        hr = FAILED(object_hr) ? object_hr : E_UNEXPECTED;
+ 
+     return hr;
+ }
+@@ -6765,6 +6786,8 @@
+         {
+             if (result->object)
+                 IUnknown_Release(result->object);
++            if (result->inner_result)
++                IRtwqAsyncResult_Release(result->inner_result);
+             list_remove(&result->entry);
+             free(result);
+         }

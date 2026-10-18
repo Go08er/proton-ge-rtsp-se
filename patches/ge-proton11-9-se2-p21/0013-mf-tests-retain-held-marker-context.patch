@@ -1,0 +1,57 @@
+Subject: [P20 review] mf tests retain held marker context
+
+Residual against GE-Proton11-9 after ge-video-rework.
+Source-reviewed only: not compiler or runtime qualification.
+Prior P19b2 patch ownership (some behavior is now upstream):
+  ge-master-20260913-se2-p8/0046-mf-tests-preserve-held-marker-context.patch
+
+---
+diff --git a/dlls/mf/tests/mf.c b/dlls/mf/tests/mf.c
+--- a/dlls/mf/tests/mf.c
++++ b/dlls/mf/tests/mf.c
+@@ -995,6 +995,7 @@
+ 
+     IMFMediaEventQueue *event_queue;
+     BOOL hold_markers;
++    PROPVARIANT held_marker_context;
+     HANDLE sample_event;
+ };
+ 
+@@ -1045,6 +1046,7 @@
+ 
+     if (!refcount)
+     {
++        PropVariantClear(&sink->held_marker_context);
+         if (sink->handler)
+             IMFMediaTypeHandler_Release(sink->handler);
+         if (sink->media_sink)
+@@ -1163,7 +1165,10 @@
+     struct test_stream_sink *sink = impl_from_IMFStreamSink(iface);
+ 
+     if (sink->hold_markers && marker_type == MFSTREAMSINK_MARKER_ENDOFSEGMENT)
+-        return S_OK;
++    {
++        PropVariantClear(&sink->held_marker_context);
++        return context ? PropVariantCopy(&sink->held_marker_context, context) : S_OK;
++    }
+ 
+     ok(0, "Unexpected call.\n");
+     return E_NOTIMPL;
+@@ -1251,6 +1256,7 @@
+     sink->IMFStreamSink_iface.lpVtbl = &test_stream_sink_vtbl,
+     sink->IMFGetService_iface.lpVtbl = &test_stream_sink_get_service_vtbl,
+     sink->refcount = 1;
++    PropVariantInit(&sink->held_marker_context);
+     if (handler)
+         IMFMediaTypeHandler_AddRef(sink->handler = handler);
+     if (media_sink)
+@@ -8926,7 +8932,8 @@
+     hr = wait_media_event_until_blocking(session, callback, MESessionStarted, 100, &value);
+     ok(hr == WAIT_TIMEOUT, "Replay completed before the sink drained, hr %#lx.\n", hr);
+ 
+-    hr = IMFStreamSink_QueueEvent(sink->stream, MEStreamSinkMarker, &GUID_NULL, S_OK, NULL);
++    hr = IMFStreamSink_QueueEvent(sink->stream, MEStreamSinkMarker, &GUID_NULL, S_OK,
++            &impl_from_IMFStreamSink(sink->stream)->held_marker_context);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     hr = wait_media_event_until_blocking(session, callback, MESessionTopologyStatus, 1000, &value);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);

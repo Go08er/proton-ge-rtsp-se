@@ -1,0 +1,41 @@
+Subject: [PATCH] winedmo: use a zero-based byte position for codec parsers
+
+av_parser_parse2's final argument is a byte position, not a timestamp.
+AV_NOPTS_VALUE initializes the parser's byte offsets below zero while its
+first frame offset is zero. FFmpeg's first-picture timestamp lookup then
+fails, and GE's existing fallback stamps the buffered I-picture with the
+next packet's PTS. P17 returns MPEG frame 0 at 120 ms instead of 0.
+
+Start the parser's byte domain at zero. FFmpeg advances its internal byte
+offset from consumed input; no caller-side offset state is needed. Use the
+same position convention at drain. Keep PTS/DTS arguments and all fallback,
+drain, queue and Flush behavior unchanged.
+
+The P17-library native control reproduces the old first-picture defect for
+seven MPEG-1/2 Matroska/PS/TS fixtures and three exact SourceReader-metadata
+replays. With this argument change all ten match direct decoding at every
+frame, with identical pixel hashes and counts. This is proposed P18 work,
+not a built Wine/runtime pass. Require both-architecture header compilation,
+H.264 parser/Flush controls, and the frozen Wine timestamp/runtime gates.
+---
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -1157,7 +1157,7 @@ NTSTATUS transform_push_input( void *arg )
+             int consumed;
+ 
+             consumed = av_parser_parse2( t->parser, t->avctx, &parsed_data, &parsed_size,
+-                                         data, size, t->packet->pts, t->packet->dts, AV_NOPTS_VALUE );
++                                         data, size, t->packet->pts, t->packet->dts, 0 );
+             if (consumed < 0)
+                 return STATUS_UNSUCCESSFUL;
+ 
+@@ -1671,7 +1671,7 @@ NTSTATUS transform_drain( void *arg )
+         if (t->parser)
+         {
+             if (av_parser_parse2( t->parser, t->avctx, &data, &size, NULL, 0,
+-                                 AV_NOPTS_VALUE, AV_NOPTS_VALUE, AV_NOPTS_VALUE ) < 0)
++                                 AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0 ) < 0)
+                 return (t->drain_status = STATUS_UNSUCCESSFUL);
+         }
+         else if (t->mpeg_es_assemble && t->mpeg_es_size)

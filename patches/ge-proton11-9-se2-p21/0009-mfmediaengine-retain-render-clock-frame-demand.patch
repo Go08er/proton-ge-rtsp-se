@@ -1,0 +1,338 @@
+Subject: [P20 review] mfmediaengine retain render clock frame demand
+
+Residual against GE-Proton11-9 after ge-video-rework.
+Source-reviewed only: not compiler or runtime qualification.
+Prior P19b2 patch ownership (some behavior is now upstream):
+  ge-proton11-6-a320/0022-mfmediaengine-preserve-selected-frame-tick-result.patch
+  proposed/0057-mfmediaengine-request-video-samples-on-clock.patch
+
+---
+diff --git a/dlls/mfmediaengine/video_frame_sink.c b/dlls/mfmediaengine/video_frame_sink.c
+--- a/dlls/mfmediaengine/video_frame_sink.c
++++ b/dlls/mfmediaengine/video_frame_sink.c
+@@ -71,7 +71,7 @@
+ 
+ struct sample_queue
+ {
+-    IMFSample *samples[2];
++    IMFSample *samples[5];
+     unsigned int used;
+     unsigned int front;
+     unsigned int back;
+@@ -87,6 +87,7 @@
+     IMFStreamSink IMFStreamSink_iface;
+     IMFMediaTypeHandler IMFMediaTypeHandler_iface;
+     IMFGetService IMFGetService_iface;
++    IMFAsyncCallback request_timer_callback;
+     LONG refcount;
+     IUnknown *device_manager;
+     IMFMediaType *media_type;
+@@ -95,6 +96,9 @@
+     IMFMediaEventQueue *event_queue;
+     IMFMediaEventQueue *stream_event_queue;
+     IMFPresentationClock *clock;
++    IMFTimer *timer;
++    IUnknown *request_timer_key;
++    IMFAsyncResult *request_timer_state;
+     IMFAsyncCallback *callback;
+     float rate;
+     enum sink_state state;
+@@ -105,6 +109,8 @@
+     CRITICAL_SECTION cs;
+ };
+ 
++static void video_frame_sink_cancel_request_timer(struct video_frame_sink *sink);
++
+ static void video_frame_sink_sample_queue_set_presentation(struct video_frame_sink *sink, IMFSample *sample)
+ {
+     struct sample_queue *queue = &sink->queue;
+@@ -159,6 +165,8 @@
+     struct sample_queue *queue = &sink->queue;
+     IMFSample *sample;
+ 
++    video_frame_sink_cancel_request_timer(sink);
++
+     while (video_frame_sink_sample_queue_pop(sink, &sample))
+         IMFSample_Release(sample);
+ 
+@@ -370,14 +378,138 @@
+ }
+ 
+ /* must be called with critical section held */
++static void video_frame_sink_cancel_request_timer(struct video_frame_sink *sink)
++{
++    IUnknown *key = sink->request_timer_key;
++    IMFAsyncResult *state = sink->request_timer_state;
++
++    /* Cancellation need not recall an already dispatched callback. Invalidate
++     * its identity before releasing either reference; it cannot clear a newer timer. */
++    sink->request_timer_key = NULL;
++    sink->request_timer_state = NULL;
++    if (key)
++    {
++        IMFTimer_CancelTimer(sink->timer, key);
++        IUnknown_Release(key);
++    }
++    if (state)
++        IMFAsyncResult_Release(state);
++}
++
++/* must be called with critical section held */
+ static void video_frame_sink_stream_request_sample(struct video_frame_sink *sink)
+ {
+-    if (sink->sample_request_pending || sink->eos)
++    if (sink->is_shut_down || sink->sample_request_pending || sink->eos)
+         return;
+ 
+-    IMFStreamSink_QueueEvent(&sink->IMFStreamSink_iface, MEStreamSinkRequestSample, &GUID_NULL, S_OK, NULL);
+-    sink->sample_request_pending = TRUE;
+-}
++    video_frame_sink_cancel_request_timer(sink);
++    if (SUCCEEDED(IMFStreamSink_QueueEvent(&sink->IMFStreamSink_iface,
++            MEStreamSinkRequestSample, &GUID_NULL, S_OK, NULL)))
++        sink->sample_request_pending = TRUE;
++}
++
++/* Keep demuxing when ticks are slow, but never pull past the newest queued
++ * frame's presentation time. Called only with sink->cs held. */
++static void video_frame_sink_schedule_request_sample(struct video_frame_sink *sink)
++{
++    struct sample_queue *queue = &sink->queue;
++    LONGLONG sampletime;
++    MFTIME clocktime;
++    HRESULT hr;
++
++    if (sink->is_shut_down || !sink->clock || sink->state != SINK_STATE_RUNNING || sink->rate <= 0.0f
++            || sink->sample_request_pending || sink->eos)
++        return;
++
++    if (queue->used < ARRAY_SIZE(queue->samples))
++    {
++        video_frame_sink_stream_request_sample(sink);
++        return;
++    }
++    if (!sink->timer || sink->request_timer_key)
++        return;
++    if (FAILED(IMFSample_GetSampleTime(queue->samples[(queue->front + queue->used - 1)
++            % ARRAY_SIZE(queue->samples)], &sampletime))
++            || FAILED(IMFPresentationClock_GetTime(sink->clock, &clocktime)))
++        return;
++    if (sampletime <= clocktime)
++    {
++        video_frame_sink_stream_request_sample(sink);
++        return;
++    }
++
++    /* A distinct refcounted identity per schedule survives cancellation/dispatch
++     * races without adding a second object implementation or an epoch counter. */
++    if (FAILED(hr = MFCreateAsyncResult(NULL, NULL, NULL, &sink->request_timer_state)))
++        return;
++    if (FAILED(hr = IMFTimer_SetTimer(sink->timer, 0, sampletime, &sink->request_timer_callback,
++            (IUnknown *)sink->request_timer_state, &sink->request_timer_key)))
++    {
++        video_frame_sink_cancel_request_timer(sink);
++        WARN("Failed to schedule video sample request, hr %#lx.\n", hr);
++    }
++}
++
++static struct video_frame_sink *impl_from_request_timer_callback(IMFAsyncCallback *iface)
++{
++    return CONTAINING_RECORD(iface, struct video_frame_sink, request_timer_callback);
++}
++
++static HRESULT WINAPI request_timer_QueryInterface(IMFAsyncCallback *iface, REFIID riid, void **obj)
++{
++    if (!obj) return E_POINTER;
++    *obj = NULL;
++    if (!IsEqualIID(riid, &IID_IUnknown) && !IsEqualIID(riid, &IID_IMFAsyncCallback))
++        return E_NOINTERFACE;
++    *obj = iface;
++    IMFAsyncCallback_AddRef(iface);
++    return S_OK;
++}
++
++static ULONG WINAPI request_timer_AddRef(IMFAsyncCallback *iface)
++{
++    struct video_frame_sink *sink = impl_from_request_timer_callback(iface);
++    return IMFStreamSink_AddRef(&sink->IMFStreamSink_iface);
++}
++
++static ULONG WINAPI request_timer_Release(IMFAsyncCallback *iface)
++{
++    struct video_frame_sink *sink = impl_from_request_timer_callback(iface);
++    return IMFStreamSink_Release(&sink->IMFStreamSink_iface);
++}
++
++static HRESULT WINAPI request_timer_GetParameters(IMFAsyncCallback *iface, DWORD *flags, DWORD *queue)
++{
++    *flags = 0;
++    *queue = MFASYNC_CALLBACK_QUEUE_MULTITHREADED;
++    return S_OK;
++}
++
++static HRESULT WINAPI request_timer_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
++{
++    struct video_frame_sink *sink = impl_from_request_timer_callback(iface);
++
++    EnterCriticalSection(&sink->cs);
++    if (sink->request_timer_state && IMFAsyncResult_GetStateNoAddRef(result)
++            == (IUnknown *)sink->request_timer_state)
++    {
++        video_frame_sink_cancel_request_timer(sink);
++        /* Recheck state and the newest sample, not the sample which armed us.
++         * The clock may dispatch up to 5 ms early; rearm instead of losing demand. */
++        video_frame_sink_schedule_request_sample(sink);
++    }
++    LeaveCriticalSection(&sink->cs);
++    return S_OK;
++}
++
++static const IMFAsyncCallbackVtbl request_timer_vtbl =
++{
++    request_timer_QueryInterface,
++    request_timer_AddRef,
++    request_timer_Release,
++    request_timer_GetParameters,
++    request_timer_Invoke,
++};
+ 
+ static void video_frame_sink_notify(struct video_frame_sink *sink, unsigned int event)
+ {
+@@ -442,6 +574,8 @@
+ 
+             if (sink->rate != 0.0f && sink->queue.used != ARRAY_SIZE(sink->queue.samples))
+                 video_frame_sink_stream_request_sample(sink);
++            else if (sink->queue.used == ARRAY_SIZE(sink->queue.samples))
++                video_frame_sink_schedule_request_sample(sink);
+         }
+     }
+ 
+@@ -766,6 +900,8 @@
+             IUnknown_Release(sink->device_manager);
+         if (sink->event_queue)
+             IMFMediaEventQueue_Release(sink->event_queue);
++        if (sink->timer)
++            IMFTimer_Release(sink->timer);
+         if (sink->clock)
+             IMFPresentationClock_Release(sink->clock);
+         if (sink->callback)
+@@ -882,6 +1018,10 @@
+ 
+ static void video_frame_sink_set_presentation_clock(struct video_frame_sink *sink, IMFPresentationClock *clock)
+ {
++    video_frame_sink_cancel_request_timer(sink);
++    if (sink->timer)
++        IMFTimer_Release(sink->timer);
++    sink->timer = NULL;
+     if (sink->clock)
+     {
+         IMFPresentationClock_RemoveClockStateSink(sink->clock, &sink->IMFClockStateSink_iface);
+@@ -892,7 +1032,9 @@
+     {
+         IMFPresentationClock_AddRef(sink->clock);
+         IMFPresentationClock_AddClockStateSink(sink->clock, &sink->IMFClockStateSink_iface);
+-    }
++        IMFPresentationClock_QueryInterface(sink->clock, &IID_IMFTimer, (void **)&sink->timer);
++    }
++    video_frame_sink_schedule_request_sample(sink);
+ }
+ 
+ static HRESULT WINAPI video_frame_sink_SetPresentationClock(IMFMediaSink *iface, IMFPresentationClock *clock)
+@@ -1026,6 +1168,10 @@
+         }
+         else
+         {
++            enum sink_state previous_state = sink->state;
++
++            if (state != SINK_STATE_RUNNING || offset != PRESENTATION_CURRENT_POSITION)
++                video_frame_sink_cancel_request_timer(sink);
+             if (state == SINK_STATE_STOPPED)
+             {
+                 video_frame_sink_sample_queue_flush(sink);
+@@ -1033,15 +1179,15 @@
+                 sink->sample_request_pending = FALSE;
+             }
+ 
+-            if (state == SINK_STATE_RUNNING && (sink->state == SINK_STATE_STOPPED || sink->state == SINK_STATE_PAUSED ||
+-                    (sink->state == SINK_STATE_RUNNING && offset != PRESENTATION_CURRENT_POSITION)))
+-                video_frame_sink_stream_request_sample(sink);
+-
+-            if (state != sink->state || state != SINK_STATE_PAUSED)
++            sink->state = state;
++            if (state == SINK_STATE_RUNNING && (previous_state != SINK_STATE_RUNNING
++                    || offset != PRESENTATION_CURRENT_POSITION))
++                video_frame_sink_schedule_request_sample(sink);
++
++            if (state != previous_state || state != SINK_STATE_PAUSED)
+             {
+                 IMFStreamSink_QueueEvent(&sink->IMFStreamSink_iface, events[state], &GUID_NULL, S_OK, NULL);
+             }
+-            sink->state = state;
+         }
+     }
+ 
+@@ -1100,9 +1246,12 @@
+     else
+     {
+         IMFStreamSink_QueueEvent(&sink->IMFStreamSink_iface, MEStreamSinkRateChanged, &GUID_NULL, S_OK, NULL);
++        video_frame_sink_cancel_request_timer(sink);
+         sink->rate = rate;
+         if (rate == 0.0f && sink->state == SINK_STATE_STOPPED)
+             video_frame_sink_stream_request_sample(sink);
++        else
++            video_frame_sink_schedule_request_sample(sink);
+     }
+ 
+     LeaveCriticalSection(&sink->cs);
+@@ -1204,6 +1353,7 @@
+     object->IMFStreamSink_iface.lpVtbl = &video_frame_sink_stream_vtbl;
+     object->IMFMediaTypeHandler_iface.lpVtbl = &video_frame_sink_stream_type_handler_vtbl;
+     object->IMFGetService_iface.lpVtbl = &video_frame_sink_stream_get_service_vtbl;
++    object->request_timer_callback.lpVtbl = &request_timer_vtbl;
+     object->refcount = 1;
+     object->rate = 1.0f;
+     object->queue.back = ARRAY_SIZE(object->queue.samples) - 1;
+@@ -1315,7 +1465,7 @@
+     if (sink)
+     {
+         IMFSample *sample;
+-        bool transfer_sample = FALSE;
++        bool transfer_sample = FALSE, selected_sample = FALSE;
+         BOOL preroll_sample;
+         EnterCriticalSection(&sink->cs);
+         while (video_frame_sink_sample_queue_pop(sink, &sample))
+@@ -1325,6 +1475,8 @@
+             {
+                 video_frame_sink_sample_queue_set_presentation(sink, sample);
+                 transfer_sample = TRUE;
++                selected_sample = TRUE;
++                sample_pts = *pts;
+             }
+             else if (preroll_sample)
+             {
+@@ -1348,6 +1500,13 @@
+                 *pts = sample_pts;
+         }
+ 
++        /* A future or preroll sample must not hide a frame selected above. */
++        if (selected_sample && SUCCEEDED(hr))
++        {
++            hr = S_OK;
++            *pts = sample_pts;
++        }
++
+         LeaveCriticalSection(&sink->cs);
+     }
+ 
+@@ -1380,7 +1539,11 @@
+ 
+ void video_frame_sink_notify_end_of_presentation_segment(struct video_frame_sink *sink)
+ {
++    EnterCriticalSection(&sink->cs);
+     sink->eos = TRUE;
++    sink->sample_request_pending = FALSE;
++    video_frame_sink_cancel_request_timer(sink);
++    LeaveCriticalSection(&sink->cs);
+ }
+ 
+ ULONG video_frame_sink_release(struct video_frame_sink *sink)

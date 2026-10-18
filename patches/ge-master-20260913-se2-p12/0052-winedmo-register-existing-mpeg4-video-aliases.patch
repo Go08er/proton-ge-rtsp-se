@@ -1,0 +1,39 @@
+From: RTSP-on-GE contributors
+Subject: [PATCH] winedmo: Register existing MPEG-4 Part 2 video aliases
+
+DIVX, DX50, FMP4 and XVID are already accepted and recognized as MPEG-4
+Part 2 by WineDMO, and their exact tags map to the existing FFmpeg decoder.
+Publish those same aliases for MF discovery. Keep their original tags:
+FFmpeg uses codec tags for variant-specific compatibility behavior.
+No new input/backend types, DMO route, decoder, parser or output code.
+
+diff --git a/dlls/msmpeg2vdec/msmpeg2vdec.c b/dlls/msmpeg2vdec/msmpeg2vdec.c
+index 814aeed..f310c14 100644
+--- a/dlls/msmpeg2vdec/msmpeg2vdec.c
++++ b/dlls/msmpeg2vdec/msmpeg2vdec.c
+@@ -27,6 +27,14 @@ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
+ 
+ static const GUID MFVideoFormat_mp4v = {MAKEFOURCC('m','p','4','v'), 0x0000, 0x0010,
+         {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID MFVideoFormat_DIVX = {MAKEFOURCC('D','I','V','X'), 0x0000, 0x0010,
++        {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID MFVideoFormat_DX50 = {MAKEFOURCC('D','X','5','0'), 0x0000, 0x0010,
++        {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID MFVideoFormat_FMP4 = {MAKEFOURCC('F','M','P','4'), 0x0000, 0x0010,
++        {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID MFVideoFormat_XVID = {MAKEFOURCC('X','V','I','D'), 0x0000, 0x0010,
++        {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+ static const GUID CLSID_MPEG4Part2DecoderMFT = {0x2d709e52, 0x123f, 0x49b5,
+         {0x9c, 0xbc, 0x9a, 0xf5, 0xcd, 0xe2, 0x8f, 0xb9}};
+ 
+@@ -81,6 +89,10 @@ HRESULT WINAPI DllRegisterServer(void)
+         {MFMediaType_Video, MFVideoFormat_MP4S},
+         {MFMediaType_Video, MFVideoFormat_MP4V},
+         {MFMediaType_Video, MFVideoFormat_mp4v},
++        {MFMediaType_Video, MFVideoFormat_DIVX},
++        {MFMediaType_Video, MFVideoFormat_DX50},
++        {MFMediaType_Video, MFVideoFormat_FMP4},
++        {MFMediaType_Video, MFVideoFormat_XVID},
+     };
+     HRESULT hr;
+ 

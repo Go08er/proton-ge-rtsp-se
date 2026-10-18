@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Deterministic model of A3.12 terminal network-error ownership."""
+"""Historical A3.12 terminal network-error ownership model.
+
+The FILTER_FAILURE -> EOF result deliberately describes the old foundation,
+not SE2-P3's later 0039 overlay. The latter is checked against actual source
+by media-edge-cases/test_terminal_filter.py and against real old/new binaries
+by the frame-consuming corrupt-NAL/error/manual-reopen case.
+"""
 
 from __future__ import annotations
 

@@ -1,0 +1,62 @@
+Subject: [PATCH] winedmo: expose demuxed VP8 and HEVC through the video decoder
+
+FFmpeg decodes both formats and WineDMO already maps their compressed input
+to codec IDs, but the MF/DMO registrations and the transform's accepted-type
+table omit them. Use the existing generic WMV-backed decoder, as GE does for
+AV1, VP9 and Theora. Register and accept the same two additional subtypes;
+leave every existing input/output type and its order unchanged.
+
+Canonicalize VP8 at the demux boundary, as already done for HEVC/VP9/AV1,
+instead of letting a container-specific codec_tag bypass the advertised
+MFVideoFormat_VP80 subtype.
+
+This accepts ordinary demuxed access units. It does not add HEVC_ES fragment
+assembly, P010/HDR output negotiation, hardware decoding or a new parser.
+Existing MF_MT_USER_DATA extradata and FFmpeg decoding/conversion remain in
+charge. Apply after the SE1 Wine series. Source-contract tested only; actual
+decoding, seek/flush and A/V continuity still need a new build and runtime A/B.
+---
+diff --git a/dlls/winedmo/unix_media_type.c b/dlls/winedmo/unix_media_type.c
+--- a/dlls/winedmo/unix_media_type.c
++++ b/dlls/winedmo/unix_media_type.c
+@@ -365,6 +365,7 @@ static void mf_video_format_init( const AVCodecParameters *params, MFVIDEOFORMAT *f
+         if (params->codec_id == AV_CODEC_ID_MPEG1VIDEO) format->guidFormat = MEDIASUBTYPE_MPEG1Payload;
+         else if (params->codec_id == AV_CODEC_ID_MPEG2VIDEO) format->guidFormat = MFVideoFormat_MPEG2;
+         else if (params->codec_id == AV_CODEC_ID_H264) format->guidFormat.Data1 = MFVideoFormat_H264.Data1;
++        else if (params->codec_id == AV_CODEC_ID_VP8) format->guidFormat.Data1 = MFVideoFormat_VP80.Data1;
+         else if (params->codec_id == AV_CODEC_ID_VP9) format->guidFormat.Data1 = MFVideoFormat_VP90.Data1;
+         else if (params->codec_id == AV_CODEC_ID_AV1) format->guidFormat.Data1 = MFVideoFormat_AV1.Data1;
+         else if (params->codec_id == AV_CODEC_ID_HEVC) format->guidFormat.Data1 = MFVideoFormat_HEVC.Data1;
+diff --git a/dlls/winedmo/video_decoder.c b/dlls/winedmo/video_decoder.c
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -2533,6 +2533,8 @@ static const GUID *const wmv_decoder_input_types[] =
+     &MFVideoFormat_theora,
+     &MFVideoFormat_AV1,
+     &MFVideoFormat_VP90,
++    &MFVideoFormat_VP80,
++    &MFVideoFormat_HEVC,
+ };
+ static const GUID *const wmv_decoder_output_types[] =
+ {
+diff --git a/dlls/wmvdecod/wmvdecod.c b/dlls/wmvdecod/wmvdecod.c
+--- a/dlls/wmvdecod/wmvdecod.c
++++ b/dlls/wmvdecod/wmvdecod.c
+@@ -69,6 +69,8 @@ HRESULT WINAPI DllRegisterServer(void)
+         {MFMediaType_Video, MFVideoFormat_theora},
+         {MFMediaType_Video, MFVideoFormat_AV1},
+         {MFMediaType_Video, MFVideoFormat_VP90},
++        {MFMediaType_Video, MFVideoFormat_VP80},
++        {MFMediaType_Video, MFVideoFormat_HEVC},
+     };
+     MFT_REGISTER_TYPE_INFO wmv_decoder_mft_outputs[] =
+     {
+@@ -111,6 +113,8 @@ HRESULT WINAPI DllRegisterServer(void)
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_theora},
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_AV1},
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_VP90},
++        {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_VP80},
++        {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_HEVC},
+     };
+     HRESULT hr;
+ 

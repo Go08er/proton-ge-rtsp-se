@@ -27,6 +27,8 @@ git -C "$REPO" add tracked.txt
 git -C "$REPO" -c user.name=Test -c user.email=test.invalid commit -qm initial
 
 PIN_SOURCE_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
+PIN_WITHOUT_NVIDIA_LIBS=1
+PIN_WITHOUT_VKLAYERS=1
 allowed_content='validated build download'
 fixture_size="${#allowed_content}"
 fixture_sha="$(printf '%s' "$allowed_content" | sha256sum | awk '{print $1}')"
@@ -313,6 +315,39 @@ if pinned_ge_require_local_steamrt_image "$FAKE_PODMAN" >/dev/null 2>&1; then
 fi
 unset FAKE_IMAGE_ID
 
+# Exercise the mandatory fresh-setup verifier with this fixture's fake pin/SDK
+# and a disposable source copy. There is no production skip or test-mode flag.
+python3 - "$ROOT_DIR" "$TMP_ROOT" "$PIN_ID" "$PIN_STEAMRT_IMAGE_ID" <<'PY'
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+root, temporary = map(Path, sys.argv[1:3])
+sys.path.insert(0, str(root / 'tests/tooling'))
+from test_wine_fresh_setup import gate, synthetic_receipt
+source = temporary / 'fresh-setup-source'
+compiled = temporary / 'fresh-setup-compiled'
+source.mkdir()
+(source / 'input.h').write_text('/* synthetic resume fixture */\n')
+shutil.copytree(source, compiled)
+receipt = synthetic_receipt(gate.source_hash(source), compiled)
+receipt.update(pin_id=sys.argv[3], steamrt_image_id=sys.argv[4])
+path = temporary / 'fresh-setup.json'
+path.write_text(json.dumps(receipt))
+command = [sys.executable, str(root / 'scripts/verify-wine-fresh-setup.py'),
+           '--receipt', str(path), '--wine-tree', str(source), '--pin-id', sys.argv[3],
+           '--series-digest', 'a' * 64, '--steamrt-image-id', sys.argv[4]]
+subprocess.run(command, check=True, timeout=30)
+wrong = command[:-1] + ['b' * 64]
+if not subprocess.run(wrong, capture_output=True, timeout=30).returncode:
+    raise SystemExit('fresh-setup receipt accepted the wrong SDK')
+path.unlink()
+if not subprocess.run(command, capture_output=True, timeout=30).returncode:
+    raise SystemExit('fresh-setup receipt was optional')
+PY
+
 ABSENT_PATH="$TMP_ROOT/absent-output"
 pinned_ge_require_absent_path fixture "$ABSENT_PATH"
 ln -s "$TMP_ROOT/missing-target" "$ABSENT_PATH"
@@ -486,8 +521,10 @@ fi
 
 python3 - "$ROOT_DIR/scripts/build-pinned-ge.sh" \
   "$ROOT_DIR/scripts/verify-preparation.sh" \
-  "$ROOT_DIR/scripts/record-pinned-ge-resume-state.sh" <<'PY'
+  "$ROOT_DIR/scripts/record-pinned-ge-resume-state.sh" "$TMP_ROOT" <<'PY'
+import fcntl
 from pathlib import Path
+import subprocess
 import sys
 
 text = Path(sys.argv[1]).read_text()
@@ -497,9 +534,22 @@ for expected in (
     'pinned_ge_require_absent_path "build artifact" "$path"',
     'pinned_ge_require_regular_or_absent "container policy" "$POLICY_FILE"',
     'pinned_ge_require_regular_or_absent "workspace build lock" "$BUILD_LOCK"',
+    'exec 9>>"$BUILD_LOCK"',
 ):
     if expected not in text:
         raise SystemExit(f"build wrapper omits safety gate: {expected}")
+# Exercise the real wrapper's lock-open line, never the shared host lock.
+# Even a rejected second contender must preserve the existing lock's bytes.
+lock_path = Path(sys.argv[4]) / 'preserved-build.lock'
+lock_path.write_bytes(b'fixture-owner\n')
+lock_open = next(line for line in text.splitlines() if line.startswith('exec 9'))
+with lock_path.open('r+b') as owner:
+    fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    contender = subprocess.run(['bash', '-eu', '-c',
+        'BUILD_LOCK="$1"\n' + lock_open + '\nflock -n 9',
+        'lock-fixture', str(lock_path)], check=False)
+    if contender.returncode != 1 or lock_path.read_bytes() != b'fixture-owner\n':
+        raise SystemExit('build lock contender changed the lock or bypassed its owner')
 early_check = text.index(
     '\nrequire_prefetched_build_contrib "$CONTRIB_MANIFEST"\n'
 )
@@ -511,6 +561,14 @@ if not early_check < low_impact_reexec < build_lock:
     raise SystemExit(
         "build-contrib completeness is not checked before re-exec and lock"
     )
+fresh_setup = text.index('python3 "$ROOT_DIR/scripts/verify-wine-fresh-setup.py"')
+if not early_check < fresh_setup < low_impact_reexec < build_lock:
+    raise SystemExit('fresh Wine setup is not mandatory before re-exec and lock')
+reexec_args = text[text.index('REEXEC_ARGS=('):text.index('[[ "$RESUME" == 0 ]]')]
+if '--fresh-setup-receipt "$FRESH_SETUP_RECEIPT"' not in reexec_args:
+    raise SystemExit('fresh setup receipt is lost by low-impact re-exec')
+if '[[ -n "$FRESH_SETUP_RECEIPT" ]]' not in text[:fresh_setup]:
+    raise SystemExit('build accepts an omitted fresh setup receipt')
 early_start = text.index("require_prefetched_build_contrib() {")
 early_end = text.index("\n# Fail before the low-impact re-exec", early_start)
 early_body = text[early_start:early_end]

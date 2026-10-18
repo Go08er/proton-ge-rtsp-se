@@ -30,3 +30,12 @@ the contained `vod-failed-range-negative` case: after the seek checkpoint, the
 HTTP fixture must record exactly one failed `GET` with status `503` and a valid
 nonzero `Range`, no retry or later media request, while MediaEngine records one
 network `ERROR`, zero `SEEKED`, zero `ENDED`, and cleared seeking/ended state.
+
+`seek_policy.py` shares ownership checks with the progressive-HTTP and main
+source audits. Historical interrupt/reuse candidates retain their exact AVIO
+recovery checks. The new serialized-seek policy requires pending ownership
+before waiting for the demux lock, pre/post-Seek Shutdown checks, common
+clear/wake/unlock, and cancellation only by teardown owners. It forbids the
+obsolete reusable-cancel latch and AVIO error clearing. Mutation controls run
+with `python3 tests/network-terminal-error/test_seek_policy.py`; these are
+structural evidence, not proof of race freedom or interactive responsiveness.

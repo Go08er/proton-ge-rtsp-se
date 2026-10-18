@@ -14,11 +14,52 @@ class HlsTimelineTests(unittest.TestCase):
         cls.create = cls.text.split('NTSTATUS demuxer_create( void *arg )', 1)[1]
         cls.seek = cls.text.split('NTSTATUS demuxer_seek( void *arg )', 1)[1]
 
-    def test_probe_hls_timing_before_publishing_source(self):
-        condition = self.create.split('format = demuxer->ctx->iformat;', 1)[1].split(
+    def assert_probe_budget(self, create):
+        condition = create.split('format = demuxer->ctx->iformat;', 1)[1].split(
             'avformat_find_stream_info', 1)[0]
         self.assertIn('strstr( format->name, "hls" )', condition)
-        self.assertIn('demuxer_set_deadline( demuxer, RTSP_OPEN_TIMEOUT_US )', condition)
+        final_check = 'if (demuxer->direct_url && demuxer_interrupt_callback( demuxer )) goto failed;'
+        if final_check not in create:
+            # Retained candidates gave probing a separate budget.
+            self.assertIn('demuxer_set_deadline( demuxer, RTSP_OPEN_TIMEOUT_US )', condition)
+            return
+        # The approved single budget covers opening AND probing. Resetting it
+        # here would silently allow a second full network timeout.
+        http, rtsp = create.split('else if ((rtsp_kind = get_rtsp_url_kind( params->url )))', 1)
+        for branch, timeout in ((http, 'HTTP'), (rtsp.split('\n    else\n', 1)[0], 'RTSP')):
+            deadline = f'demuxer_set_deadline( demuxer, {timeout}_OPEN_TIMEOUT_US );'
+            self.assertEqual(branch.count(deadline), 1)
+            self.assertLess(branch.index(deadline), branch.index('avformat_open_input'))
+        success = create.split('\nfailed:', 1)[0]
+        publish = success.index('params->demuxer.handle = (UINT_PTR)demuxer;')
+        common = success.split('format = demuxer->ctx->iformat;', 1)[1]
+        self.assertLess(success.index(final_check), publish)
+        self.assertNotIn('demuxer_set_deadline', common.split('params->demuxer.handle', 1)[0])
+        clear = 'demuxer_set_deadline( demuxer, 0 );'
+        self.assertEqual(success.count(clear), 1)
+        self.assertLess(publish, success.index(clear))
+        self.assertLess(success.index(clear), success.index('return STATUS_SUCCESS;'))
+
+    def test_probe_hls_timing_before_publishing_source(self):
+        self.assert_probe_budget(self.create)
+
+    def test_single_budget_regressions_are_rejected(self):
+        final_check = 'if (demuxer->direct_url && demuxer_interrupt_callback( demuxer )) goto failed;'
+        if final_check not in self.create:
+            self.skipTest('retained candidate predates the single opening budget')
+        for old, new in (
+            ('demuxer_set_deadline( demuxer, HTTP_OPEN_TIMEOUT_US );', ''),
+            ('demuxer_set_deadline( demuxer, RTSP_OPEN_TIMEOUT_US );', ''),
+            ('format = demuxer->ctx->iformat;',
+             'format = demuxer->ctx->iformat; demuxer_set_deadline( demuxer, RTSP_OPEN_TIMEOUT_US );'),
+            ('format = demuxer->ctx->iformat;',
+             'format = demuxer->ctx->iformat; demuxer_set_deadline( demuxer, 0 );'),
+            (final_check, ''),
+        ):
+            with self.subTest(regression=(old, new)):
+                self.assertIn(old, self.create)
+                with self.assertRaises(AssertionError):
+                    self.assert_probe_budget(self.create.replace(old, new, 1))
 
     def test_common_origin_includes_finite_hls(self):
         anchor = ('if (demuxer->ctx->start_time != AV_NOPTS_VALUE &&\n'
@@ -41,7 +82,13 @@ class HlsTimelineTests(unittest.TestCase):
         self.assertLess(self.seek.index(guard), self.seek.index(translation))
         self.assertLess(self.seek.index(translation), self.seek.index('ret = avformat_seek_file'))
         self.assertIn('if (demuxer->hls_timestamp_base != AV_NOPTS_VALUE)', self.seek)
-        self.assertIn('if (demuxer->ctx->ctx_flags & AVFMTCTX_UNSEEKABLE) return FALSE;', self.text)
+        # GE11-9 adds a finite-resource nonseekable latch to the same early
+        # rejection; neither form may bypass FFmpeg's UNSEEKABLE flag.
+        guards = (
+            'if (demuxer->ctx->ctx_flags & AVFMTCTX_UNSEEKABLE) return FALSE;',
+            'if (demuxer->nonseekable || (demuxer->ctx->ctx_flags & AVFMTCTX_UNSEEKABLE)) return FALSE;',
+        )
+        self.assertTrue(any(guard in self.text for guard in guards))
 
 
 if __name__ == '__main__':

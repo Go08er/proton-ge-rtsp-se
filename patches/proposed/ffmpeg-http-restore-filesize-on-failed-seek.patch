@@ -1,0 +1,23 @@
+diff --git a/libavformat/http.c b/libavformat/http.c
+index 03dba28..d7e5793 100644
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -2089,7 +2089,7 @@ static int64_t http_seek_internal(URLContext *h, int64_t off, int whence, int fo
+ {
+     HTTPContext *s = h->priv_data;
+     URLContext *old_hd = NULL;
+-    uint64_t old_off = s->off;
++    uint64_t old_off = s->off, old_filesize = s->filesize;
+     uint8_t old_buf[BUFFER_SIZE];
+     int old_buf_size, ret;
+     AVDictionary *options = NULL;
+@@ -2166,6 +2166,9 @@ static int64_t http_seek_internal(URLContext *h, int64_t off, int whence, int fo
+         s->buf_end = s->buffer + old_buf_size;
+         s->hd      = old_hd;
+         s->off     = old_off;
++        /* An error response's body length does not replace the entity
++         * length when rolling back to the old connection. */
++        s->filesize = old_filesize;
+         return ret;
+     }
+     av_dict_free(&options);

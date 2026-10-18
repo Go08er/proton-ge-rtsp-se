@@ -1,0 +1,43 @@
+Subject: [PATCH] mfmediaengine: start a ready source when autoplay is enabled
+
+SetAutoPlay only stored a flag. Load already consumes that flag through Play,
+but enabling it after source loading never starts an idle presentation.
+Reuse the existing Play path, as original Proton-RTSP does for an idle source.
+Do not issue another Play when the latest playback intent is already true.
+Store the property before Play can call the application back, so a reentrant
+setter wins instead of being overwritten by this older call. Propagate Play
+errors without rolling back the property. This differs deliberately from the
+original setter's post-Play property assignment.
+
+This deliberately does not add autoplay intent to asynchronous load
+completion: that requires reconciling enable/disable with the latest explicit
+Play/Pause command. Pending-load toggles remain flag-only; Load still honors
+the flag. No new state machine, source-generation rule or automatic retry.
+Apply after SE1; independent of the other parity proposals. Source/model
+coverage is not a Windows MediaEngine or VRChat playback result.
+---
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -3158,14 +3158,19 @@
+ static HRESULT WINAPI media_engine_SetAutoPlay(IMFMediaEngineEx *iface, BOOL autoplay)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    HRESULT hr = S_OK;
+ 
+-    FIXME("(%p, %d): stub.\n", iface, autoplay);
++    TRACE("%p, %d.\n", iface, autoplay);
+ 
+     EnterCriticalSection(&engine->cs);
+     media_engine_set_flag(engine, FLAGS_ENGINE_AUTO_PLAY, autoplay);
++    if (autoplay && !(engine->flags & FLAGS_ENGINE_SHUT_DOWN)
++            && engine->network_state == MF_MEDIA_ENGINE_NETWORK_IDLE
++            && !engine->playback_requested)
++        hr = IMFMediaEngineEx_Play(iface);
+     LeaveCriticalSection(&engine->cs);
+ 
+-    return S_OK;
++    return hr;
+ }
+ 
+ static BOOL WINAPI media_engine_GetLoop(IMFMediaEngineEx *iface)

@@ -13,7 +13,7 @@ actual results, and limitations of the test.
 
 Released pins and patch bytes are immutable. Use a new candidate pin and
 new patch copies when changing a selected series; do not silently retarget
-SE1's hashes, sources or release asset. Keep compilation, contained playback
+SE1's or SE2's hashes, sources or release assets. Keep compilation, contained playback
 and in-game observations separate in the qualification record.
 
 Confirmed issue captures help development, but raw Proton logs can contain

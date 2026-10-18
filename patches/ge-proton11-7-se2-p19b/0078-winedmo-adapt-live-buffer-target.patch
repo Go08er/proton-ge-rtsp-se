@@ -1,0 +1,147 @@
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -252,6 +252,8 @@
+ #define MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS 1024
+ #define MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES   (64 * 1024 * 1024)
+ #define BUFFERING_RESERVE 50000000 /* Five seconds, in 100 ns units. */
++static const LONGLONG live_targets[] = {4000000, 6000000, 9000000, 14000000, 21000000, 32000000, 50000000};
++#define LIVE_QUIET_MS 180000
+ 
+ struct media_stream;
+ 
+@@ -355,6 +357,9 @@
+     LONGLONG buffering_last_time;
+     LONG buffering, buffering_poll_busy;
+     BOOL buffering_network, read_ahead;
++    BOOL live_enabled;
++    UINT live_level, live_stutters;
++    ULONGLONG live_holds[7], live_hold, live_quiet;
+     IMFAsyncCallback async_commands_callback;
+     LONG ref;
+     DWORD async_commands_queue;
+@@ -434,6 +439,11 @@
+                 active ? MEBufferingStarted : MEBufferingStopped, &GUID_NULL, S_OK, NULL);
+         if (active && FAILED(hr)) return;
+         InterlockedExchange(&source->buffering, active);
++        if (source->live_enabled && source->rate == 1.0f)
++        {
++            source->live_hold = active ? GetTickCount64() : 0;
++            source->live_quiet = active ? 0 : GetTickCount64();
++        }
+     }
+     for (i = 0; i < source->stream_count; ++i)
+     {
+@@ -455,6 +465,37 @@
+         source->streams[i]->delivered_known = FALSE;
+         source->streams[i]->starved_ms = 0;
+     }
++}
++
++/* Only naturally completed holds measure jitter, not Pause, Stop or seek. */
++static void live_hold_complete(struct media_source *source, ULONGLONG now)
++{
++    UINT expired = 0;
++    if (!source->live_enabled || source->rate != 1.0f || !source->live_hold || now - source->live_hold < 500) return;
++    while (expired < source->live_stutters && now - source->live_holds[expired] >= 120000) ++expired;
++    source->live_stutters -= expired;
++    memmove(source->live_holds, source->live_holds + expired, source->live_stutters * sizeof(*source->live_holds));
++    if (source->live_level + 1 == ARRAY_SIZE(live_targets)) return;
++    if (source->live_stutters < ARRAY_SIZE(source->live_holds)) source->live_holds[source->live_stutters++] = now;
++    if (source->live_stutters >= source->live_level + 2)
++    {
++        ++source->live_level;
++        source->live_stutters = 0;
++    }
++}
++
++/* Queue lock held. Packet PTS span avoids counting multi-frame AAC packets as
++ * one AAC frame. Unknown timestamps cannot establish a refill reserve. */
++static LONGLONG live_queue_span(struct media_stream *stream)
++{
++    struct media_packet *pkt;
++    LONGLONG first = INT64_MAX, last = INT64_MIN;
++    LIST_FOR_EACH_ENTRY(pkt, &stream->packet_queue, struct media_packet, entry)
++    {
++        if (pkt->pts == INT64_MIN) return 0;
++        first = min(first, pkt->pts); last = max(last, pkt->pts);
++    }
++    return last <= first || (first < 0 && last > INT64_MAX + first) ? 0 : last - first;
+ }
+ 
+ /* The timer retains the source. Clock calls occur outside all source/queue locks;
+@@ -487,6 +528,11 @@
+     if (source->state != SOURCE_RUNNING || source->demux_thread_shutdown || source->read_flushing
+             || generation != source->buffering_generation || clock != source->clock)
+         goto done;
++    if (source->live_enabled && source->rate == 1.0f && !source->buffering && source->live_quiet && now - source->live_quiet >= LIVE_QUIET_MS)
++    {
++        if (source->live_level) --source->live_level;
++        source->live_quiet = now;
++    }
+     for (i = 0; i < source->stream_count; ++i)
+     {
+         struct media_stream *stream = source->streams[i];
+@@ -495,7 +541,8 @@
+         EnterCriticalSection(&stream->queue_cs);
+         packets += stream->queued_packets; bytes += stream->queued_bytes;
+         eos = stream->eos;
+-        if (!eos && (stream->queued_unknown || stream->queued_duration < BUFFERING_RESERVE)) ready = FALSE;
++        if (!eos && (source->live_enabled && source->rate == 1.0f ? live_queue_span(stream) < live_targets[source->live_level] :
++                stream->queued_unknown || stream->queued_duration < BUFFERING_RESERVE)) ready = FALSE;
+         LeaveCriticalSection(&stream->queue_cs);
+         if (eos) continue;
+         if (FAILED(hr) || state != MFCLOCK_STATE_RUNNING || !stream->delivered_known
+@@ -512,7 +559,10 @@
+     if (source->buffering)
+     {
+         if (ready || packets >= MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS || bytes >= MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES)
++        {
++            live_hold_complete(source, now);
+             source_buffering(source, FALSE);
++        }
+     }
+     else if (eligible && exhausted) source_buffering(source, TRUE);
+     if (SUCCEEDED(hr)) source->buffering_last_time = time;
+@@ -657,7 +707,7 @@
+ 
+     return !any_active || queued_packets >= MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS
+             || queued_bytes >= MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES
+-            || (primed && any_full && (!source->read_ahead || !duration_known)
++            || ((!source->live_enabled || source->rate != 1.0f) && primed && any_full && (!source->read_ahead || !duration_known)
+             && !InterlockedCompareExchange(&source->buffering, 0, 0))
+             || (source->read_ahead && duration_full);
+ }
+@@ -1229,6 +1279,8 @@
+     {
+         HRESULT seek_error = S_OK;
+ 
++        source->live_level = source->live_stutters = 0;
++        source->live_hold = 0;
+         /* Make every read from the old timeline distinguishable even if the
+          * complete flush begins and ends before that read returns. */
+         media_source_begin_demux_transition(source);
+@@ -1378,6 +1430,8 @@
+         source->eop_queued = false;
+     }
+ 
++    source->live_enabled = source->buffering_network && !source->read_ahead && !source->has_duration;
++    source->live_quiet = GetTickCount64();
+     source->state = SOURCE_RUNNING;
+ 
+     for (i = 0; i < source->stream_count; i++)
+@@ -1404,6 +1458,7 @@
+         return MF_E_SHUTDOWN;
+ 
+     reset_buffering(source);
++    source->live_enabled = FALSE;
+     for (i = 0; i < source->stream_count; i++)
+     {
+         struct media_stream *stream = source->streams[i];
+@@ -1431,6 +1486,7 @@
+     if (source->state == SOURCE_SHUTDOWN)
+         return MF_E_SHUTDOWN;
+     reset_buffering(source);
++    source->live_enabled = FALSE;
+ 
+     for (i = 0; i < source->stream_count; i++)
+     {

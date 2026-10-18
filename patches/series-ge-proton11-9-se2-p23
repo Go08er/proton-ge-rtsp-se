@@ -1,0 +1,24 @@
+# GE-Proton11-9 SE2-P23 UNQUALIFIED terminal-error/read-ahead/stall-seek source candidate.
+# Apply strictly after GE ge-video-rework; P23 not yet built or runtime-qualified.
+# P22's thirteen modules are byte-identical; four new modules follow them:
+# 0021 mf clock stop after a terminal start error, 0022 winedmo deferred read-ahead
+# data errors, 0023 winedmo interrupt stalled read on seek, 0024 winedmo adopt GE HTTP reconnect.
+# They touch only dlls/mf/session.c, dlls/winedmo/media_source.c and unix_demuxer.c; no new files.
+# UNQUALIFIED: component compile and targeted tests only; no broad qualification.
+ge-proton11-9-se2-p23/0001-winedmo-retain-bounded-network-and-origin-contract.patch
+ge-proton11-9-se2-p23/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch
+ge-proton11-9-se2-p23/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch
+ge-proton11-9-se2-p23/0004-winedmo-retain-codec-admission-and-format-validation.patch
+ge-proton11-9-se2-p23/0005-mfreadwrite-retain-reader-error-layout-and-origin-contract.patch
+ge-proton11-9-se2-p23/0006-mf-retain-session-lifecycle-and-demand-accounting.patch
+ge-proton11-9-se2-p23/0007-mf-retain-sar-flush-demand-and-marker-ownership.patch
+ge-proton11-9-se2-p23/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch
+ge-proton11-9-se2-p23/0009-mfmediaengine-retain-render-clock-frame-demand.patch
+ge-proton11-9-se2-p23/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch
+ge-proton11-9-se2-p23/0011-mfplat-retain-failed-async-result-status.patch
+ge-proton11-9-se2-p23/0012-winewayland-retain-vr-device-extensions.patch
+ge-proton11-9-se2-p23/0013-mf-tests-retain-held-marker-context.patch
+ge-proton11-9-se2-p23/0021-mf-stop-clock-after-terminal-start-error.patch
+ge-proton11-9-se2-p23/0022-winedmo-defer-read-ahead-data-errors.patch
+ge-proton11-9-se2-p23/0023-winedmo-interrupt-stalled-read-on-seek.patch
+ge-proton11-9-se2-p23/0024-winedmo-adopt-ge-http-reconnect.patch

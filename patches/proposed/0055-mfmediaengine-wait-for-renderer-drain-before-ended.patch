@@ -1,0 +1,40 @@
+Subject: [PATCH] mfmediaengine: wait for session completion before reporting ended
+
+Source MEEndOfPresentation means that no more input will arrive, not that
+the transforms and sinks have consumed their remaining output. GE serializes
+replay behind that drain. Reporting public ENDED early lets the client stop
+pulling frames, or reset the frame sink for a seek, before the last demand
+needed to forward the video end marker. The queued replay can then wait
+forever for the old session to finish.
+
+Use the existing MESessionEnded handler for the public ended state and loop
+restart, as the original Proton-RTSP MediaEngine does. Keep the session's
+drain barrier, marker generations, explicit seek-to-duration handling and
+terminal-error handling unchanged. No delay, retry or timeout is introduced.
+
+P12's immediate post-EOS MPEG A/V replay is the negative runtime control.
+The same packets without audio pass, and continuing frame consumption for
+300 ms before replay passes; neither diagnostic workaround is a product fix.
+The new source must pass the original immediate-replay oracle before adoption.
+---
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -1251,17 +1251,6 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface,
+             break;
+         }
+ 
+-        case MEEndOfPresentation:
+-            EnterCriticalSection(&engine->cs);
+-            /* Media Engine users may wait on ended state before replacing the
+-             * source. Network streams can deliver source end-of-presentation
+-             * before every renderer has drained enough to produce MESessionEnded. */
+-            ended_event = media_engine_handle_ended(engine);
+-            LeaveCriticalSection(&engine->cs);
+-            if (ended_event)
+-                IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ENDED, 0, 0);
+-            break;
+-
+         case MEEndOfPresentationSegment:
+             EnterCriticalSection(&engine->cs);
+             if (engine->presentation.frame_sink)

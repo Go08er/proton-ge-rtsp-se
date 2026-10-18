@@ -9,6 +9,35 @@ pinned_ge_fail() {
   return 1
 }
 
+# Rootless hosts need not delegate the CPU/cpuset cgroup controllers. Apply
+# affinity inside the SDK instead; keep its original entrypoint/init after
+# taskset, and never broaden the caller's allowed CPU set.
+pinned_ge_container_cpu_options() {
+  local jobs="$1" entrypoint="${2:-null}" cpuset
+  [[ "$jobs" =~ ^[1-9][0-9]*$ ]] \
+    || { pinned_ge_fail "invalid container CPU budget: $jobs"; return 1; }
+  cpuset="$(awk '$1 == "Cpus_allowed_list:" {print $2}' /proc/self/status)"
+  [[ "$cpuset" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] \
+    || { pinned_ge_fail "could not determine host CPU affinity"; return 1; }
+  python3 - "$jobs" "$cpuset" "$entrypoint" <<'PY'
+import json
+import shlex
+import sys
+
+jobs, mask, original = sys.argv[1:]
+cpus = []
+for part in mask.split(','):
+    limits = list(map(int, part.split('-')))
+    cpus.extend(range(limits[0], limits[-1] + 1))
+selected = ','.join(map(str, sorted(set(cpus))[:int(jobs)]))
+entrypoint = json.loads(original) or []
+if not selected or not isinstance(entrypoint, list) or not all(isinstance(arg, str) for arg in entrypoint):
+    raise SystemExit('invalid container affinity/entrypoint')
+command = ['/usr/bin/taskset', '-c', selected, *entrypoint]
+print('--entrypoint=' + shlex.quote(json.dumps(command, separators=(',', ':'))))
+PY
+}
+
 pinned_ge_launcher_patch_record() {
   if [[ "$PIN_PROTON_LAUNCHER_POLICY" == upstream ]]; then
     printf 'none\n'
@@ -78,7 +107,15 @@ pinned_ge_load_config() {
     PIN_GE_PATCH_OVERLAP_MANIFEST
     PIN_GE_PATCH_OVERLAP_MANIFEST_SHA256
   )
-  local -a optional_keys=(PIN_PROTON_LAUNCHER_POLICY)
+  local -a optional_keys=(PIN_PROTON_LAUNCHER_POLICY
+    PIN_FFMPEG_CRYPTO_BUILD_SERIES
+    PIN_FFMPEG_DAV1D_PATCH_SHA256 PIN_FFMPEG_DAV1D_MAKEFILE_BLOB
+    PIN_FFMPEG_MPEGVIDEO_PATCH_SHA256 PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB
+    PIN_FFMPEG_AAC_PARSER_PATCH_SHA256 PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB
+    PIN_FFMPEG_RTSPS_PATCH_SHA256 PIN_FFMPEG_RTSPS_RTSP_BLOB
+    PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256 PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB
+    PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256 PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB
+    PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256 PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB)
   local -A seen=() allowed=()
 
   # The loader may be called repeatedly in one shell, and callers may export
@@ -305,6 +342,131 @@ pinned_ge_load_config() {
   done
   [[ "$PIN_WITHOUT_NVIDIA_LIBS" =~ ^[01]$ && "$PIN_WITHOUT_VKLAYERS" =~ ^[01]$ ]] \
     || pinned_ge_fail "optional-component flags must be 0 or 1" || return 1
+  if [[ -n "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]]; then
+    [[ "$PIN_SCHEMA_VERSION" == 5 \
+        && "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}" =~ ^[0-9a-f]{64}$ \
+        && "${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" =~ ^[0-9a-f]{40}$ ]] \
+      || pinned_ge_fail "dav1d build module requires both patch and final Makefile digests in schema 5" || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_RTSPS_PATCH_SHA256:-}${PIN_FFMPEG_RTSPS_RTSP_BLOB:-}" ]]; then
+    [[ "$PIN_SCHEMA_VERSION" == 5 \
+        && "${PIN_FFMPEG_RTSPS_PATCH_SHA256:-}" =~ ^[0-9a-f]{64}$ \
+        && "${PIN_FFMPEG_RTSPS_RTSP_BLOB:-}" =~ ^[0-9a-f]{40}$ ]] \
+      || pinned_ge_fail "secure RTSP module requires both patch and final rtsp.c digests in schema 5" || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_MPEGVIDEO_PATCH_SHA256:-}${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" ]]; then
+    [[ "$PIN_SCHEMA_VERSION" == 5 \
+        && "${PIN_FFMPEG_MPEGVIDEO_PATCH_SHA256:-}" =~ ^[0-9a-f]{64}$ \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" =~ ^[0-9a-f]{40}$ ]] \
+      || pinned_ge_fail "MPEGVIDEO build module requires both patch and final Makefile digests in schema 5" || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" ]]; then
+    # The AAC hunk's context contains the MPEGVIDEO flag, so it can only follow it.
+    [[ "$PIN_SCHEMA_VERSION" == 5 && -n "${PIN_FFMPEG_MPEGVIDEO_PATCH_SHA256:-}" \
+        && "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" =~ ^[0-9a-f]{64}$ \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" =~ ^[0-9a-f]{40}$ ]] \
+      || pinned_ge_fail "AAC parser build module requires the MPEGVIDEO module and both patch and final Makefile digests in schema 5" || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}${PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB:-}" ]]; then
+    [[ "$PIN_SCHEMA_VERSION" == 5 \
+        && "${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}" =~ ^[0-9a-f]{64}$ \
+        && "${PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB:-}" =~ ^[0-9a-f]{40}$ ]] \
+      || pinned_ge_fail "HTTP seek module requires both patch and final http.c digests in schema 5" || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}${PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB:-}" ]]; then
+    [[ "$PIN_SCHEMA_VERSION" == 5 && -n "${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}" \
+        && "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" =~ ^[0-9a-f]{64}$ \
+        && "${PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB:-}" =~ ^[0-9a-f]{40}$ ]] \
+      || pinned_ge_fail "HTTP filesize companion requires the HTTP-seek module and both patch/postimage digests in schema 5" || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}${PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB:-}" ]]; then
+    [[ "$PIN_SCHEMA_VERSION" == 5 \
+        && "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" =~ ^[0-9a-f]{64}$ \
+        && "${PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB:-}" =~ ^[0-9a-f]{40}$ ]] \
+      || pinned_ge_fail "HLS early-seek companion requires both patch/postimage digests in schema 5" || return 1
+  fi
+}
+
+pinned_ge_http_filesize_patch() {
+  local patch="$PINNED_GE_ROOT/patches/proposed/ffmpeg-http-restore-filesize-on-failed-seek.patch"
+  [[ -n "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" \
+      && "$(pinned_ge_sha256 "$patch")" == "$PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256" ]] \
+    || pinned_ge_fail "HTTP filesize companion differs from the selected pin" || return 1
+  printf '%s\n' "$patch"
+}
+
+pinned_ge_hls_early_seek_patch() {
+  local patch="$PINNED_GE_ROOT/patches/proposed/ffmpeg-hls-allow-seeks-before-first-segment.patch"
+  [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" \
+      && "$(pinned_ge_sha256 "$patch")" == "$PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256" ]] \
+    || pinned_ge_fail "HLS early-seek companion differs from the selected pin" || return 1
+  printf '%s\n' "$patch"
+}
+
+# Named P19b companions, separate from the unchanged four security backports.
+# Empty output preserves historical prepared/build receipts byte-for-byte.
+pinned_ge_ffmpeg_playback_records() {
+  if [[ -n "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" ]]; then
+    printf 'ffmpeg_http_filesize_patch_sha256\t%s\nffmpeg_http_filesize_http_blob\t%s\n' \
+      "$PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256" "$PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB"
+  fi
+  if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" ]]; then
+    printf 'ffmpeg_hls_early_seek_patch_sha256\t%s\nffmpeg_hls_early_seek_hls_blob\t%s\n' \
+      "$PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256" "$PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB"
+  fi
+}
+
+pinned_ge_require_ffmpeg_playback_state() {
+  local file="$1" key expected
+  while IFS=$'\t' read -r key expected; do
+    [[ -n "$key" ]] || continue
+    [[ "$(pinned_ge_state_value "$file" "$key")" == "$expected" ]] \
+      || pinned_ge_fail "FFmpeg playback companion provenance differs for $key" || return 1
+  done < <(pinned_ge_ffmpeg_playback_records)
+}
+
+pinned_ge_http_seek_patch() {
+  local patch="$PINNED_GE_ROOT/patches/proposed/ffmpeg-http-seek-respect-connection-close.patch"
+  [[ -n "${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}" \
+      && "$(pinned_ge_sha256 "$patch")" == "$PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256" ]] \
+    || pinned_ge_fail "HTTP seek companion differs from the selected pin" || return 1
+  printf '%s\n' "$patch"
+}
+
+pinned_ge_rtsps_transport_patch() {
+  local patch="$PINNED_GE_ROOT/patches/proposed/ffmpeg-keep-rtsps-redirects-secure.patch"
+  [[ -n "${PIN_FFMPEG_RTSPS_PATCH_SHA256:-}" \
+      && "$(pinned_ge_sha256 "$patch")" == "$PIN_FFMPEG_RTSPS_PATCH_SHA256" ]] \
+    || pinned_ge_fail "secure RTSP companion differs from the selected pin" || return 1
+  printf '%s\n' "$patch"
+}
+
+pinned_ge_ffmpeg_final_makefile_blob() {
+  printf '%s\n' "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB}}}"
+}
+
+pinned_ge_mpegvideo_build_patch() {
+  local patch="$PINNED_GE_ROOT/patches/proposed/ffmpeg-enable-mpeg-video-parser.patch"
+  [[ -n "${PIN_FFMPEG_MPEGVIDEO_PATCH_SHA256:-}" \
+      && "$(pinned_ge_sha256 "$patch")" == "$PIN_FFMPEG_MPEGVIDEO_PATCH_SHA256" ]] \
+    || pinned_ge_fail "MPEGVIDEO build patch differs from the selected pin" || return 1
+  printf '%s\n' "$patch"
+}
+
+pinned_ge_aac_parser_build_patch() {
+  local patch="$PINNED_GE_ROOT/patches/proposed/ffmpeg-enable-aac-parser.patch"
+  [[ -n "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" \
+      && "$(pinned_ge_sha256 "$patch")" == "$PIN_FFMPEG_AAC_PARSER_PATCH_SHA256" ]] \
+    || pinned_ge_fail "AAC parser build patch differs from the selected pin" || return 1
+  printf '%s\n' "$patch"
+}
+
+pinned_ge_dav1d_build_patch() {
+  local patch="$PINNED_GE_ROOT/patches/proposed/ffmpeg-enable-libdav1d-av1-decoding.patch"
+  [[ -n "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}" \
+      && "$(pinned_ge_sha256 "$patch")" == "$PIN_FFMPEG_DAV1D_PATCH_SHA256" ]] \
+    || pinned_ge_fail "dav1d build patch differs from the selected pin" || return 1
+  printf '%s\n' "$patch"
 }
 
 pinned_ge_require_safe_absolute_path() {
@@ -514,6 +676,16 @@ pinned_ge_require_ffmpeg_config_surface() {
   done
   pinned_ge_require_exact_ffmpeg_define "$config" CONFIG_GNUTLS 1 \
     || return 1
+  if [[ -n "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}" ]]; then
+    pinned_ge_require_exact_ffmpeg_define "$config" CONFIG_LIBDAV1D 1 || return 1
+    pinned_ge_require_exact_ffmpeg_define "$components" CONFIG_LIBDAV1D_DECODER 1 || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_MPEGVIDEO_PATCH_SHA256:-}" ]]; then
+    pinned_ge_require_exact_ffmpeg_define "$components" CONFIG_MPEGVIDEO_PARSER 1 || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" ]]; then
+    pinned_ge_require_exact_ffmpeg_define "$components" CONFIG_AAC_PARSER 1 || return 1
+  fi
   pinned_ge_require_exact_ffmpeg_define "$config" CONFIG_LIBZMQ 0 \
     || return 1
   pinned_ge_require_exact_ffmpeg_define "$components" CONFIG_ZMQ_FILTER 0 \
@@ -557,19 +729,31 @@ pinned_ge_require_ffmpeg_config_surface() {
   }
 }
 
+pinned_ge_job_cap() {
+  # An operator may explicitly authorize more CPUs after a pin was frozen.
+  # Keep the pin unchanged and never infer permission from idle CPU capacity.
+  local cap="${PINNED_GE_AUTHORIZED_JOB_CAP-$PIN_DEFAULT_JOBS}"
+  [[ "$cap" =~ ^[1-9][0-9]*$ && "$cap" -ge "$PIN_DEFAULT_JOBS" ]] \
+    || pinned_ge_fail "authorized job cap must be an integer at least $PIN_DEFAULT_JOBS" \
+    || return 1
+  printf '%s\n' "$cap"
+}
+
 pinned_ge_validate_job_schedule() {
   local global_jobs="$1"
   local make_jobs="$2"
   local ninja_jobs="$3"
-  local product
+  local product cap
+
+  cap="$(pinned_ge_job_cap)" || return 1
 
   [[ "$global_jobs" =~ ^[1-9][0-9]*$ \
       && "$make_jobs" =~ ^[1-9][0-9]*$ \
       && "$ninja_jobs" =~ ^[1-9][0-9]*$ ]] \
     || pinned_ge_fail "global, Make, and Ninja job counts must be positive integers" \
     || return 1
-  [[ "$global_jobs" -le "$PIN_DEFAULT_JOBS" ]] \
-    || pinned_ge_fail "global jobs exceed the accepted cap $PIN_DEFAULT_JOBS" \
+  [[ "$global_jobs" -le "$cap" ]] \
+    || pinned_ge_fail "global jobs exceed the accepted cap $cap" \
     || return 1
   [[ "$make_jobs" -le "$global_jobs" && "$ninja_jobs" -le "$global_jobs" ]] \
     || pinned_ge_fail "Make and Ninja jobs must not exceed the global budget $global_jobs" \
@@ -586,12 +770,14 @@ pinned_ge_resolve_job_schedule() {
   local global_jobs="$1"
   local make_jobs="${2:-}"
   local ninja_jobs="${3:-}"
-  local max_jobs product
+  local max_jobs product cap
+
+  cap="$(pinned_ge_job_cap)" || return 1
 
   [[ "$global_jobs" =~ ^[1-9][0-9]*$ ]] \
     || pinned_ge_fail "global jobs must be a positive integer" || return 1
-  [[ "$global_jobs" -le "$PIN_DEFAULT_JOBS" ]] \
-    || pinned_ge_fail "global jobs exceed the accepted cap $PIN_DEFAULT_JOBS" \
+  [[ "$global_jobs" -le "$cap" ]] \
+    || pinned_ge_fail "global jobs exceed the accepted cap $cap" \
     || return 1
   if [[ -n "$make_jobs" && ! "$make_jobs" =~ ^[1-9][0-9]*$ ]]; then
     pinned_ge_fail "Make jobs must be a positive integer"
@@ -674,8 +860,10 @@ pinned_ge_require_prepared_media_provenance() (
     || pinned_ge_fail "GE media-cleanup manifest differs from its pinned digest" \
     || return 1
 
-  [[ "$(pinned_ge_state_value "$manifest" media_cleanup_version)" == 1 ]] \
-    || pinned_ge_fail "unsupported GE media-cleanup manifest version" || return 1
+  case "$(pinned_ge_state_value "$manifest" media_cleanup_version)" in
+    1|2) ;;
+    *) pinned_ge_fail "unsupported GE media-cleanup manifest version" || return 1 ;;
+  esac
   [[ "$(pinned_ge_state_value "$manifest" source_commit)" == "$PIN_SOURCE_COMMIT" ]] \
     || pinned_ge_fail "GE media-cleanup manifest is pinned to another source" \
     || return 1
@@ -847,10 +1035,10 @@ pinned_ge_default_source() {
 }
 
 pinned_ge_default_build_dir() {
-  # Piper/eSpeak has a nested-path failure on long build roots. Keep the
-  # disposable object path short; verified artifacts remain named by the full
-  # compatibility-tool identity inside it.
-  printf '%s/rtsp-ge11-%s\n' "${PINNED_GE_BUILD_ROOT:-/tmp}" \
+  # Keep new objects on the project drive, never the host's /tmp. Piper/eSpeak
+  # can require a shorter explicit --build-dir or PINNED_GE_BUILD_ROOT; verified
+  # artifacts retain the full compatibility-tool identity inside that path.
+  printf '%s/rtsp-ge11-%s\n' "${PINNED_GE_BUILD_ROOT:-$PINNED_GE_ROOT/work/builds}" \
     "${PIN_SOURCE_COMMIT:0:8}"
 }
 
@@ -859,10 +1047,22 @@ pinned_ge_default_state_dir() {
 }
 
 pinned_ge_registered_submodules() {
-  local source="$1"
+  local source="$1" path _key
   pinned_ge_git -C "$source" config -f .gitmodules \
     --get-regexp '^submodule\..*\.path$' \
-    | awk '$2 !~ /^(nvidia-libs|vklayers)\// {print $2}'
+    | while read -r _key path; do
+        case "$path" in
+          nvidia-libs/*) [[ "${PIN_WITHOUT_NVIDIA_LIBS:-1}" != 1 ]] || continue ;;
+          vklayers/*) [[ "${PIN_WITHOUT_VKLAYERS:-1}" != 1 ]] || continue ;;
+        esac
+        # GE11-6 retains this obsolete .gitmodules entry, but the tree and
+        # active build rules use the ordinary top-level dxvk-nvapi instead.
+        if [[ "$path" == nvidia-libs/dxvk-nvapi \
+            && -z "$(pinned_ge_git -C "$source" ls-tree HEAD -- "$path")" ]]; then
+          continue
+        fi
+        printf '%s\n' "$path"
+      done
 }
 
 pinned_ge_require_original_build_rules() {
@@ -878,6 +1078,38 @@ pinned_ge_require_original_build_rules() {
     || pinned_ge_fail "rules-meson content differs from the accepted snapshot" \
     || return 1
 }
+
+pinned_ge_nvidia_build_rules() (
+  # Reduced historical pins never build this rule. Full-GE pins derive the
+  # one-line normalization from their immutable superproject, not a moving
+  # working copy; the ordinary prepared root-state digest records the result.
+  [[ "${PIN_WITHOUT_NVIDIA_LIBS:-1}" == 0 ]] || return 0
+  local source="$1" operation="$2" rules="$1/make/rules-nvidia-libs.mk"
+  [[ "$operation" == normalize || "$operation" == check ]] \
+    || pinned_ge_fail "invalid NVIDIA build-rule operation: $operation" || return 1
+  [[ -f "$rules" && ! -L "$rules" ]] \
+    || pinned_ge_fail "NVIDIA build rule is absent or unsafe" || return 1
+  set -o pipefail
+  pinned_ge_git -C "$source" show "$PIN_SOURCE_COMMIT:make/rules-nvidia-libs.mk" \
+    | python3 -c '
+from pathlib import Path
+import sys
+
+path, operation = Path(sys.argv[1]), sys.argv[2]
+original = sys.stdin.buffer.read()
+old = b"\tninja -C \"$$($(2)_$(3)_OBJ)\" install\n"
+new = b"\tninja -j\"$$(NINJA_JOBS)\" -C \"$$($(2)_$(3)_OBJ)\" install\n"
+if original.count(old) != 1:
+    raise SystemExit("expected exactly one unbounded NVIDIA Ninja invocation in the pinned source")
+expected = original.replace(old, new, 1)
+if operation == "normalize":
+    if path.read_bytes() != original:
+        raise SystemExit("NVIDIA build rule differs from the pinned original; refusing normalization")
+    path.write_bytes(expected)
+elif path.read_bytes() != expected:
+    raise SystemExit("bounded NVIDIA Ninja rule differs from the pinned whole-file result")
+' "$rules" "$operation"
+)
 
 pinned_ge_require_source_identity() {
   local source="$1"
@@ -908,9 +1140,9 @@ pinned_ge_require_source_identity() {
     [[ "$PIN_SCHEMA_VERSION" == 5 \
         && "$(pinned_ge_git -C "$source" \
           hash-object --no-filters -- Makefile.in)" \
-          == "$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB" ]] \
+          == "$(pinned_ge_ffmpeg_final_makefile_blob)" ]] \
       || pinned_ge_fail \
-        "GE Makefile.in is neither the accepted snapshot nor schema-5 crypto result" \
+        "GE Makefile.in is neither the accepted snapshot nor the selected schema-5 build result" \
       || return 1
   fi
   [[ "$(pinned_ge_sha256 "$source/configure.sh")" == "$PIN_CONFIGURE_SHA256" ]] \
@@ -1148,6 +1380,13 @@ pinned_ge_ffmpeg_security_touched_paths() {
   printf '%s\n' "$paths"
 }
 
+pinned_ge_ffmpeg_crypto_build_series() {
+  local relative="${PIN_FFMPEG_CRYPTO_BUILD_SERIES:-patches/ffmpeg-build/series}"
+  [[ "$relative" =~ ^patches/ffmpeg-build/series(-[A-Za-z0-9-]+)?$ ]] \
+    || { pinned_ge_fail "unsafe FFmpeg crypto-build series path: $relative"; return 1; }
+  printf '%s/%s\n' "$PINNED_GE_ROOT" "$relative"
+}
+
 pinned_ge_ffmpeg_crypto_build_patch_record() {
   local patch_root="$1"
   local series="$2"
@@ -1329,6 +1568,39 @@ pinned_ge_require_prepared_ffmpeg_security_provenance() (
   fix_count="$(wc -l <<<"$records")"
   expected_touched_paths="$(pinned_ge_ffmpeg_security_touched_paths \
     "$patch_root" "$series")" || return 1
+  if [[ -n "${PIN_FFMPEG_RTSPS_PATCH_SHA256:-}" ]]; then
+    pinned_ge_rtsps_transport_patch >/dev/null || return 1
+    expected_touched_paths="$(printf '%s\nlibavformat/rtsp.c\n' "$expected_touched_paths" | LC_ALL=C sort -u)"
+    [[ "$(pinned_ge_git -C "$source/ffmpeg" hash-object --no-filters -- libavformat/rtsp.c)" \
+        == "$PIN_FFMPEG_RTSPS_RTSP_BLOB" \
+        && "$(pinned_ge_state_value "$patch_audit" rtsps_patch_sha256)" == "$PIN_FFMPEG_RTSPS_PATCH_SHA256" \
+        && "$(pinned_ge_state_value "$patch_audit" rtsps_rtsp_blob)" == "$PIN_FFMPEG_RTSPS_RTSP_BLOB" ]] \
+      || pinned_ge_fail "secure RTSP companion postimage or audit differs from the pin" || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}" ]]; then
+    pinned_ge_http_seek_patch >/dev/null || return 1
+    expected_touched_paths="$(printf '%s\nlibavformat/http.c\n' "$expected_touched_paths" | LC_ALL=C sort -u)"
+    [[ "$(pinned_ge_git -C "$source/ffmpeg" hash-object --no-filters -- libavformat/http.c)" \
+        == "${PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB:-$PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB}" \
+        && "$(pinned_ge_state_value "$patch_audit" http_seek_patch_sha256)" == "$PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256" \
+        && "$(pinned_ge_state_value "$patch_audit" http_seek_http_blob)" == "$PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB" ]] \
+      || pinned_ge_fail "HTTP seek companion postimage or audit differs from the pin" || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" ]]; then
+    pinned_ge_http_filesize_patch >/dev/null || return 1
+    [[ "$(pinned_ge_state_value "$patch_audit" http_filesize_patch_sha256)" == "$PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256" \
+        && "$(pinned_ge_state_value "$patch_audit" http_filesize_http_blob)" == "$PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB" ]] \
+      || pinned_ge_fail "HTTP filesize companion audit differs from the pin" || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" ]]; then
+    pinned_ge_hls_early_seek_patch >/dev/null || return 1
+    expected_touched_paths="$(printf '%s\nlibavformat/hls.c\n' "$expected_touched_paths" | LC_ALL=C sort -u)"
+    [[ "$(pinned_ge_git -C "$source/ffmpeg" hash-object --no-filters -- libavformat/hls.c)" \
+        == "$PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB" \
+        && "$(pinned_ge_state_value "$patch_audit" hls_early_seek_patch_sha256)" == "$PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256" \
+        && "$(pinned_ge_state_value "$patch_audit" hls_early_seek_hls_blob)" == "$PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB" ]] \
+      || pinned_ge_fail "HLS early-seek companion postimage or audit differs from the pin" || return 1
+  fi
   touched_count="$(wc -l <<<"$expected_touched_paths")"
   series_digest="$(pinned_ge_series_digest "$patch_root" "$series")" || return 1
   expected_patch_rows="$(while IFS=$'\t' read -r index entry fix patch_sha \
@@ -1351,7 +1623,10 @@ pinned_ge_require_prepared_ffmpeg_security_provenance() (
     || return 1
 
   awk -F '\t' -v expected_patches="$fix_count" \
-      -v expected_touched="$touched_count" '
+      -v expected_touched="$touched_count" -v rtsps="${PIN_FFMPEG_RTSPS_PATCH_SHA256:-}" \
+      -v http_seek="${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}" \
+      -v http_filesize="${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" \
+      -v hls_early_seek="${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" '
     BEGIN {
       unique["ffmpeg_security_patch_audit_version"] = 1
       unique["base_commit"] = 1
@@ -1365,6 +1640,22 @@ pinned_ge_require_prepared_ffmpeg_security_provenance() (
       unique["ffmpeg_repo_state_sha256"] = 1
       unique["source_diff_check"] = 1
       unique["security_series_application"] = 1
+      if (rtsps != "") {
+        unique["rtsps_patch_sha256"] = 1
+        unique["rtsps_rtsp_blob"] = 1
+      }
+      if (http_seek != "") {
+        unique["http_seek_patch_sha256"] = 1
+        unique["http_seek_http_blob"] = 1
+      }
+      if (http_filesize != "") {
+        unique["http_filesize_patch_sha256"] = 1
+        unique["http_filesize_http_blob"] = 1
+      }
+      if (hls_early_seek != "") {
+        unique["hls_early_seek_patch_sha256"] = 1
+        unique["hls_early_seek_hls_blob"] = 1
+      }
     }
     $1 == "patch" {
       if (NF != 6) bad = 1
@@ -1387,6 +1678,7 @@ pinned_ge_require_prepared_ffmpeg_security_provenance() (
   ' "$patch_audit" \
     || pinned_ge_fail "FFmpeg security patch audit has an unexpected schema" \
     || return 1
+  pinned_ge_require_ffmpeg_playback_state "$state_file" || return 1
 
   magicyuv_blob="$(pinned_ge_git -C "$source/ffmpeg" \
     hash-object --no-filters -- libavcodec/magicyuv.c)"
@@ -1404,7 +1696,7 @@ pinned_ge_require_prepared_ffmpeg_security_provenance() (
       && -z "$(pinned_ge_git -C "$source/ffmpeg" diff --name-only --cached --)" \
       && -z "$(pinned_ge_git -C "$source/ffmpeg" \
         ls-files --others --exclude-standard)" ]] \
-    || pinned_ge_fail "prepared FFmpeg has changes outside the security backport" \
+    || pinned_ge_fail "prepared FFmpeg has changes outside the security backport and selected transport module" \
     || return 1
   pinned_ge_git -C "$source/ffmpeg" diff --check || return 1
   repo_state="$(pinned_ge_repo_state_digest "$source/ffmpeg")" || return 1
@@ -1467,13 +1759,13 @@ pinned_ge_require_prepared_ffmpeg_crypto_build_provenance() (
   local source="$1"
   local state_dir="$2"
   local state_file patch_root series audit record entry origin patch_sha
-  local series_digest makefile_blob enable_count
+  local series_digest makefile_blob enable_count chain_makefile_dir
 
   source="$(realpath -e -- "$source")"
   state_dir="$(realpath -e -- "$state_dir")"
   state_file="$state_dir/prepared-source.tsv"
   patch_root="$PINNED_GE_ROOT/patches/ffmpeg-build"
-  series="$patch_root/series"
+  series="$(pinned_ge_ffmpeg_crypto_build_series)" || return 1
   audit="$state_dir/ffmpeg-crypto-build-audit.tsv"
   for path in "$state_file" "$series" "$audit"; do
     [[ -f "$path" && ! -L "$path" ]] \
@@ -1491,9 +1783,36 @@ pinned_ge_require_prepared_ffmpeg_crypto_build_provenance() (
     || return 1
   makefile_blob="$(pinned_ge_git -C "$source" \
     hash-object --no-filters -- Makefile.in)"
-  [[ "$makefile_blob" == "$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB" ]] \
-    || pinned_ge_fail "FFmpeg crypto-enabled Makefile differs from its pin" \
+  [[ "$makefile_blob" == "$(pinned_ge_ffmpeg_final_makefile_blob)" ]] \
+    || pinned_ge_fail "FFmpeg final Makefile differs from its pin" \
     || return 1
+  # The AAC hunk sits in the trailing context of the MPEGVIDEO hunk, so the
+  # earlier modules are checked in reverse application order on a scratch copy
+  # (its own throwaway repository) after the AAC module has been peeled for real.
+  chain_makefile_dir="$source"
+  if [[ -n "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" ]]; then
+    pinned_ge_git -C "$source" apply --check --reverse --whitespace=error-all -- \
+      "$(pinned_ge_aac_parser_build_patch)" || return 1
+    chain_makefile_dir="$(mktemp -d "${TMPDIR:-/tmp}/ffmpeg-makefile-chain.XXXXXX")"
+    trap 'rm -rf -- "$chain_makefile_dir"' EXIT
+    # Its own repository, so a parent worktree can never capture the apply.
+    pinned_ge_git -C "$chain_makefile_dir" init --quiet || return 1
+    cp -- "$source/Makefile.in" "$chain_makefile_dir/Makefile.in"
+    pinned_ge_git -C "$chain_makefile_dir" apply --reverse --whitespace=error-all -- \
+      "$(pinned_ge_aac_parser_build_patch)" \
+      || pinned_ge_fail "AAC parser patch cannot be peeled from the final Makefile" || return 1
+    [[ "$(pinned_ge_git -C "$chain_makefile_dir" hash-object --no-filters -- Makefile.in)" \
+        == "$PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB" ]] \
+      || pinned_ge_fail "Makefile without the AAC parser module differs from the MPEGVIDEO pin" || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}" ]]; then
+    pinned_ge_git -C "$chain_makefile_dir" apply --check --reverse --whitespace=error-all -- \
+      "$(pinned_ge_dav1d_build_patch)" || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_MPEGVIDEO_PATCH_SHA256:-}" ]]; then
+    pinned_ge_git -C "$chain_makefile_dir" apply --check --reverse --whitespace=error-all -- \
+      "$(pinned_ge_mpegvideo_build_patch)" || return 1
+  fi
   enable_count="$(rg -c \
     '^[[:space:]]*--enable-protocol=crypto[[:space:]]*\\$' \
     "$source/Makefile.in" || true)"
@@ -1535,7 +1854,7 @@ pinned_ge_require_prepared_ffmpeg_crypto_build_provenance() (
       && "$(pinned_ge_state_value "$audit" series_digest)" == "$series_digest" \
       && "$(pinned_ge_state_value "$audit" touched_path)" == Makefile.in \
       && "$(pinned_ge_state_value "$audit" final_makefile_blob)" \
-        == "$makefile_blob" \
+        == "$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB" \
       && "$(pinned_ge_state_value "$audit" crypto_enable_count)" == 1 \
       && "$(pinned_ge_state_value "$audit" application)" == passed ]] \
     || pinned_ge_fail "FFmpeg crypto-build audit facts are inconsistent" || return 1
@@ -1552,7 +1871,7 @@ pinned_ge_require_prepared_ffmpeg_crypto_build_provenance() (
       && "$(pinned_ge_state_value "$state_file" \
         ffmpeg_crypto_build_audit_sha256)" == "$(pinned_ge_sha256 "$audit")" \
       && "$(pinned_ge_state_value "$state_file" \
-        ffmpeg_crypto_build_makefile_blob)" == "$makefile_blob" ]] \
+        ffmpeg_crypto_build_makefile_blob)" == "$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB" ]] \
     || pinned_ge_fail "prepared-state FFmpeg crypto-build provenance is inconsistent" \
     || return 1
 )
@@ -2447,8 +2766,8 @@ proton_launcher_patch_sha256	$(pinned_ge_state_value "$prepared_state" proton_la
 rtsp_hook_order	$(pinned_ge_state_value "$prepared_state" rtsp_hook_order)
 final_diff_check_baseline_match	passed
 final_winegstreamer_external_references	0
-without_nvidia_libs	1
-without_vklayers	1
+without_nvidia_libs	$PIN_WITHOUT_NVIDIA_LIBS
+without_vklayers	$PIN_WITHOUT_VKLAYERS
 target	redist
 steamrt_image	$PIN_STEAMRT_IMAGE
 steam_install	disabled
@@ -2470,6 +2789,7 @@ ge_patch_overlap_residual_diff_sha256	$(pinned_ge_state_value "$prepared_state" 
 EOF
   fi
   if [[ "$version" == 6 ]]; then
+    pinned_ge_require_ffmpeg_playback_state "$invocation" || return 1
     while IFS=$'\t' read -r key expected; do
       [[ "$(pinned_ge_state_value "$invocation" "$key")" == "$expected" ]] \
         || pinned_ge_fail "resume invocation $key differs from this request" \

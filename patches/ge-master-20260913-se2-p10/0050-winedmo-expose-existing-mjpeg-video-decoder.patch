@@ -1,0 +1,49 @@
+From: RTSP-on-GE contributors
+Subject: [PATCH] winedmo: Admit canonical MJPG through the existing video decoder
+
+The pinned FFmpeg already decodes MJPEG and its RIFF table maps MJPG to
+AV_CODEC_ID_MJPEG. Admit canonical MFVideoFormat_MJPG in the existing
+WMV-backed video MFT and DMO, as used for Theora, AV1, VP8/9 and HEVC.
+Preserve every existing input/output entry and its order.
+
+Do not canonicalize container-specific MJPEG tags. Some carry decoder
+semantics (MTSJ changes chroma order; MJPG influences interlace handling).
+Ordinary AVI MJPG and the existing tag-absent RIFF fallback already publish
+the canonical subtype. Noncanonical jpeg/mjpa/MTSJ variants remain outside
+this new public admission instead of losing their original tags.
+
+This is ordinary demux-framed MJPG admission, not Motion JPEG-B, GIF/APNG,
+fragment assembly, hardware decoding, a parser, HDR or a new output path.
+Existing decode, conversion, timestamps, flush and output validation remain
+unchanged. Source tests do not replace candidate public-MF playback tests.
+
+diff --git a/dlls/winedmo/video_decoder.c b/dlls/winedmo/video_decoder.c
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -2535,6 +2535,7 @@
+     &MFVideoFormat_VP90,
+     &MFVideoFormat_VP80,
+     &MFVideoFormat_HEVC,
++    &MFVideoFormat_MJPG,
+ };
+ static const GUID *const wmv_decoder_output_types[] =
+ {
+diff --git a/dlls/wmvdecod/wmvdecod.c b/dlls/wmvdecod/wmvdecod.c
+--- a/dlls/wmvdecod/wmvdecod.c
++++ b/dlls/wmvdecod/wmvdecod.c
+@@ -71,6 +71,7 @@
+         {MFMediaType_Video, MFVideoFormat_VP90},
+         {MFMediaType_Video, MFVideoFormat_VP80},
+         {MFMediaType_Video, MFVideoFormat_HEVC},
++        {MFMediaType_Video, MFVideoFormat_MJPG},
+     };
+     MFT_REGISTER_TYPE_INFO wmv_decoder_mft_outputs[] =
+     {
+@@ -115,6 +116,7 @@
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_VP90},
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_VP80},
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_HEVC},
++        {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_MJPG},
+     };
+     HRESULT hr;
+ 

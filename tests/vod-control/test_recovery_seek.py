@@ -163,7 +163,14 @@ class IntegratedSourceTests(unittest.TestCase):
         self.assertTrue("video_frame_sink_reset" not in tick,
                         "OnVideoStreamTick must not reset the sink before the seekability check")
         self.assertEqual(tick.count("media_engine_set_current_time(engine, mftime_to_seconds(clocktime));"), 2)
-        self.assertEqual(tick.count("FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK"), 2)
+        # Both recovery branches must avoid an application seek in flight.
+        # 0058 removes deferred seeks altogether, but not this protection.
+        self.assertEqual(tick.count("FLAGS_ENGINE_SEEKING"), 2)
+        if "FLAGS_ENGINE_DEFERRED_SEEK" in source:
+            self.assertEqual(tick.count("FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK"), 2)
+        else:
+            self.assertIn("&& !(engine->flags & FLAGS_ENGINE_SEEKING)", tick)
+            self.assertIn("FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_WAITING", tick)
         seek = self.body(source, "media_engine_set_current_time")
         caps = "hr = IMFMediaSession_GetSessionCapabilities(engine->session, &caps); "
         guard = "if (FAILED(hr) || !(caps & MFSESSIONCAP_SEEK)) return hr;"
@@ -190,6 +197,19 @@ class IntegratedSourceTests(unittest.TestCase):
                 self.assertTrue(mutated != self.source, "mutation anchor missing: " + old)
                 with self.assertRaises(AssertionError):
                     self.assert_source_contract(mutated)
+
+    def test_either_missing_inflight_guard_is_rejected(self):
+        start = self.source.index("static HRESULT WINAPI media_engine_OnVideoStreamTick")
+        end = self.source.index("\n}", start) + 2
+        tick = self.source[start:end]
+        for occurrence in (0, 1):
+            matches = list(re.finditer("FLAGS_ENGINE_SEEKING", tick))
+            self.assertEqual(len(matches), 2)
+            match = matches[occurrence]
+            altered = tick[:match.start()] + "0" + tick[match.end():]
+            mutated = self.source[:start] + altered + self.source[end:]
+            with self.assertRaises(AssertionError):
+                self.assert_source_contract(mutated)
 
 
 if __name__ == "__main__":

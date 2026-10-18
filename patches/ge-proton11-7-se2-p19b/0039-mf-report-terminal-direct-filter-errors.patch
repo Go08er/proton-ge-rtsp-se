@@ -1,0 +1,83 @@
+Subject: [PATCH] Context-only refresh without qualification diagnostics
+
+Original: patches/proposed/0039-mf-report-terminal-direct-filter-errors.patch
+Added/removed line multiset is identical; only context/line positions differ.
+---
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -4909,7 +4909,8 @@
+                 if (hr == MF_E_SHUTDOWN)
+                     session_handle_source_shutdown(session);
+                 else if (hr == MF_E_OPERATION_CANCELLED || hr == MF_E_NET_TIMEOUT
+-                        || hr == MF_E_NET_READ || hr == MF_E_INVALID_POSITION)
++                        || hr == MF_E_NET_READ || hr == MF_E_INVALID_POSITION
++                        || hr == MF_E_INVALID_STREAM_DATA || hr == E_OUTOFMEMORY)
+                 {
+                     if (!(session_source->flags & SOURCE_FLAG_TERMINAL_ERROR_FORWARDED))
+                     {
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -1212,7 +1212,8 @@
+ 
+             if (FAILED(IMFMediaEvent_GetStatus(event, &error)) ||
+                     (error != MF_E_OPERATION_CANCELLED && error != MF_E_NET_TIMEOUT
+-                    && error != MF_E_NET_READ && error != MF_E_INVALID_POSITION) ||
++                    && error != MF_E_NET_READ && error != MF_E_INVALID_POSITION
++                    && error != MF_E_INVALID_STREAM_DATA && error != E_OUTOFMEMORY) ||
+                     FAILED(IMFMediaEvent_GetValue(event, &source)) ||
+                     source.vt != VT_UNKNOWN || !source.punkVal)
+             {
+@@ -1222,7 +1223,8 @@
+ 
+             if (error == MF_E_OPERATION_CANCELLED)
+                 error_code = MF_MEDIA_ENGINE_ERR_ABORTED;
+-            else if (error == MF_E_INVALID_POSITION)
++            else if (error == MF_E_INVALID_POSITION || error == MF_E_INVALID_STREAM_DATA
++                    || error == E_OUTOFMEMORY)
+                 error_code = MF_MEDIA_ENGINE_ERR_DECODE;
+             else
+                 error_code = MF_MEDIA_ENGINE_ERR_NETWORK;
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -453,6 +453,10 @@
+         return MF_E_NET_TIMEOUT;
+     if (status == STATUS_CONNECTION_DISCONNECTED)
+         return MF_E_NET_READ;
++    if (status == STATUS_DATA_ERROR)
++        return MF_E_INVALID_STREAM_DATA;
++    if (status == STATUS_NO_MEMORY)
++        return E_OUTOFMEMORY;
+     return HRESULT_FROM_NT(status);
+ }
+ 
+@@ -1612,7 +1616,7 @@
+         }
+         status = winedmo_demuxer_read(source->demuxer, &stream_idx, &output, &needed_size);
+ 
+-        /* Claim a terminal network error while this lock still excludes a
++        /* Claim a terminal demux error while this lock still excludes a
+          * seek. A seek which began before this claim changes the transition
+          * epoch; demux_error_cs separately orders the claim against the final
+          * Started/Seeked event commit without covering a blocking read. */
+@@ -1624,7 +1628,8 @@
+             continue;
+         }
+         if (status == STATUS_CANCELLED || status == STATUS_IO_TIMEOUT
+-                || status == STATUS_CONNECTION_DISCONNECTED)
++                || status == STATUS_CONNECTION_DISCONNECTED || status == STATUS_DATA_ERROR
++                || status == STATUS_NO_MEMORY)
+         {
+             HRESULT error = media_source_error_from_demux_status(status);
+ 
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -1347,7 +1347,8 @@
+ 
+     /* Preserve the legacy local-bytestream behavior while keeping terminal
+      * failures on direct HTTP, HLS, and RTSP inputs distinct from clean EOF. */
+-    if (!demuxer->direct_url || !input_error) return STATUS_END_OF_FILE;
++    if (!demuxer->direct_url) return STATUS_END_OF_FILE;
++    if (!input_error) return ret == AVERROR(ENOMEM) ? STATUS_NO_MEMORY : STATUS_DATA_ERROR;
+     if (__atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )) return STATUS_CANCELLED;
+     if (ret == AVERROR_EXIT || ret == AVERROR(ETIMEDOUT)) return STATUS_IO_TIMEOUT;
+     return STATUS_CONNECTION_DISCONNECTED;

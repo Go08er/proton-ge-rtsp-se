@@ -67,7 +67,7 @@ for case, url in enumerate(sys.argv[2:], 1):
 '''
 
 
-def inner(expect, content_probe=False, segment_probe=False, native_hls_mode=None, hls_format_probe=False, decode_probe=False, seek_probe=False, live_hls_probe=False, balanced_reads=False):
+def inner(expect, content_probe=False, segment_probe=False, native_hls_mode=None, hls_format_probe=False, decode_probe=False, seek_probe=False, live_hls_probe=False, balanced_reads=False, site_path_probe=False):
     resource.setrlimit(resource.RLIMIT_FSIZE, (16 * 1024 * 1024,) * 2)
     bodies = {
         "/plain.mp4": Path("/srv/inputs/fixture.mp4").read_bytes(),
@@ -76,6 +76,10 @@ def inner(expect, content_probe=False, segment_probe=False, native_hls_mode=None
         "/child.m3u8": b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:9.0,\nsegment.ts\n#EXT-X-ENDLIST\n",
     }
     bodies["/gated.mp4"] = bodies["/plain.mp4"]
+    if site_path_probe:
+        bodies['/hls_playlist/playlist'] = bodies['/root.m3u8'].replace(b'child.m3u8', b'/child.m3u8')
+        bodies['/hls_playlist/movie'] = bodies['/plain.mp4']
+        bodies['/hls_playlist/denied'] = b''
     if hls_format_probe:
         bodies['/fragmented.mp4'] = Path('/srv/inputs/fragmented.mp4').read_bytes()
         bodies['/packed.aac'] = Path('/srv/inputs/packed.aac').read_bytes()
@@ -135,7 +139,7 @@ def inner(expect, content_probe=False, segment_probe=False, native_hls_mode=None
             body = bodies.get(path, b"")
             offset = 0
             location = None
-            if path == "/denied.mp4" or (path != "/plain.mp4" and ua != USER_AGENT):
+            if path in ("/denied.mp4", "/hls_playlist/denied") or (path != "/plain.mp4" and ua != USER_AGENT):
                 status, body = 403, b""
             elif path in redirects:
                 status, body, location = 302, b"", "/gated.mp4"
@@ -164,7 +168,8 @@ def inner(expect, content_probe=False, segment_probe=False, native_hls_mode=None
             if status == 206:
                 self.send_header("Content-Range", f"bytes {offset}-{offset + len(body) - 1}/{len(bodies[path])}")
             self.send_header("Accept-Ranges", "bytes")
-            mime = ("video/mp4" if path == "/media.m3u8" else
+            mime = ("application/octet-stream" if path.startswith('/hls_playlist/') else
+                    "video/mp4" if path == "/media.m3u8" else
                     "text/html" if path == "/invalid.m3u8" else
                     "application/vnd.apple.mpegurl" if path.endswith(".m3u8") else
                     "video/mp2t" if path.endswith(".ts") else "video/mp4")
@@ -183,6 +188,8 @@ def inner(expect, content_probe=False, segment_probe=False, native_hls_mode=None
     paths = ["/plain.mp4", "/gated.mp4", "/redirect.mp4", "/root.m3u8", "/denied.mp4"]
     if content_probe:
         paths.extend(("/media.m3u8", "/redirect.m3u8", "/invalid.m3u8"))
+    if site_path_probe:
+        paths.extend(('/hls_playlist/playlist', '/hls_playlist/movie', '/hls_playlist/denied'))
     if segment_probe:
         paths.extend(('/normal-segments.m3u8', '/web-segments.m3u8', '/html-segment.m3u8',
                       '/file-segment.m3u8', '/image-segment.m3u8'))
@@ -221,6 +228,8 @@ def inner(expect, content_probe=False, segment_probe=False, native_hls_mode=None
     if content_probe:
         expected = [True, True, True, True, False] + (
             [False, False, False] if expect == "old-failure" else [True, True, False])
+    if site_path_probe:
+        expected = [True, True, True, True, False, True, expect != 'old-failure', False]
     if segment_probe:
         expected = [True, True, True, True, False, True, expect == 'candidate-pass', False, False, False]
     if hls_format_probe:
@@ -247,8 +256,8 @@ def inner(expect, content_probe=False, segment_probe=False, native_hls_mode=None
                                              if ok and paths[i - 1].endswith('.m3u8')]
         good &= all(r['audio_last'] >= 60000000 and r['video_last'] >= 60000000 for r in seeks)
     # Require actual traffic, including child requests on the successful HLS route.
-    good &= any(r["agent"] == ("lavf" if expect == "old-failure" and not (content_probe or segment_probe or hls_format_probe) else "wmf") for r in observed)
-    if expect == "candidate-pass" or content_probe or segment_probe or hls_format_probe:
+    good &= any(r["agent"] == ("lavf" if expect == "old-failure" and not (content_probe or segment_probe or hls_format_probe or site_path_probe) else "wmf") for r in observed)
+    if expect == "candidate-pass" or content_probe or segment_probe or hls_format_probe or site_path_probe:
         good &= all(r["agent"] == "wmf" for r in observed)
         good &= all(any(r["path"] == p and r["status"] in {200, 206} and r["agent"] == "wmf" for r in observed)
                     for p in ("/gated.mp4", "/root.m3u8", "/child.m3u8", "/segment.ts"))
@@ -263,10 +272,14 @@ def inner(expect, content_probe=False, segment_probe=False, native_hls_mode=None
         web_reads = sum(r['path'].startswith('/web-segments-') for r in observed)
         good &= (web_reads == 0 if expect == 'old-failure' else web_reads > 0)
     good &= sum(r["path"] == "/denied.mp4" for r in observed) == 1
+    if site_path_probe:
+        good &= sum(r['path'] == '/hls_playlist/denied' for r in observed) == 1
+        good &= all(any(r['path'] == p and r['status'] in (200, 206) for r in observed)
+                    for p in ('/hls_playlist/playlist', '/hls_playlist/movie'))
     if hls_format_probe:
         good &= all(any(r['path'] == p and r['status'] in (200, 206) for r in observed)
                     for p in ('/fragmented.mp4', '/packed.aac', '/caption.vtt'))
-    summary = {"expect": expect, "scenario": "hls-live-window-start" if live_hls_probe else "hls-formats" if hls_format_probe else "segment-names" if segment_probe else "content-detection" if content_probe else "user-agent",
+    summary = {"expect": expect, "scenario": "site-path-probe" if site_path_probe else "hls-live-window-start" if live_hls_probe else "hls-formats" if hls_format_probe else "segment-names" if segment_probe else "content-detection" if content_probe else "user-agent",
                "passed": bool(good), "open_success": outcomes,
                "request_agents": dict(Counter(r["agent"] for r in observed)),
                "requests": observed, "served_bytes": total_bytes,
@@ -289,7 +302,8 @@ def main():
         return inner(sys.argv[2], os.environ.get("PROBE_CONTENT") == "1", os.environ.get("PROBE_SEGMENTS") == "1",
                      os.environ.get('PROBE_NATIVE_HLS') or None, os.environ.get('PROBE_HLS_FORMATS') == '1',
                      os.environ.get('PROBE_DECODE') == '1', os.environ.get('PROBE_SEEK') == '1',
-                     os.environ.get('PROBE_LIVE_HLS') == '1', os.environ.get('PROBE_BALANCED') == '1')
+                     os.environ.get('PROBE_LIVE_HLS') == '1', os.environ.get('PROBE_BALANCED') == '1',
+                     os.environ.get('PROBE_SITE_PATH') == '1')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tool", type=Path, required=True)
     parser.add_argument("--probe", type=Path, required=True)
@@ -300,6 +314,8 @@ def main():
     parser.add_argument("--app-id", type=int, required=True)
     parser.add_argument("--expect", choices=["old-failure", "candidate-pass"], required=True)
     probes = parser.add_mutually_exclusive_group()
+    probes.add_argument('--site-path-probe', action='store_true',
+                        help='HLS and MP4 under /hls_playlist/ must open; HTTP 403 must fail without retry')
     probes.add_argument("--content-probe", action="store_true",
                         help="compare content detection with identical WMF identities; old-failure means A3.21's forced-HLS failure")
     probes.add_argument('--segment-probe', action='store_true',
@@ -358,6 +374,7 @@ def main():
                "--setenv", "PROBE_APP_ID", str(args.app_id), "--setenv", "PROBE_CONTAINED", "1",
                "--setenv", "PROBE_RUNTIME_LIB", str(runtime_lib),
                "--setenv", "PROBE_CONTENT", "1" if args.content_probe else "0",
+               "--setenv", "PROBE_SITE_PATH", "1" if args.site_path_probe else "0",
                "--setenv", "PROBE_SEGMENTS", "1" if args.segment_probe else "0",
                "--setenv", "PROBE_NATIVE_HLS", args.native_hls_mode or '',
                "--setenv", "PROBE_HLS_FORMATS", '1' if args.hls_format_probe else '0',

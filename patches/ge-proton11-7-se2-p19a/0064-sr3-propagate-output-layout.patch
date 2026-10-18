@@ -1,0 +1,60 @@
+Subject: [PROPOSED P19 SR3 v2] mfreadwrite: propagate types before suppressing no-op notices
+
+Keep GE's deliberate suppression of redundant consumer type-change notices,
+but compare against the reader's last advertised type, not an MFT output
+type which may already describe its new layout. Always propagate negotiated
+types internally; suppress only the final consumer notification when equal.
+
+Controls: real local MFT reports no-op or actual 48 kHz -> 44.1 kHz change.
+P18 passes no-op, fails real change; revision passes both. Also retain the
+prior-failing padded NV12/1080p layout controls. Not in an active series.
+
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -1260,28 +1260,16 @@
+ /* update the transform output type while keeping subtype which matches the old output type */
+ static HRESULT transform_entry_update_output_type(struct transform_entry *entry, IMFMediaType *old_output_type)
+ {
+-    IMFMediaType *new_output_type = NULL;
+-    DWORD flags = 0;
+     HRESULT hr;
+ 
+     if (FAILED(hr = set_matching_transform_output_type(entry->transform, old_output_type)))
+         return hr;
+     transform_entry_release_allocator(entry);
+ 
+-    /* Only signal a format change to the consumer if the output format data actually
+-     * differs from what it was before. This avoids spurious CURRENTMEDIATYPECHANGED
+-     * notifications when the decoder normalizes its output (e.g. mono→stereo, upsample)
+-     * and the effective consumer-visible format did not change. */
+-    {
+-        HRESULT get_hr = IMFTransform_GetOutputCurrentType(entry->transform, 0, &new_output_type);
+-        HRESULT eq_hr = new_output_type ? IMFMediaType_IsEqual(old_output_type, new_output_type, &flags) : E_FAIL;
+-
+-        if (FAILED(get_hr) || FAILED(eq_hr) || !(flags & MF_MEDIATYPE_EQUAL_FORMAT_DATA))
+-            entry->pending_flags |= MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED;
+-    }
+-
+-    if (new_output_type)
+-        IMFMediaType_Release(new_output_type);
++    /* STREAM_CHANGE may already have updated the MFT's current type. Always
++     * propagate to downstream transforms; suppress no-op client notices only
++     * against the cached type the client actually saw. */
++    entry->pending_flags |= MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED;
+     return hr;
+ }
+ 
+@@ -1379,7 +1367,13 @@
+                     && SUCCEEDED(hr = IMFTransform_GetOutputCurrentType(entry->transform, 0, &media_type)))
+             {
+                 if (!next)
++                {
++                    DWORD equal_flags = 0;
++                    if (SUCCEEDED(IMFMediaType_IsEqual(stream->current, media_type, &equal_flags))
++                            && (equal_flags & MF_MEDIATYPE_EQUAL_FORMAT_DATA))
++                        entry->pending_flags &= ~MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED;
+                     hr = IMFMediaType_CopyAllItems(media_type, (IMFAttributes *)stream->current);
++                }
+                 else
+                     hr = transform_entry_update_input_type(next, media_type);
+                 IMFMediaType_Release(media_type);

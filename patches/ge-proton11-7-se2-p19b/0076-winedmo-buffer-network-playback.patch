@@ -1,0 +1,413 @@
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -251,6 +251,7 @@
+ #define MEDIA_SOURCE_MAX_QUEUED_BYTES   (8 * 1024 * 1024)
+ #define MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS 1024
+ #define MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES   (64 * 1024 * 1024)
++#define BUFFERING_RESERVE 50000000 /* Five seconds, in 100 ns units. */
+ 
+ struct media_stream;
+ 
+@@ -289,6 +290,11 @@
+     LONG request_generation;
+     UINT queued_packets;
+     UINT64 queued_bytes;
++    UINT64 queued_duration;
++    UINT queued_unknown, starved_ms;
++    ULONGLONG starvation_window;
++    LONGLONG delivered_start, delivered_end;
++    BOOL delivered_known;
+ };
+ 
+ static void media_packet_queue_flush(struct media_stream *stream)
+@@ -301,6 +307,7 @@
+     }
+     stream->queued_packets = 0;
+     stream->queued_bytes = 0;
++    stream->queued_duration = stream->queued_unknown = 0;
+ }
+ 
+ enum source_async_op
+@@ -340,6 +347,14 @@
+     IMFRateSupport IMFRateSupport_iface;
+     IMFRateControl IMFRateControl_iface;
+     IMFMediaShutdownNotify IMFMediaShutdownNotify_iface;
++    IMFClockConsumer IMFClockConsumer_iface;
++    IMFPresentationClock *clock;
++    DWORD periodic_key;
++    ULONG buffering_generation;
++    ULONGLONG buffering_poll;
++    LONGLONG buffering_last_time;
++    LONG buffering, buffering_poll_busy;
++    BOOL buffering_network, read_ahead;
+     IMFAsyncCallback async_commands_callback;
+     LONG ref;
+     DWORD async_commands_queue;
+@@ -407,6 +422,104 @@
+ static inline struct media_source *impl_from_IMFMediaSource(IMFMediaSource *iface)
+ {
+     return CONTAINING_RECORD(iface, struct media_source, IMFMediaSource_iface);
++}
++
++static void source_buffering(struct media_source *source, BOOL active)
++{
++    unsigned int i;
++    HRESULT hr;
++    if (source->buffering != active)
++    {
++        hr = IMFMediaEventQueue_QueueEventParamVar(source->event_queue,
++                active ? MEBufferingStarted : MEBufferingStopped, &GUID_NULL, S_OK, NULL);
++        if (active && FAILED(hr)) return;
++        InterlockedExchange(&source->buffering, active);
++    }
++    for (i = 0; i < source->stream_count; ++i)
++    {
++        EnterCriticalSection(&source->streams[i]->queue_cs);
++        WakeAllConditionVariable(&source->streams[i]->queue_cv);
++        LeaveCriticalSection(&source->streams[i]->queue_cs);
++    }
++}
++
++static void reset_buffering(struct media_source *source)
++{
++    unsigned int i;
++    source_buffering(source, FALSE);
++    ++source->buffering_generation;
++    source->buffering_poll = 0;
++    source->buffering_last_time = INT64_MIN;
++    for (i = 0; i < source->stream_count; ++i)
++    {
++        source->streams[i]->delivered_known = FALSE;
++        source->streams[i]->starved_ms = 0;
++    }
++}
++
++/* The timer retains the source. Clock calls occur outside all source/queue locks;
++ * the generation and clock identity retire a poll crossing seek or replacement. */
++static void CALLBACK buffering_poll(IUnknown *context)
++{
++    struct media_source *source = impl_from_IMFMediaSource((IMFMediaSource *)context);
++    IMFPresentationClock *clock;
++    MFCLOCK_STATE state;
++    ULONGLONG now = GetTickCount64(), elapsed;
++    ULONG generation, i;
++    UINT64 packets = 0, bytes = 0;
++    LONGLONG time;
++    BOOL ready = TRUE, eligible = TRUE, exhausted = FALSE;
++    HRESULT hr;
++
++    if (InterlockedCompareExchange(&source->buffering_poll_busy, 1, 0)) return;
++    EnterCriticalSection(&source->cs);
++    if (source->state != SOURCE_RUNNING || source->demux_thread_shutdown || source->read_flushing || !(clock = source->clock)
++            || now - source->buffering_poll < 50)
++    { LeaveCriticalSection(&source->cs); InterlockedExchange(&source->buffering_poll_busy, 0); return; }
++    elapsed = source->buffering_poll ? now - source->buffering_poll : 0;
++    source->buffering_poll = now;
++    generation = source->buffering_generation;
++    IMFPresentationClock_AddRef(clock);
++    LeaveCriticalSection(&source->cs);
++    hr = IMFPresentationClock_GetState(clock, 0, &state);
++    if (SUCCEEDED(hr)) hr = IMFPresentationClock_GetTime(clock, &time);
++    EnterCriticalSection(&source->cs);
++    if (source->state != SOURCE_RUNNING || source->demux_thread_shutdown || source->read_flushing
++            || generation != source->buffering_generation || clock != source->clock)
++        goto done;
++    for (i = 0; i < source->stream_count; ++i)
++    {
++        struct media_stream *stream = source->streams[i];
++        BOOL eos;
++        if (!stream->active) continue;
++        EnterCriticalSection(&stream->queue_cs);
++        packets += stream->queued_packets; bytes += stream->queued_bytes;
++        eos = stream->eos;
++        if (!eos && (stream->queued_unknown || stream->queued_duration < BUFFERING_RESERVE)) ready = FALSE;
++        LeaveCriticalSection(&stream->queue_cs);
++        if (eos) continue;
++        if (FAILED(hr) || state != MFCLOCK_STATE_RUNNING || !stream->delivered_known
++                || time < stream->delivered_start)
++        { stream->starved_ms = 0; eligible = FALSE; continue; }
++        if (!(stream->sample_worker_pending || stream->token_queue_count)) { stream->starved_ms = 0; continue; }
++        if (!stream->starved_ms || now - stream->starvation_window >= 5000 || elapsed > 100
++                || time < source->buffering_last_time || (time < stream->delivered_end
++                && (UINT64)stream->delivered_end - (UINT64)time > 1000000))
++        { stream->starved_ms = 0; stream->starvation_window = now; }
++        if (time >= stream->delivered_end && elapsed <= 100) stream->starved_ms += elapsed;
++        if (stream->starved_ms >= 100) exhausted = TRUE;
++    }
++    if (source->buffering)
++    {
++        if (ready || packets >= MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS || bytes >= MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES)
++            source_buffering(source, FALSE);
++    }
++    else if (eligible && exhausted) source_buffering(source, TRUE);
++    if (SUCCEEDED(hr)) source->buffering_last_time = time;
++done:
++    LeaveCriticalSection(&source->cs);
++    IMFPresentationClock_Release(clock);
++    InterlockedExchange(&source->buffering_poll_busy, 0);
+ }
+ 
+ static struct media_stream *media_source_find_stream(struct media_source *source,
+@@ -509,6 +622,7 @@
+     BOOL any_active = FALSE;
+     BOOL primed = TRUE;
+     BOOL any_full = FALSE;
++    BOOL duration_full = TRUE, duration_known = TRUE;
+     UINT64 queued_packets = 0;
+     UINT64 queued_bytes = 0;
+ 
+@@ -519,15 +633,18 @@
+         BOOL empty;
+ 
+         EnterCriticalSection(&stream->queue_cs);
+-        if (!stream->active || stream->eos)
++        if (!stream->active)
+         {
+             LeaveCriticalSection(&stream->queue_cs);
+             continue;
+         }
+-        any_active = TRUE;
+-        empty = !stream->queued_packets;
+-        full = stream->queued_packets >= MEDIA_SOURCE_MAX_QUEUED_PACKETS
+-                || stream->queued_bytes >= MEDIA_SOURCE_MAX_QUEUED_BYTES;
++        if (!stream->eos) any_active = TRUE;
++        empty = !stream->eos && !stream->queued_packets;
++        if (!stream->eos && stream->queued_unknown) duration_known = FALSE;
++        if (!stream->eos && (stream->queued_unknown || stream->queued_duration < BUFFERING_RESERVE))
++            duration_full = FALSE;
++        full = !stream->eos && (stream->queued_packets >= MEDIA_SOURCE_MAX_QUEUED_PACKETS
++                || stream->queued_bytes >= MEDIA_SOURCE_MAX_QUEUED_BYTES);
+         queued_packets += stream->queued_packets;
+         queued_bytes += stream->queued_bytes;
+         LeaveCriticalSection(&stream->queue_cs);
+@@ -539,7 +656,10 @@
+     }
+ 
+     return !any_active || queued_packets >= MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS
+-            || queued_bytes >= MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES || (primed && any_full);
++            || queued_bytes >= MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES
++            || (primed && any_full && (!source->read_ahead || !duration_known)
++            && !InterlockedCompareExchange(&source->buffering, 0, 0))
++            || (source->read_ahead && duration_full);
+ }
+ 
+ /* ========================================================================
+@@ -1104,6 +1224,7 @@
+         }
+     }
+ 
++    reset_buffering(source);
+     if (position->vt == VT_I8)
+     {
+         HRESULT seek_error = S_OK;
+@@ -1282,6 +1403,7 @@
+     if (source->state == SOURCE_SHUTDOWN)
+         return MF_E_SHUTDOWN;
+ 
++    reset_buffering(source);
+     for (i = 0; i < source->stream_count; i++)
+     {
+         struct media_stream *stream = source->streams[i];
+@@ -1308,6 +1430,7 @@
+ 
+     if (source->state == SOURCE_SHUTDOWN)
+         return MF_E_SHUTDOWN;
++    reset_buffering(source);
+ 
+     for (i = 0; i < source->stream_count; i++)
+     {
+@@ -1421,15 +1544,17 @@
+     struct media_packet *pkt = NULL;
+ 
+     EnterCriticalSection(&stream->queue_cs);
+-    while (generation == stream->request_generation && list_empty(&stream->packet_queue)
+-            && stream->active && !stream->paused && !stream->eos && !source->demux_thread_shutdown)
++    while (generation == stream->request_generation && (source->buffering || list_empty(&stream->packet_queue))
++            && stream->active && !stream->paused && (!stream->eos || source->buffering) && !source->demux_thread_shutdown)
+         SleepConditionVariableCS(&stream->queue_cv, &stream->queue_cs, INFINITE);
+-    if (generation == stream->request_generation && !list_empty(&stream->packet_queue))
++    if (generation == stream->request_generation && !source->buffering && !list_empty(&stream->packet_queue))
+     {
+         pkt = LIST_ENTRY(list_head(&stream->packet_queue), struct media_packet, entry);
+         list_remove(&pkt->entry);
+         --stream->queued_packets;
+         stream->queued_bytes -= pkt->size;
++        if (pkt->duration > 0) stream->queued_duration -= min(pkt->duration, BUFFERING_RESERVE);
++        else --stream->queued_unknown;
+     }
+     LeaveCriticalSection(&stream->queue_cs);
+     return pkt;
+@@ -1441,6 +1566,8 @@
+     list_add_head(&stream->packet_queue, &pkt->entry);
+     ++stream->queued_packets;
+     stream->queued_bytes += pkt->size;
++    if (pkt->duration > 0) stream->queued_duration += min(pkt->duration, BUFFERING_RESERVE);
++    else ++stream->queued_unknown;
+     WakeConditionVariable(&stream->queue_cv);
+     LeaveCriticalSection(&stream->queue_cs);
+ }
+@@ -1509,7 +1636,20 @@
+ 
+         if (pkt)
+         {
++            if (source->buffering) { stream_requeue_packet(stream, pkt); continue; }
+             hr = media_stream_send_sample(stream, pkt, *token);
++            if (SUCCEEDED(hr))
++            {
++                LONGLONG time = stream->is_video && pkt->pts < 0 ? 0 : pkt->pts;
++                if (pkt->pts == INT64_MIN || pkt->duration <= 0 || time > INT64_MAX - pkt->duration)
++                    stream->delivered_known = FALSE;
++                else
++                {
++                    if (!stream->delivered_known) { stream->delivered_start = time; stream->delivered_end = time; }
++                    stream->delivered_end = max(stream->delivered_end, time + pkt->duration);
++                    stream->delivered_known = TRUE;
++                }
++            }
+             media_packet_free(pkt);
+             return hr;
+         }
+@@ -1729,6 +1869,8 @@
+                 list_add_tail(&stream->packet_queue, &pkt->entry);
+                 ++stream->queued_packets;
+                 stream->queued_bytes += pkt->size;
++                if (pkt->duration > 0) stream->queued_duration += min(pkt->duration, BUFFERING_RESERVE);
++                else ++stream->queued_unknown;
+                 queued = TRUE;
+             }
+             LeaveCriticalSection(&stream->queue_cs);
+@@ -2089,6 +2231,67 @@
+     return S_OK;
+ }
+ 
++static struct media_source *source_from_clock(IMFClockConsumer *iface)
++{
++    return CONTAINING_RECORD(iface, struct media_source, IMFClockConsumer_iface);
++}
++static HRESULT WINAPI source_clock_query(IMFClockConsumer *iface, REFIID iid, void **out)
++{
++    return IMFMediaSource_QueryInterface(&source_from_clock(iface)->IMFMediaSource_iface, iid, out);
++}
++static ULONG WINAPI source_clock_addref(IMFClockConsumer *iface)
++{
++    return IMFMediaSource_AddRef(&source_from_clock(iface)->IMFMediaSource_iface);
++}
++static ULONG WINAPI source_clock_release(IMFClockConsumer *iface)
++{
++    return IMFMediaSource_Release(&source_from_clock(iface)->IMFMediaSource_iface);
++}
++static HRESULT WINAPI source_clock_set(IMFClockConsumer *iface, IMFPresentationClock *clock)
++{
++    struct media_source *source = source_from_clock(iface);
++    IMFPresentationClock *old = NULL;
++    DWORD remove = 0, key = 0;
++    HRESULT hr = S_OK;
++    EnterCriticalSection(&source->cs);
++    if (source->state == SOURCE_SHUTDOWN) hr = MF_E_SHUTDOWN;
++    else
++    {
++        if (clock && source->buffering_network && !source->periodic_key)
++        {
++            hr = MFAddPeriodicCallback(buffering_poll, (IUnknown *)&source->IMFMediaSource_iface, &key);
++            if (SUCCEEDED(hr)) source->periodic_key = key;
++        }
++        if (SUCCEEDED(hr))
++        {
++            reset_buffering(source);
++            if (clock) IMFPresentationClock_AddRef(clock);
++            old = source->clock; source->clock = clock;
++            if (!clock) { remove = source->periodic_key; source->periodic_key = 0; }
++        }
++    }
++    LeaveCriticalSection(&source->cs);
++    if (remove) MFRemovePeriodicCallback(remove); /* Drains synchronously: never hold source->cs. */
++    if (old) IMFPresentationClock_Release(old);
++    return hr;
++}
++static HRESULT WINAPI source_clock_get(IMFClockConsumer *iface, IMFPresentationClock **clock)
++{
++    struct media_source *source = source_from_clock(iface);
++    HRESULT hr;
++    if (!clock) return E_POINTER;
++    EnterCriticalSection(&source->cs);
++    *clock = source->clock;
++    hr = source->state == SOURCE_SHUTDOWN ? MF_E_SHUTDOWN : *clock ? S_OK : MF_E_NO_CLOCK;
++    if (*clock) IMFPresentationClock_AddRef(*clock);
++    LeaveCriticalSection(&source->cs);
++    return hr;
++}
++static const IMFClockConsumerVtbl source_clock_vtbl =
++{
++    source_clock_query, source_clock_addref, source_clock_release, source_clock_set, source_clock_get,
++};
++
+ /* ========================================================================
+  * IMFGetService
+  * ======================================================================== */
+@@ -2247,6 +2450,8 @@
+         return hr;
+ 
+     EnterCriticalSection(&source->cs);
++    if (source->state == SOURCE_SHUTDOWN) { LeaveCriticalSection(&source->cs); return MF_E_SHUTDOWN; }
++    if (source->rate != rate) reset_buffering(source);
+     source->rate = rate;
+     LeaveCriticalSection(&source->cs);
+ 
+@@ -2376,6 +2581,8 @@
+     {
+         *out = &source->IMFMediaShutdownNotify_iface;
+     }
++    else if (IsEqualIID(riid, &IID_IMFClockConsumer))
++        *out = &source->IMFClockConsumer_iface;
+     else
+     {
+         FIXME("%s, %p.\n", debugstr_guid(riid), out);
+@@ -2605,7 +2812,8 @@
+ static HRESULT WINAPI media_source_Shutdown(IMFMediaSource *iface)
+ {
+     struct media_source *source = impl_from_IMFMediaSource(iface);
+-    DWORD async_commands_queue, sample_requests_queue;
++    DWORD async_commands_queue, sample_requests_queue, periodic_key;
++    IMFPresentationClock *clock;
+     HRESULT hr;
+ 
+     TRACE("%p.\n", iface);
+@@ -2619,6 +2827,10 @@
+     }
+ 
+     source->state = SOURCE_SHUTDOWN;
++    ++source->buffering_generation;
++    InterlockedExchange(&source->buffering, FALSE);
++    periodic_key = source->periodic_key; source->periodic_key = 0;
++    clock = source->clock; source->clock = NULL;
+     media_source_begin_demux_transition(source);
+ 
+     /* Signal demux thread and all waiting stream queues to unblock. */
+@@ -2652,6 +2864,8 @@
+     /* Avoid holding source->cs across queue unlock in case an implementation
+      * chooses to finish destruction synchronously. */
+     LeaveCriticalSection(&source->cs);
++    if (periodic_key) MFRemovePeriodicCallback(periodic_key);
++    if (clock) IMFPresentationClock_Release(clock);
+     MFUnlockWorkQueue(sample_requests_queue);
+     MFUnlockWorkQueue(async_commands_queue);
+     EnterCriticalSection(&source->cs);
+@@ -2750,6 +2964,7 @@
+     object->IMFRateSupport_iface.lpVtbl = &media_source_rate_support_vtbl;
+     object->IMFRateControl_iface.lpVtbl = &media_source_rate_control_vtbl;
+     object->IMFMediaShutdownNotify_iface.lpVtbl = &media_source_shutdown_notify_vtbl;
++    object->IMFClockConsumer_iface.lpVtbl = &source_clock_vtbl;
+     object->async_commands_callback.lpVtbl = &source_async_commands_callback_vtbl;
+     object->ref = 1;
+     object->byte_stream = context->stream;
+@@ -2759,6 +2974,10 @@
+             ? context->file_size - context->stream_offset : (UINT64)-1;
+     object->rate = 1.0f;
+     object->seekable = true;
++    object->read_ahead = context->url && (!wcsnicmp(context->url, L"http://", 7) || !wcsnicmp(context->url, L"https://", 8));
++    object->buffering_network = object->read_ahead || (context->url &&
++            (!wcsnicmp(context->url, L"rtsp://", 7) || !wcsnicmp(context->url, L"rtspt://", 8)
++            || !wcsnicmp(context->url, L"rtsps://", 8) || !wcsnicmp(context->url, L"rtspst://", 9)));
+     InitializeCriticalSectionEx(&object->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     object->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": cs");
+     InitializeCriticalSectionEx(&object->demuxer_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);

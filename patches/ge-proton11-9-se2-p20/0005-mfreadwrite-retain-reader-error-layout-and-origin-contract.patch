@@ -1,0 +1,580 @@
+Subject: [P20 review] mfreadwrite retain reader error layout and origin contract
+
+Residual against GE-Proton11-9 after ge-video-rework.
+Source-reviewed only: not compiler or runtime qualification.
+Prior P19b2 patch ownership (some behavior is now upstream):
+  ge-proton11-7-se2-p19a/0063-sr5-terminal-reader-errors.patch
+  ge-proton11-7-se2-p19a/0064-sr3-propagate-output-layout.patch
+  ge-proton11-7-se2-p19a/0065-sr1-preserve-source-timestamps.patch
+  ge-proton11-7-se2-p19a/0066-sr4-forward-reconnect-events.patch
+  ge-proton11-7-se2-p19a/0067-sr6-complete-prestart-flush.patch
+  ge-proton11-7-se2-p19b/0071-mfreadwrite-map-source-origin-metadata.patch
+  ge-proton11-7-se2-p19b/0072-mfreadwrite-avoid-duplicate-pending-initial-start.patch
+
+---
+diff --git a/dlls/mfreadwrite/reader.c b/dlls/mfreadwrite/reader.c
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -36,6 +36,7 @@
+ 
+ #include "wine/debug.h"
+ #include "wine/list.h"
++#include "wine/mforigin.h"
+ 
+ #include "mf_private.h"
+ 
+@@ -107,6 +108,7 @@
+     LONGLONG timestamp_adjust;
+     BOOL have_sample_ts;
+     BOOL is_new_stream;
++    BOOL preserve_seek_epoch;
+     BOOL unthrottled_audio_output;
+     struct transform_entry *draining_transform;
+     struct transform_entry *draining_sample_transform;
+@@ -185,9 +187,13 @@
+     unsigned int flags;
+     BOOL unthrottled_audio_output;
+     unsigned int seek_serial;
++    BOOL has_presentation_origin;
++    LONGLONG presentation_origin; /* effective source coordinate offset; zero for HLS */
+     unsigned int completed_seek_serial;
+     DWORD queue;
+     enum media_source_state source_state;
++    BOOL initial_start_pending;
++    HRESULT terminal_error;
+     struct media_stream *streams;
+     struct list responses;
+     CRITICAL_SECTION cs;
+@@ -232,6 +238,7 @@
+ static HRESULT source_reader_flush_transform_samples(struct source_reader *reader, struct media_stream *stream,
+         struct transform_entry *entry);
+ static void source_reader_cancel_stream_drain(struct media_stream *stream, enum media_stream_state state);
++static void source_reader_set_terminal_error(struct source_reader *reader, HRESULT status);
+ 
+ static ULONG source_reader_addref(struct source_reader *reader)
+ {
+@@ -486,15 +493,29 @@
+     }
+ }
+ 
++static BOOL source_reader_add_timestamp(LONGLONG timestamp, LONGLONG offset, LONGLONG *result)
++{
++    /* Do not turn an unknown timestamp into a plausible value or saturate
++     * negative preroll.  A representational overflow is an invalid timestamp. */
++    if (timestamp == INT64_MIN || timestamp == INT64_MAX
++            || (offset > 0 && timestamp > INT64_MAX - offset)
++            || (offset < 0 && timestamp < INT64_MIN - offset))
++        return FALSE;
++    *result = timestamp + offset;
++    return *result != INT64_MIN && *result != INT64_MAX;
++}
++
+ static void source_reader_reset_stream_timing(struct media_stream *stream)
+ {
+     stream->last_sample_ts = 0;
+     stream->delivered_sample_ts = 0;
+     stream->queued_sample_ts = 0;
+     stream->last_sample_duration = 0;
+-    stream->timestamp_adjust = 0;
++    stream->timestamp_adjust = stream->reader->has_presentation_origin
++            ? -stream->reader->presentation_origin : 0;
+     stream->have_sample_ts = FALSE;
+     stream->is_new_stream = TRUE;
++    stream->preserve_seek_epoch = FALSE;
+ }
+ 
+ static void source_reader_adjust_queued_stream_timestamps(struct source_reader *reader, struct media_stream *stream,
+@@ -512,6 +533,7 @@
+         if (!response->sample)
+             continue;
+         response->timestamp += adjust;
++        IMFSample_SetSampleTime(response->sample, response->timestamp);
+     }
+ 
+     if (stream->have_sample_ts)
+@@ -531,7 +553,17 @@
+     response->status = status;
+     response->stream_index = stream->index;
+     response->stream_flags = stream_flags;
+-    if (timestamp && stream->timestamp_adjust)
++    if (!sample && reader->has_presentation_origin && SUCCEEDED(status)
++            && (stream_flags & MF_SOURCE_READERF_STREAMTICK))
++    {
++        if (!source_reader_add_timestamp(timestamp, stream->timestamp_adjust, &timestamp))
++        {
++            response->status = MF_E_INVALID_TIMESTAMP;
++            response->stream_flags = MF_SOURCE_READERF_ERROR;
++            timestamp = 0;
++        }
++    }
++    else if (!sample && !reader->has_presentation_origin && timestamp && stream->timestamp_adjust)
+         timestamp += stream->timestamp_adjust;
+     response->timestamp = timestamp;
+     response->sample = sample;
+@@ -547,6 +579,9 @@
+     {
+         LONGLONG duration;
+ 
++        /* An untimestamped sample cannot establish or advance the epoch. */
++        if (reader->has_presentation_origin && FAILED(IMFSample_GetSampleTime(sample, &timestamp)))
++            return S_OK;
+         stream->last_sample_ts = timestamp;
+         stream->queued_sample_ts = timestamp;
+         stream->last_sample_duration = SUCCEEDED(IMFSample_GetSampleDuration(sample, &duration)) ? duration : 0;
+@@ -569,18 +604,28 @@
+     stream->flags &= ~STREAM_FLAG_EOS_REPORTED;
+ 
+     if (FAILED(IMFSample_GetSampleTime(sample, &timestamp)))
++    {
+         WARN("Sample time wasn't set.\n");
++        /* Preserve absence, rather than relabeling a fabricated zero with the
++         * common origin.  The first timestamped sample still establishes timing. */
++        if (reader->has_presentation_origin)
++            return source_reader_queue_response(reader, stream, S_OK, flags, 0, sample);
++    }
+     if (FAILED(IMFSample_GetSampleDuration(sample, &duration)))
+         duration = 0;
+ 
++    if (reader->has_presentation_origin
++            && !source_reader_add_timestamp(timestamp, stream->timestamp_adjust, &adjusted_timestamp))
++        return MF_E_INVALID_TIMESTAMP;
++
+     if (stream->is_new_stream)
+     {
+-        if (!(reader->flags & SOURCE_READER_PRESERVE_SOURCE_TIMESTAMPS) && timestamp > startup_threshold)
++        if (!(reader->flags & SOURCE_READER_PRESERVE_SOURCE_TIMESTAMPS)
++                && !reader->has_presentation_origin
++                && !stream->preserve_seek_epoch && timestamp > startup_threshold)
+         {
+             stream->timestamp_adjust = -timestamp;
+             source_reader_adjust_queued_stream_timestamps(reader, stream, stream->timestamp_adjust);
+-            IMFSample_SetSampleTime(sample, 0);
+-            timestamp = 0;
+         }
+ 
+         flags |= MF_SOURCE_READERF_NEWSTREAM;
+@@ -601,13 +646,16 @@
+                     stream->index, wine_dbgstr_longlong(adjusted), wine_dbgstr_longlong(expected));
+             stream->timestamp_adjust += expected - adjusted;
+             source_reader_adjust_queued_stream_timestamps(reader, stream, expected - adjusted);
+-            IMFSample_SetSampleTime(sample, expected);
+-        }
+-    }
+-
+-    adjusted_timestamp = timestamp;
+-    if (adjusted_timestamp && stream->timestamp_adjust)
+-        adjusted_timestamp += stream->timestamp_adjust;
++        }
++    }
++
++    if (reader->has_presentation_origin)
++    {
++        if (!source_reader_add_timestamp(timestamp, stream->timestamp_adjust, &adjusted_timestamp))
++            return MF_E_INVALID_TIMESTAMP;
++    }
++    else
++        adjusted_timestamp = timestamp + stream->timestamp_adjust;
+ 
+     if (source_reader_stream_is_video(stream) && stream->have_sample_ts)
+     {
+@@ -618,13 +666,11 @@
+                 && delta < stream->last_sample_duration && stream->last_sample_duration < max_frame_duration)
+         {
+             adjusted_timestamp = stream->queued_sample_ts + stream->last_sample_duration;
+-            timestamp = adjusted_timestamp - stream->timestamp_adjust;
+             delta = stream->last_sample_duration;
+ 
+             TRACE("Advancing stream %u video sample timestamp to %s from previous duration %s.\n",
+                     stream->index, wine_dbgstr_longlong(adjusted_timestamp),
+                     wine_dbgstr_longlong(stream->last_sample_duration));
+-            IMFSample_SetSampleTime(sample, adjusted_timestamp);
+         }
+ 
+         if (delta > 0 && delta < max_frame_duration && !duration)
+@@ -635,7 +681,10 @@
+         }
+     }
+ 
+-    return source_reader_queue_response(reader, stream, S_OK, flags, timestamp, sample);
++    /* GE's epoch correction must describe the sample and its callback equally.
++     * Apply it once, after all existing duration/discontinuity corrections. */
++    IMFSample_SetSampleTime(sample, adjusted_timestamp);
++    return source_reader_queue_response(reader, stream, S_OK, flags, adjusted_timestamp, sample);
+ }
+ 
+ static BOOL source_reader_request_sample_eos(HRESULT hr)
+@@ -654,6 +703,9 @@
+ static HRESULT source_reader_request_sample(struct source_reader *reader, struct media_stream *stream)
+ {
+     HRESULT hr = S_OK;
++
++    if (FAILED(reader->terminal_error))
++        return reader->terminal_error;
+ 
+     if (stream->state == STREAM_STATE_DRAINING)
+         return source_reader_service_stream_drain(reader, stream);
+@@ -667,7 +719,10 @@
+                 hr = source_reader_end_stream(reader, stream);
+             }
+             else
++            {
+                 WARN("Sample request failed, hr %#lx.\n", hr);
++                source_reader_set_terminal_error(reader, hr);
++            }
+         }
+         else
+         {
+@@ -732,6 +787,8 @@
+                 reader->streams[i].requests = 0;
+                 reader->streams[i].responses = 0;
+                 source_reader_reset_stream_timing(&reader->streams[i]);
++                reader->streams[i].preserve_seek_epoch = !!(reader->flags
++                        & (SOURCE_READER_SEEKING | SOURCE_READER_ASYNC_SEEK_QUEUED));
+                 IMFMediaStream_AddRef(reader->streams[i].stream);
+                 if (FAILED(hr = IMFMediaStream_BeginGetEvent(stream, &reader->stream_events_callback,
+                         (IUnknown *)stream)))
+@@ -769,12 +826,14 @@
+     switch (event_type)
+     {
+         case MESourceStarted:
++            reader->initial_start_pending = FALSE;
+             reader->source_state = SOURCE_STATE_STARTED;
+             reader->flags &= ~SOURCE_READER_SEEKING;
+             reader->next_stream_eos_index = 0;
+             reader->presentation_ended = FALSE;
+             break;
+         case MESourceStopped:
++            reader->initial_start_pending = FALSE;
+             reader->source_state = SOURCE_STATE_STOPPED;
+             reader->flags &= ~SOURCE_READER_SEEKING;
+             break;
+@@ -831,6 +890,14 @@
+ 
+     switch (event_type)
+     {
++        case MEError:
++            if (FAILED(IMFMediaEvent_GetStatus(event, &hr)) || SUCCEEDED(hr))
++                hr = E_FAIL;
++            EnterCriticalSection(&reader->cs);
++            source_reader_set_terminal_error(reader, hr);
++            LeaveCriticalSection(&reader->cs);
++            hr = S_OK;
++            break;
+         case MENewStream:
+             hr = source_reader_new_stream_handler(reader, event);
+             break;
+@@ -847,6 +914,8 @@
+         case MEBufferingStopped:
+         case MEConnectStart:
+         case MEConnectEnd:
++        case MEReconnectStart:
++        case MEReconnectEnd:
+         case MEExtendedType:
+         case MESourceCharacteristicsChanged:
+         case MESourceMetadataChanged:
+@@ -1204,28 +1273,16 @@
+ /* update the transform output type while keeping subtype which matches the old output type */
+ static HRESULT transform_entry_update_output_type(struct transform_entry *entry, IMFMediaType *old_output_type)
+ {
+-    IMFMediaType *new_output_type = NULL;
+-    DWORD flags = 0;
+     HRESULT hr;
+ 
+     if (FAILED(hr = set_matching_transform_output_type(entry->transform, old_output_type)))
+         return hr;
+     transform_entry_release_allocator(entry);
+ 
+-    /* Only signal a format change to the consumer if the output format data actually
+-     * differs from what it was before. This avoids spurious CURRENTMEDIATYPECHANGED
+-     * notifications when the decoder normalizes its output (e.g. mono→stereo, upsample)
+-     * and the effective consumer-visible format did not change. */
+-    {
+-        HRESULT get_hr = IMFTransform_GetOutputCurrentType(entry->transform, 0, &new_output_type);
+-        HRESULT eq_hr = new_output_type ? IMFMediaType_IsEqual(old_output_type, new_output_type, &flags) : E_FAIL;
+-
+-        if (FAILED(get_hr) || FAILED(eq_hr) || !(flags & MF_MEDIATYPE_EQUAL_FORMAT_DATA))
+-            entry->pending_flags |= MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED;
+-    }
+-
+-    if (new_output_type)
+-        IMFMediaType_Release(new_output_type);
++    /* STREAM_CHANGE may already have updated the MFT's current type. Always
++     * propagate to downstream transforms; suppress no-op client notices only
++     * against the cached type the client actually saw. */
++    entry->pending_flags |= MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED;
+     return hr;
+ }
+ 
+@@ -1323,7 +1380,13 @@
+                     && SUCCEEDED(hr = IMFTransform_GetOutputCurrentType(entry->transform, 0, &media_type)))
+             {
+                 if (!next)
++                {
++                    DWORD equal_flags = 0;
++                    if (SUCCEEDED(IMFMediaType_IsEqual(stream->current, media_type, &equal_flags))
++                            && (equal_flags & MF_MEDIATYPE_EQUAL_FORMAT_DATA))
++                        entry->pending_flags &= ~MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED;
+                     hr = IMFMediaType_CopyAllItems(media_type, (IMFAttributes *)stream->current);
++                }
+                 else
+                     hr = transform_entry_update_input_type(next, media_type);
+                 IMFMediaType_Release(media_type);
+@@ -1438,6 +1501,27 @@
+     return hr;
+ }
+ 
++/* Called under reader->cs. A fatal source failure is not EOF and cannot be
++ * recovered by another read/seek on this reader. Complete outstanding demand;
++ * commands not yet processed observe terminal_error when they start. */
++static void source_reader_set_terminal_error(struct source_reader *reader, HRESULT status)
++{
++    unsigned int i;
++
++    if (SUCCEEDED(status) || FAILED(reader->terminal_error))
++        return;
++    reader->terminal_error = status;
++    reader->initial_start_pending = FALSE;
++    reader->flags &= ~(SOURCE_READER_SEEKING | SOURCE_READER_ASYNC_SEEK_QUEUED);
++    for (i = 0; i < reader->stream_count; ++i)
++    {
++        reader->streams[i].flags &= ~STREAM_FLAG_SAMPLE_REQUESTED;
++        source_reader_fail_stream_drain(reader, &reader->streams[i], status);
++    }
++    WakeAllConditionVariable(&reader->state_event);
++    WakeAllConditionVariable(&reader->sample_event);
++}
++
+ static HRESULT source_reader_start_transform_drain(struct transform_entry *entry)
+ {
+     HRESULT hr;
+@@ -1624,7 +1708,8 @@
+         {
+             /* FIXME: propagate processing errors? */
+             reader->streams[i].flags &= ~STREAM_FLAG_SAMPLE_REQUESTED;
+-            hr = source_reader_process_sample(reader, &reader->streams[i], sample);
++            hr = FAILED(reader->terminal_error) ? reader->terminal_error
++                    : source_reader_process_sample(reader, &reader->streams[i], sample);
+             break;
+         }
+     }
+@@ -1666,6 +1751,7 @@
+ 
+         if (id == stream->id)
+         {
++            BOOL preserve_seek_epoch = stream->preserve_seek_epoch;
+             switch (event_type)
+             {
+                 case MEEndOfStream:
+@@ -1675,6 +1761,7 @@
+                     source_reader_cancel_stream_drain(stream, STREAM_STATE_READY);
+                     stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED | STREAM_FLAG_STOPPED);
+                     source_reader_reset_stream_timing(stream);
++                    stream->preserve_seek_epoch = preserve_seek_epoch;
+ 
+                     if ((ptr = list_head(&stream->transforms)))
+                     {
+@@ -1689,6 +1776,7 @@
+                     source_reader_cancel_stream_drain(stream, STREAM_STATE_READY);
+                     stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED | STREAM_FLAG_STOPPED);
+                     source_reader_reset_stream_timing(stream);
++                    stream->preserve_seek_epoch = preserve_seek_epoch;
+ 
+                     if ((ptr = list_head(&stream->transforms)))
+                     {
+@@ -1892,6 +1980,9 @@
+     HRESULT hr = S_OK;
+     unsigned int i;
+ 
++    if (FAILED(reader->terminal_error))
++        return reader->terminal_error;
++
+     for (i = 0; i < reader->stream_count; ++i)
+     {
+         source_reader_get_stream_selection(reader, i, &selected);
+@@ -1901,7 +1992,7 @@
+             reader->streams[i].flags &= ~STREAM_FLAG_SELECTED;
+     }
+ 
+-    if (reader->source_state == SOURCE_STATE_STARTED)
++    if (reader->source_state == SOURCE_STATE_STARTED || reader->initial_start_pending)
+     {
+         for (i = 0; i < reader->stream_count; ++i)
+         {
+@@ -1912,10 +2003,18 @@
+         }
+     }
+ 
++    /* Start acceptance precedes MESourceStarted. Concurrent async reads
++     * must not manufacture another initial seek that retires demand the
++     * source already accepted. Real selection changes retain their Start. */
++    if (reader->initial_start_pending && !selection_changed)
++        return S_OK;
++
+     position.hVal.QuadPart = 0;
+     if (reader->source_state != SOURCE_STATE_STARTED || selection_changed)
+     {
+         position.vt = reader->source_state == SOURCE_STATE_STARTED ? VT_EMPTY : VT_I8;
++        if (reader->source_state != SOURCE_STATE_STARTED)
++            reader->initial_start_pending = TRUE;
+         /* Update cached stream selection if descriptor was accepted. */
+         if (SUCCEEDED(hr = IMFMediaSource_Start(reader->source, reader->descriptor, &GUID_NULL, &position)))
+         {
+@@ -1925,8 +2024,12 @@
+             {
+                 if (reader->streams[i].flags & STREAM_FLAG_SELECTED)
+                     reader->streams[i].flags |= STREAM_FLAG_PRESENTED;
++                else
++                    reader->streams[i].flags &= ~STREAM_FLAG_PRESENTED;
+             }
+         }
++        else
++            reader->initial_start_pending = FALSE;
+     }
+ 
+     return hr;
+@@ -2507,7 +2610,7 @@
+                     {
+                         stream->requests++;
+                         source_reader_request_sample(reader, stream);
+-                        /* FIXME: set error stream/reader state on request failure */
++                        /* Request failure completes pending reads through the terminal-error path. */
+                     }
+                 }
+                 else
+@@ -2516,6 +2619,15 @@
+                     source_reader_queue_response(reader, &stub_stream, hr, MF_SOURCE_READERF_ERROR, 0, NULL);
+                 }
+             }
++            else
++            {
++                source_reader_set_terminal_error(reader, hr);
++                status = hr;
++                stream_index = command->u.read.stream_index;
++                source_reader_get_stream_read_index(reader, command->u.read.stream_index, &stream_index);
++                stream_flags = MF_SOURCE_READERF_ERROR;
++                report_sample = TRUE;
++            }
+ 
+             LeaveCriticalSection(&reader->cs);
+ 
+@@ -2531,6 +2643,11 @@
+         case SOURCE_READER_ASYNC_SEEK:
+ 
+             EnterCriticalSection(&reader->cs);
++            if (FAILED(reader->terminal_error))
++            {
++                LeaveCriticalSection(&reader->cs);
++                break;
++            }
+             reader->flags &= ~SOURCE_READER_ASYNC_SEEK_QUEUED;
+             ++reader->seek_serial;
+             reader->flags |= SOURCE_READER_SEEKING;
+@@ -3312,6 +3429,8 @@
+ {
+     struct source_reader *reader = impl_from_IMFSourceReaderEx(iface);
+     struct source_reader_async_command *command;
++    PROPVARIANT source_position;
++    const PROPVARIANT *effective_position = position;
+     unsigned int i;
+     DWORD flags;
+     HRESULT hr;
+@@ -3323,6 +3442,19 @@
+ 
+     if (!(flags & MFMEDIASOURCE_CAN_SEEK))
+         return MF_E_INVALIDREQUEST;
++
++    /* Inverse of the reader-only sample shift.  Copy once before either sync
++     * Start() or async dispatch; HLS already uses normalized source positions,
++     * so its effective origin is zero and 0025 remains the sole inverse there.
++     * Native MP4 still reaches the existing SR2 demuxer seek-anchor selection. */
++    if (reader->has_presentation_origin && IsEqualGUID(format, &GUID_NULL) && position->vt == VT_I8)
++    {
++        source_position = *position;
++        if (!source_reader_add_timestamp(position->hVal.QuadPart, reader->presentation_origin,
++                &source_position.hVal.QuadPart))
++            return MF_E_INVALID_POSITION;
++        effective_position = &source_position;
++    }
+ 
+     EnterCriticalSection(&reader->cs);
+ 
+@@ -3343,6 +3475,9 @@
+             source_reader_flush_stream(reader, i);
+             reader->streams[i].state = STREAM_STATE_READY;
+             source_reader_reset_stream_timing(&reader->streams[i]);
++            /* This is an explicit client seek, not a new movie epoch. Keep its
++             * first sample time; GE's later discontinuity correction remains. */
++            reader->streams[i].preserve_seek_epoch = TRUE;
+         }
+ 
+         if (reader->async_callback)
+@@ -3350,7 +3485,7 @@
+             if (SUCCEEDED(hr = source_reader_create_async_op(SOURCE_READER_ASYNC_SEEK, &command)))
+             {
+                 command->u.seek.format = *format;
+-                PropVariantCopy(&command->u.seek.position, position);
++                PropVariantCopy(&command->u.seek.position, effective_position);
+ 
+                 reader->flags |= SOURCE_READER_ASYNC_SEEK_QUEUED;
+                 hr = MFPutWorkItem(reader->queue, &reader->async_commands_callback, &command->IUnknown_iface);
+@@ -3363,7 +3498,7 @@
+         {
+             ++reader->seek_serial;
+             reader->flags |= SOURCE_READER_SEEKING;
+-            if (FAILED(hr = IMFMediaSource_Start(reader->source, reader->descriptor, format, position)))
++            if (FAILED(hr = IMFMediaSource_Start(reader->source, reader->descriptor, format, effective_position)))
+             {
+                 reader->completed_seek_serial = reader->seek_serial;
+                 reader->flags &= ~SOURCE_READER_SEEKING;
+@@ -3513,7 +3648,13 @@
+         SleepConditionVariableCS(&reader->state_event, &reader->cs, INFINITE);
+     }
+ 
+-    if (reader->async_callback)
++    if (FAILED(reader->terminal_error))
++    {
++        hr = reader->terminal_error;
++        if (stream_flags) *stream_flags = MF_SOURCE_READERF_ERROR;
++        if (sample) *sample = NULL;
++    }
++    else if (reader->async_callback)
+         hr = source_reader_read_sample_async(reader, index, flags, actual_index, stream_flags, timestamp, sample);
+     else
+         hr = source_reader_read_sample(reader, index, flags, actual_index, stream_flags, timestamp, sample);
+@@ -3529,7 +3670,7 @@
+     unsigned int stream_index;
+     HRESULT hr;
+ 
+-    if ((reader->flags & SOURCE_READER_ASYNC_SEEK_QUEUED) || reader->source_state != SOURCE_STATE_STARTED)
++    if (reader->flags & SOURCE_READER_ASYNC_SEEK_QUEUED)
+         return S_OK;
+ 
+     if (reader->flags & SOURCE_READER_FLUSHING)
+@@ -3854,6 +3995,8 @@
+         BOOL shutdown_on_release, REFIID riid, void **out)
+ {
+     struct source_reader *object;
++    struct wine_mf_presentation_origin origin;
++    UINT32 origin_size;
+     unsigned int i;
+     HRESULT hr;
+ 
+@@ -3880,6 +4023,18 @@
+     if (FAILED(hr = IMFMediaSource_CreatePresentationDescriptor(object->source, &object->descriptor)))
+         goto failed;
+ 
++    /* Capture once for this presentation.  Selection, flush, stream replacement
++     * and ordinary seeks must not select a new origin from sample arrival order.
++     * Missing, invalid or unknown-coordinate metadata retains GE's old policy. */
++    if (SUCCEEDED(IMFPresentationDescriptor_GetBlob(object->descriptor, &MF_WINE_PD_PRESENTATION_ORIGIN,
++            (BYTE *)&origin, sizeof(origin), &origin_size)) && origin_size == sizeof(origin)
++            && origin.valid == TRUE && origin.origin != INT64_MIN && origin.origin != INT64_MAX
++            && (origin.coordinates == WINE_MF_ORIGIN_NATIVE || origin.coordinates == WINE_MF_ORIGIN_NORMALIZED))
++    {
++        object->has_presentation_origin = TRUE;
++        object->presentation_origin = origin.coordinates == WINE_MF_ORIGIN_NATIVE ? origin.origin : 0;
++    }
++
+     if (FAILED(hr = IMFPresentationDescriptor_GetStreamDescriptorCount(object->descriptor, &object->stream_count)))
+         goto failed;
+ 

@@ -1,0 +1,123 @@
+Subject: [PATCH] winedmo: route secure RTSP aliases through verified FFmpeg TLS
+
+Optional transport module, not part of the installed SE1 series. Register
+rtsps and rtspst, normalize only their scheme to FFmpeg rtsps, request TCP,
+and explicitly require peer verification. Preserve userinfo, bracketed IPv6,
+explicit ports, query and fragment bytes. Never fall back to plaintext or
+URLMon. Include these sources in the existing bounded rtspdrain channel
+without adding fields or logging URL content.
+
+Depends on proposed ffmpeg-keep-rtsps-redirects-secure.patch as one test
+module, plus SE1's existing GnuTLS/crypto build and trust-store packaging.
+FFmpeg supplies TLS chain and current-hostname checks and default port 322.
+That native rtsps behavior is source verified, NOT claimed byte-for-byte
+equivalent to GStreamer's omitted-port or control-URI behavior. The original
+registers both aliases but rtsps may negotiate UDP before TCP; this module
+deliberately uses TCP for both. Do not register rtspsu or tunnel aliases by
+analogy. TLS success, bad-chain, wrong-host, redirect, close and playback
+still require a contained A/B runtime gate before promotion.
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -893,6 +893,7 @@
+     DIRECT_NETWORK_NONE,
+     DIRECT_NETWORK_RTSP,
+     DIRECT_NETWORK_RTSP_TCP,
++    DIRECT_NETWORK_RTSPS_TCP,
+ };
+ 
+ static enum direct_network_url get_rtsp_url_kind( const char *url )
+@@ -900,14 +901,16 @@
+     if (!url) return DIRECT_NETWORK_NONE;
+     if (!strncasecmp( url, "rtsp://", 7 )) return DIRECT_NETWORK_RTSP;
+     if (!strncasecmp( url, "rtspt://", 8 )) return DIRECT_NETWORK_RTSP_TCP;
++    if (!strncasecmp( url, "rtsps://", 8 )) return DIRECT_NETWORK_RTSPS_TCP;
++    if (!strncasecmp( url, "rtspst://", 9 )) return DIRECT_NETWORK_RTSPS_TCP;
+     return DIRECT_NETWORK_NONE;
+ }
+ 
+ static char *normalize_rtsp_url( const char *url, enum direct_network_url kind )
+ {
+-    const char *suffix;
++    const char *suffix, *scheme = "rtsp";
+     char *ret;
+-    size_t len;
++    size_t len, scheme_len;
+ 
+     switch (kind)
+     {
+@@ -917,14 +920,19 @@
+     case DIRECT_NETWORK_RTSP_TCP:
+         suffix = url + 5;
+         break;
++    case DIRECT_NETWORK_RTSPS_TCP:
++        scheme = "rtsps";
++        suffix = url + (!strncasecmp( url, "rtspst://", 9 ) ? 6 : 5);
++        break;
+     default:
+         return NULL;
+     }
+ 
+-    len = 4 + strlen( suffix ) + 1;
++    scheme_len = strlen( scheme );
++    len = scheme_len + strlen( suffix ) + 1;
+     if (!(ret = malloc( len ))) return NULL;
+-    memcpy( ret, "rtsp", 4 );
+-    memcpy( ret + 4, suffix, len - 4 );
++    memcpy( ret, scheme, scheme_len );
++    memcpy( ret + scheme_len, suffix, len - scheme_len );
+     return ret;
+ }
+ 
+@@ -1067,8 +1075,14 @@
+ 
+         if (!rtsp || !(direct_url = normalize_rtsp_url( params->url, rtsp_kind ))) goto failed;
+         if (av_dict_set_int( &options, "timeout", 15000000, 0 ) < 0) goto failed;
+-        if (rtsp_kind == DIRECT_NETWORK_RTSP_TCP &&
++        if ((rtsp_kind == DIRECT_NETWORK_RTSP_TCP || rtsp_kind == DIRECT_NETWORK_RTSPS_TCP) &&
+             av_dict_set( &options, "rtsp_transport", "tcp", 0 ) < 0) goto failed;
++        /* Keep the secure scheme intact: FFmpeg selects TLS, the secure default
++         * port and a secure control URI. Its RTSP TLS options reach both the
++         * certificate-chain and per-connection hostname checks. Never retry a
++         * failed secure source through the cleartext or URLMon routes. */
++        if (rtsp_kind == DIRECT_NETWORK_RTSPS_TCP &&
++            av_dict_set_int( &options, "tls_verify", 1, 0 ) < 0) goto failed;
+ 
+         demuxer->direct_url = TRUE;
+         demuxer->io_timeout = RTSP_IO_TIMEOUT_US;
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -2994,9 +2994,11 @@
+ 
+     if (TRACE_ON(rtspdrain) && context->url
+             && (!wcsnicmp(context->url, L"rtsp://", 7)
+-            || !wcsnicmp(context->url, L"rtspt://", 8)))
++            || !wcsnicmp(context->url, L"rtspt://", 8)
++            || !wcsnicmp(context->url, L"rtsps://", 8)
++            || !wcsnicmp(context->url, L"rtspst://", 9)))
+     {
+-        object->drain_diag_forced_tcp = !wcsnicmp(context->url, L"rtspt://", 8);
++        object->drain_diag_forced_tcp = wcsnicmp(context->url, L"rtsp://", 7) != 0;
+         object->drain_diag_id = InterlockedIncrement(&rtspdrain_next_source_id);
+         object->drain_diag_enabled =
+                 object->drain_diag_id <= MEDIA_SOURCE_DRAIN_DIAG_SOURCE_LIMIT;
+diff --git a/dlls/winedmo/winedmo.rgs b/dlls/winedmo/winedmo.rgs
+--- a/dlls/winedmo/winedmo.rgs
++++ b/dlls/winedmo/winedmo.rgs
+@@ -66,6 +66,14 @@
+                     {
+                         val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'winedmo Scheme Handler'
+                     }
++                    'rtsps:'
++                    {
++                        val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'winedmo Scheme Handler'
++                    }
++                    'rtspst:'
++                    {
++                        val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'winedmo Scheme Handler'
++                    }
+                 }
+             }
+         }

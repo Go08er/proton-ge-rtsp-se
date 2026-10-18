@@ -1,0 +1,205 @@
+Subject: [PATCH] winedmo: preserve published streams when late tracks arrive
+
+FFmpeg MPEG-TS and HLS may append AVStreams after initial discovery. The
+WineDMO filter array and Windows stream descriptors are not resized then.
+Remember their allocated count for ownership loops and public queries.
+
+A valid new track is unselected: discard its packet without failing playback
+of the originally published streams. Reject only indices outside FFmpeg's
+own current stream table. Preserve the existing discarded-MOV packet path.
+
+Use one existing I/O timeout budget per filtered-packet request, including
+skipped packets and EAGAIN, instead of renewing it for every read.
+Start it with the existing helper on the first actual input read; cached
+packets and filter-only output do not start an I/O budget.
+Poll cancellation and the retained absolute deadline between reads, including
+buffered reads which need not invoke FFmpeg's interrupt callback. No new
+constant or reconnect policy; local bytestreams with no I/O timeout still
+have cancellation but do not acquire a new wallclock deadline.
+This tightens retry/read-loop timing; it cannot preempt arbitrary filter work.
+
+This preserves original-track packet delivery, not arbitrary track replacement
+or dynamic MF descriptors. A timeout means no published packet completed in
+the budget, not proof of transport inactivity. Apply after the SE1 Wine series;
+0027 is independent. Native extracted-function tests use mocked FFmpeg/time;
+actual media playback and scheduler/network performance remain unverified.
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -72,6 +72,7 @@
+     AVFormatContext *ctx;
+     struct stream_context *stream_context;
+     struct stream *streams;
++    UINT stream_count; /* allocated filters and published Windows streams */
+     INT64 duration;
+     INT64 hls_timestamp_base;
+     BOOL direct_url;
+@@ -722,7 +723,7 @@
+ {
+     UINT i;
+ 
+-    for (i = 0; i < demuxer->ctx->nb_streams; i++)
++    for (i = 0; i < demuxer->stream_count; i++)
+     {
+         AVCodecParameters *par = demuxer->ctx->streams[i]->codecpar;
+         struct stream *stream = demuxer->streams + i;
+@@ -1128,11 +1129,12 @@
+     {
+         demuxer->hls_timestamp_base = get_user_time( demuxer->ctx->start_time, AV_TIME_BASE_Q );
+     }
+-    if (!(demuxer->streams = calloc( demuxer->ctx->nb_streams, sizeof(*demuxer->streams) ))) goto failed;
++    demuxer->stream_count = demuxer->ctx->nb_streams;
++    if (!(demuxer->streams = calloc( demuxer->stream_count, sizeof(*demuxer->streams) ))) goto failed;
+     if (demuxer_create_streams( demuxer )) goto failed;
+ 
+     params->demuxer.handle = (UINT_PTR)demuxer;
+-    params->stream_count = demuxer->ctx->nb_streams;
++    params->stream_count = demuxer->stream_count;
+     if (strstr( format->name, "mp4" )) strcpy( params->mime_type, "video/mp4" );
+     else if (strstr( format->name, "avi" )) strcpy( params->mime_type, "video/avi" );
+     else if (strstr( format->name, "mpeg" )) strcpy( params->mime_type, "video/mpeg" );
+@@ -1164,7 +1166,7 @@
+ failed:
+     av_dict_free( &options );
+     free( direct_url );
+-    i = demuxer->ctx ? demuxer->ctx->nb_streams : 0;
++    i = demuxer->stream_count;
+     demuxer_free_context( demuxer );
+     if (demuxer->streams)
+     {
+@@ -1189,7 +1191,7 @@
+     TRACE( "demuxer %p\n", demuxer );
+ 
+     params->context = demuxer->stream_context;
+-    for (i = 0; i < demuxer->ctx->nb_streams; i++)
++    for (i = 0; i < demuxer->stream_count; i++)
+     {
+         av_bsf_free( &demuxer->streams[i].filter );
+     }
+@@ -1223,6 +1225,7 @@
+ 
+ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packet )
+ {
++    INT64 read_deadline = 0;
+     struct stream *stream;
+     BOOL input_error;
+     int i, ret;
+@@ -1238,6 +1241,11 @@
+ 
+     do
+     {
++        /* One budget for the complete packet request, including ignored tracks
++         * and EAGAIN. Cached input may not invoke FFmpeg's interrupt callback. */
++        if (__atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )) return STATUS_CANCELLED;
++        if (read_deadline && av_gettime_relative() >= read_deadline) return STATUS_IO_TIMEOUT;
++
+         input_error = FALSE;
+         if ((*packet = demuxer->last_packet)) return STATUS_SUCCESS;
+         if (!(*packet = av_packet_alloc())) return STATUS_NO_MEMORY;
+@@ -1254,7 +1262,15 @@
+ 
+         if (!ret)
+         {
+-            if (demuxer->io_timeout) demuxer_set_deadline( demuxer, demuxer->io_timeout );
++            if (demuxer->io_timeout)
++            {
++                if (!read_deadline)
++                {
++                    demuxer_set_deadline( demuxer, demuxer->io_timeout );
++                    read_deadline = __atomic_load_n( &demuxer->deadline, __ATOMIC_RELAXED );
++                }
++                else __atomic_store_n( &demuxer->deadline, read_deadline, __ATOMIC_RELAXED );
++            }
+             ret = av_read_frame( demuxer->ctx, *packet );
+             if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
+             input_error = ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN);
+@@ -1276,6 +1292,21 @@
+                     continue;
+                 }
+ 
++                if ((unsigned int)(*packet)->stream_index >= demuxer->ctx->nb_streams)
++                {
++                    ret = AVERROR_INVALIDDATA;
++                    input_error = TRUE;
++                }
++                else if ((unsigned int)(*packet)->stream_index >= demuxer->stream_count)
++                {
++                    /* A valid late track has no Windows descriptor or filter.
++                     * Leave it unselected without stopping the original tracks. */
++                    av_packet_free( packet );
++                    continue;
++                }
++            }
++            if (!ret)
++            {
+                 stream = demuxer->streams + (*packet)->stream_index;
+                 ret = av_bsf_send_packet( stream->filter, (*packet) );
+                 input_error = FALSE;
+@@ -1287,7 +1318,7 @@
+ 
+         if (ret == AVERROR_EOF)
+         {
+-            for (i = 0; ret == AVERROR_EOF && i < demuxer->ctx->nb_streams; i++)
++            for (i = 0; ret == AVERROR_EOF && i < demuxer->stream_count; i++)
+             {
+                 if (demuxer->streams[i].eos) continue;
+                 stream = demuxer->streams + i;
+@@ -1433,7 +1464,7 @@
+     }
+ done:
+     demuxer->cancelled_read_pending_recovery = FALSE;
+-    for (i = 0; i < demuxer->ctx->nb_streams; i++)
++    for (i = 0; i < demuxer->stream_count; i++)
+     {
+         av_bsf_flush( demuxer->streams[i].filter );
+         demuxer->streams[i].eos = FALSE;
+@@ -1476,11 +1507,14 @@
+ {
+     struct demuxer_stream_lang_params *params = arg;
+     struct demuxer *demuxer = get_demuxer( params->demuxer );
+-    AVStream *stream = demuxer->ctx->streams[params->stream];
++    AVStream *stream;
+     AVDictionaryEntry *tag;
+ 
+     TRACE( "demuxer %p, stream %u\n", demuxer, params->stream );
+ 
++    if (params->stream >= demuxer->stream_count) return STATUS_INVALID_PARAMETER;
++    stream = demuxer->ctx->streams[params->stream];
++
+     if (!(tag = av_dict_get( stream->metadata, "language", NULL, 0 )))
+         return STATUS_NOT_FOUND;
+ 
+@@ -1493,11 +1527,14 @@
+ {
+     struct demuxer_stream_name_params *params = arg;
+     struct demuxer *demuxer = get_demuxer( params->demuxer );
+-    AVStream *stream = demuxer->ctx->streams[params->stream];
++    AVStream *stream;
+     AVDictionaryEntry *tag;
+ 
+     TRACE( "demuxer %p, stream %u\n", demuxer, params->stream );
+ 
++    if (params->stream >= demuxer->stream_count) return STATUS_INVALID_PARAMETER;
++    stream = demuxer->ctx->streams[params->stream];
++
+     if (!(tag = av_dict_get( stream->metadata, "title", NULL, AV_DICT_IGNORE_SUFFIX )) &&
+         !(tag = av_dict_get( stream->metadata, "name", NULL, AV_DICT_IGNORE_SUFFIX )))
+         return STATUS_NOT_FOUND;
+@@ -1510,10 +1547,14 @@
+ {
+     struct demuxer_stream_type_params *params = arg;
+     struct demuxer *demuxer = get_demuxer( params->demuxer );
+-    AVStream *stream = demuxer->ctx->streams[params->stream];
+-    AVCodecParameters *par = demuxer->streams[params->stream].filter->par_out;
++    AVStream *stream;
++    AVCodecParameters *par;
+     AVRational fps;
+ 
++    if (params->stream >= demuxer->stream_count) return STATUS_INVALID_PARAMETER;
++    stream = demuxer->ctx->streams[params->stream];
++    par = demuxer->streams[params->stream].filter->par_out;
++
+     TRACE( "demuxer %p, stream %u, stream %p, index %u\n", demuxer, params->stream, stream, stream->index );
+     if (par->codec_type == AVMEDIA_TYPE_VIDEO)
+     {

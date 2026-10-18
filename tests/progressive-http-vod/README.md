@@ -1,5 +1,30 @@
 # Progressive HTTP VOD Alpha tests
 
+## Control calls and explicit damaged-source recovery (SE2-P4 investigation)
+
+The same probe/runner has two additional, mutually exclusive modes:
+
+- `--case hls --control-stress`: 160 volume/mute/time operation groups on an
+  MTA worker while the main thread transfers software frames. Each group
+  must finish within one second, with clock/frame progress before and after.
+  The parent timeout also bounds a native call which never returns. This
+  uses static synthetic HLS and null audio, not a world's callbacks, rolling
+  live HLS, endpoint reconfiguration or VR/DXGI. P3 passes; it is a negative
+  reproduction attempt, not a vetted fix test.
+- `--case file --filter-recovery-seek`: use the exact single-bad-NAL fixture
+  described in `../media-edge-cases/README.md`. Require an observed DECODE
+  error or ENDED, then call SetCurrentTime(8) and Play on the same source.
+  P2 resumes; P3 fails to advance despite S_OK API returns. The observation
+  counter is reset for recovery, not the actual MediaEngine error state.
+  No automatic retry or SetSource hides the distinction. P4 intentionally
+  retains this limitation; this case is not a passing P4 qualification gate.
+
+Use the existing explicit `--tool`, `--probe`, `--fixtures`, `--output`,
+`--runtime-lib`, `--pulseaudio` and fresh synthetic `--app-id` arguments.
+Containment and the 75-second child/110-second outer deadlines remain.
+The original `--filter-error` test still verifies defined error followed by
+explicit clean-source reopen. It answers a different question.
+
 ## Focused MediaEngine HLS seek regression (A3.23)
 
 `hls_clock_probe.c` consumes frames through `OnVideoStreamTick` and
@@ -11,8 +36,8 @@ It does not measure audible audio, A/V sync, DXGI or headset behavior.
 
 The exact same continuous synthetic content as MP4 passes on A3.22-R2;
 HLS (ordinary or web-like segment names) freezes after one target frame.
-See [the public qualification summary](../../docs/TESTING.md) for scope and
-results. Private session records and prefixes are not exported. Do not
+See [the A3.23 qualification record](../../docs/GE_PROTON11_6_A323_SEEK_EVALUATION.md)
+for frozen inputs, commands, prior failures and candidate results. Do not
 substitute this for the older SourceReader decode probe: they exercise
 different parts of the MF pipeline.
 
@@ -32,6 +57,51 @@ ffmpeg -hide_banner -loglevel error -nostdin -i fixture.mp4 \
 Recheck both prior-failing HLS and prior-passing MP4 whenever the probe or
 fixtures change. Regeneration is not assumed byte-identical across FFmpeg
 versions. All logs remain local; the runner refuses AppID 438100.
+
+For finite codec checks, `--case file --media-file fixture.mp4`,
+`fixture.mkv`, or `fixture.webm` serves that file with its matching MIME type;
+no HLS playlist is required. Keep the same 40-second, 160×90 synthetic A/V
+content and the unchanged probe: initial playback, forward seek to 25 seconds,
+and backward seek to 8 seconds must all advance with transferred frames.
+Compare the identical encoded fixture on the prior and candidate tools.
+Container support in the runner is not evidence that a codec works in Wine.
+
+### SE2-P1 co-test seek replay (investigative, not a vetted HEVC reproducer)
+
+The same small probe now accepts `--seek-stress` through the runner with
+`--case file`. It consumes frames during 18 seconds of additional normal
+playback, then replays three waves of ten fractional seek targets and delays
+from the sanitized 2026-09-12 HEVC source log. Requests use the game fixture's
+extensionless `/media` route, MIME type and 4 MiB/s pacing. The existing
+clock/frame recovery oracle must pass after each wave. Existing byte/time
+budgets, synthetic-AppID restrictions and containment remain in place.
+
+Compile only the Windows test executable (not Proton), using the project's
+Nix shell:
+
+```sh
+x86_64-w64-mingw32-gcc -Wall -Wextra -Werror -municode \
+  tests/progressive-http-vod/hls_clock_probe.c -o /tmp/rtsp-seek-probe.exe \
+  -lole32 -loleaut32 -lmfplat -lmf -lmfuuid -luuid -lwindowscodecs
+```
+
+Use explicit existing tool/fixture/runtime paths and a fresh result path and
+synthetic AppID, as in `docs/SE2_P1_BUILD_20260912.md`, adding `--seek-stress`.
+The no-flag initial/forward/backward test is unchanged. Never use the game
+AppID or run the probe directly outside its contained runner.
+
+`--seek-scrub` uses the same stress sequence with Pause, a 50-ms frame-consuming
+interval, position change, another 50 ms, and Play for each request. It tests
+another caller state; it is not asserted to be AVPro's exact call sequence.
+It also passed on unchanged SE2-P1. The same byte/time budgets apply.
+
+Four headless HEVC variants passed on unchanged SE2-P1, including the final
+warm-up/paced replay: the game failure is **not yet reproduced** by this mode.
+The updated probe still detects the established R2 HLS seek freeze, while
+its R2 MP4 control passes. This checks the original recovery oracle, not
+the new mode's sensitivity to the HEVC issue. The replay does not model
+AVPro's exact caller state, DXGI, physical audio or VR load. See the
+[investigation record](../../docs/SE2_P1_SEEK_INVESTIGATION_20260912.md).
 
 ## Existing source and policy checks
 
@@ -144,9 +214,8 @@ python3 tests/progressive-http-vod/test_hls_segment_policy.py \
   --wine-tree worktrees/ge-proton11-6-a322-rtsp/wine
 ```
 
-The historical A3.22 private qualification record is not exported. Generate
-synthetic inputs and use the commands above; keep each new run's exact inputs
-and outcomes. See [testing scope](../../docs/TESTING.md).
+Exact tested inputs, outcomes and commands are in
+[`GE_PROTON11_6_A322_CANDIDATE.md`](../../docs/GE_PROTON11_6_A322_CANDIDATE.md).
 
 For a stronger headless check, compile `http_decode_probe.c` with the same
 command as the open probe, adding `-lmfreadwrite`, and pass that executable
@@ -175,7 +244,34 @@ candidate result. This cadence is not claimed to reproduce AVPro exactly.
 
 The offset-origin TS fixture fails initial decoding on both A3.21 and A3.22
 R1, while timestamp-zero controls decode on both. This is the prior-failing
-runtime regression for R2's HLS origin mapping. The private R2 validation
-record is not exported; retain both controls when reproducing this test.
-`test_hls_timeline.py --wine-tree DIR` checks the
+runtime regression for R2's HLS origin mapping. See
+[the R2 validation record](../../docs/GE_PROTON11_6_A322_R2_VALIDATION.md)
+for controls, build identities, retained unsuccessful probe revisions and
+actual candidate results. `test_hls_timeline.py --wine-tree DIR` checks the
 source contracts only; it does not replace the decoded-sample regression.
+# Focused frame-consuming follow-ups (2026-09-13)
+
+The existing `hls_clock_probe.c` / `run_hls_clock.py` now also support:
+
+- `--seek-scrub`: the recorded fractional seek cadence with Pause/position/Play,
+  frame consumption between calls, and four measured recovery phases. This
+  passes on P1 and is **not** a vetted reproducer of the live HEVC defect.
+- `--filter-error`: the exact synthetic corrupt-NAL fixture from
+  `tests/media-edge-cases/make_bad_nal.py`. Require normal initial playback,
+  one DECODE/MF_E_INVALID_STREAM_DATA error rather than ENDED, then advancing
+  frames/clock after manual clean-source reopen. P1 fails with false ENDED.
+- `--case rtsp --mediamtx PATH --ffmpeg PATH`: real-time TCP publication of
+  the hash-locked synthetic H.264/AAC fixture, initial and sustained software
+  frame/clock progress, then live SetSource replacement. No live seeking.
+  Both processes run inside the existing private namespace, never against
+  a host service. Publication is capped at 90 seconds (~4.3 MiB of this fixed
+  payload), the overall case at 110 seconds; no other listener is enabled.
+  This passes on P1 and is a happy-path regression control, not a defect oracle.
+
+All modes retain fresh synthetic AppIDs (438100 refused), private null audio,
+software bitmap transfer, local bounded evidence and parent-enforced teardown.
+RTSP does not traverse the HTTP server, so `served_bytes=0` in that case is
+an **HTTP-only** counter, not an assertion that no RTSP bytes arrived.
+These checks do not qualify physical audio, A/V synchronization, DXGI, VRChat
+or headset/load behavior. Build the small Windows probe with the existing
+instructions below; this is separable from a Proton build.

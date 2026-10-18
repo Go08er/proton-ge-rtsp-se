@@ -28,3 +28,13 @@ The model is a policy regression test, not a substitute for the VRChat gate.
 The runtime pass requires uninterrupted VOD playback with player audio, no
 10-second visible stall cadence, and continuous A/V recovery after one slider
 gesture. Backend seek counts require a separate diagnostic trace.
+
+## Topology-ready cleanup safety (0040)
+
+`test_topology_cleanup.py --wine-tree <tree> --cc cc` extracts the actual
+MediaEngine topology-status case, checks it with GCC `-fanalyzer`, and runs
+ready/not-ready/scrubbing controls with stubbed COM boundaries. On old P1/P3,
+`--prior` requires the uninitialized-variant diagnostic; `--patch` can apply
+0040 to a disposable single-file copy for the green comparison. Temporary
+files are removed. This is a source-level safety test, not a simulated or
+reproduced game crash. The current candidate must pass without `--prior`.

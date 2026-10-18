@@ -47,10 +47,9 @@ resolver behavior, a trust store, firewall state, or system services is
 `vm-only`.  Those cases belong in the declared Nix VM lab; they must never
 modify the workstation running Steam.
 
-This directory retains the historical stress-suite infrastructure. Its
-private planning matrix is not exported. Use the checked-in scenario
-manifests and fixture scripts; [current testing scope](../../docs/TESTING.md)
-distinguishes these checks from the focused MediaEngine clock regression.
+The complete rationale, fixture recipes, pass/fail rules, negative controls,
+and automation boundary are in
+[`../../docs/MEDIA_ENGINE_STRESS_MATRIX.md`](../../docs/MEDIA_ENGINE_STRESS_MATRIX.md).
 
 At present, no media scenario is end-to-end implemented (0 of 76). Manifest
 validation and its mutation tests run directly as static infrastructure; they

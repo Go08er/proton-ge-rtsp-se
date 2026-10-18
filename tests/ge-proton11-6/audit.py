@@ -36,11 +36,17 @@ def audit(engine, demux):
     scrub = engine.split("case MESessionScrubSampleComplete:", 1)[1].split("break;", 1)[0]
     require("!(engine->flags & FLAGS_ENGINE_PAUSE_PENDING)" in scrub,
             "scrub completion must not issue a duplicate already-pending Pause")
-    require("else if (is_http_url( params->url ))" in demux
+    require(re.search(r"^    (?:else )?if \(is_http_url\( params->url \)\)", demux, re.M)
             and "media-route=direct-http-progressive" in demux,
             "direct HTTP must include extensionless Googlevideo URLs")
-    require("is_googlevideo_url" not in demux and '"reconnect' not in demux,
+    require("is_googlevideo_url" not in demux,
             "no separate Googlevideo retry policy alongside bounded direct HTTP")
+    if '"reconnect' in demux:
+        # Maintainer policy 2026-10-17: GE11-9's progressive HTTP reconnect is
+        # adopted; allow only that form, with an outer deadline that covers it.
+        require("is_http_progressive_url" in demux and '"reconnect_delay_max", "5"' in demux
+                and "HTTP_RECONNECT_IO_TIMEOUT_US" in demux,
+                "HTTP reconnect only in GE11-9's progressive form with a covering outer deadline")
     require("demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback" in demux
             and 'av_dict_set_int( &options, "tls_verify", 1, 0 )' in demux,
             "retain cancellation and TLS verification (full contract is audited separately)")

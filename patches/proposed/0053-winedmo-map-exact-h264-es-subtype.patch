@@ -1,0 +1,21 @@
+From: RTSP-on-GE contributors
+Subject: [PATCH] winedmo: Map the already-advertised H.264 elementary-stream subtype
+
+MFVideoFormat_H264_ES is already registered and accepted, but it is a
+non-FourCC GUID and currently resolves to AV_CODEC_ID_NONE. Match the
+complete GUID to the existing H264 decoder, preserving other GUID tails
+and the existing FourCC paths. Existing no-extradata H264 parsing remains
+unchanged; this adds no fragment assembler or codec-data conversion.
+
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -170,6 +170,8 @@
+     DWORD fourcc = mfvf->guidFormat.Data1;
+     enum AVCodecID id = av_codec_get_id( tables, fourcc );
+ 
++    /* This already-advertised MF subtype is a full GUID, not a FourCC. */
++    if (IsEqualGUID( &mfvf->guidFormat, &MFVideoFormat_H264_ES )) return AV_CODEC_ID_H264;
+     if (id != AV_CODEC_ID_NONE) return id;
+ 
+     switch (fourcc)

@@ -1,0 +1,150 @@
+From: RTSP-on-GE contributors
+Subject: [PATCH] winedmo: Drain parser tails before decoder EOS
+
+Flush the existing video parser once at EOS and retain its final packet,
+or the existing MPEG assembly tail, until avcodec_send_packet accepts it.
+Accept deferred drain requests, block subsequent input, and advance pending
+packet/NULL sends from the normal output path without spinning on EAGAIN.
+Only mark decoder draining after NULL is accepted; reset all state on flush.
+Fatal parser/allocation/send failures remain errors until flush/recreation.
+No parser selection, ordinary input parsing, output-format or clock change.
+
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+index 21553aa..9b43cda 100644
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -61,6 +61,9 @@ struct unix_transform
+     bool is_audio;
+     bool is_raw_video;
+     bool draining;       /* NULL packet sent — flushing decoder */
++    bool drain_requested;
++    bool drain_packet_pending; /* parsed_packet owns the unsent final access unit */
++    NTSTATUS drain_status;     /* fatal drain failure, cleared by flush */
+     bool frame_pending;  /* frame holds undispatched output */
+ 
+     /* Audio output conversion */
+@@ -1009,7 +1012,7 @@ NTSTATUS transform_push_input( void *arg )
+         return STATUS_SUCCESS;
+     }
+ 
+-    if (t->draining) return STATUS_DEVICE_BUSY;
++    if (t->drain_requested || t->draining) return STATUS_DEVICE_BUSY;
+ 
+     if (!t->is_audio)
+     {
+@@ -1240,6 +1243,36 @@ NTSTATUS transform_push_input( void *arg )
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS advance_transform_drain( struct unix_transform *t )
++{
++    int ret;
++
++    if (t->drain_status) return t->drain_status;
++    if (!t->drain_requested || t->draining) return STATUS_SUCCESS;
++
++    if (t->drain_packet_pending)
++    {
++        if ((ret = avcodec_send_packet( t->avctx, t->parsed_packet )) < 0)
++        {
++            if (ret == AVERROR(EAGAIN)) return STATUS_SUCCESS;
++            WARN( "avcodec_send_packet during drain: %d\n", ret );
++            return (t->drain_status = STATUS_UNSUCCESSFUL);
++        }
++        t->drain_packet_pending = false;
++        t->mpeg_es_size = 0;
++        av_packet_unref( t->parsed_packet );
++    }
++
++    if ((ret = avcodec_send_packet( t->avctx, NULL )) < 0 && ret != AVERROR_EOF)
++    {
++        if (ret == AVERROR(EAGAIN)) return STATUS_SUCCESS;
++        WARN( "avcodec_send_packet EOS: %d\n", ret );
++        return (t->drain_status = STATUS_UNSUCCESSFUL);
++    }
++    t->draining = true;
++    return STATUS_SUCCESS;
++}
++
+ NTSTATUS transform_get_output( void *arg )
+ {
+     struct transform_get_output_params *params = arg;
+@@ -1322,6 +1355,15 @@ NTSTATUS transform_get_output( void *arg )
+ 
+     /* ---- Receive next frame if none pending ---- */
+ 
++    /* A drain request is accepted even when the decoder needs output consumed
++     * before it can accept the parser tail or NULL packet. Make one send step
++     * here, then use the normal receive path for backpressure progress. */
++    if ((ret = advance_transform_drain( t )))
++    {
++        params->size = 0;
++        return ret;
++    }
++
+     if (!t->frame_pending)
+     {
+         for (;;)
+@@ -1606,25 +1648,37 @@ NTSTATUS transform_drain( void *arg )
+         return STATUS_SUCCESS;
+     }
+ 
+-    if (!t->draining)
++    if (!t->drain_requested && !t->draining)
+     {
+-        if (t->mpeg_es_assemble && t->mpeg_es_size)
++        uint8_t *data = NULL;
++        int size = 0;
++
++        t->drain_requested = true;
++        if (t->parser)
++        {
++            if (av_parser_parse2( t->parser, t->avctx, &data, &size, NULL, 0,
++                                 AV_NOPTS_VALUE, AV_NOPTS_VALUE, AV_NOPTS_VALUE ) < 0)
++                return (t->drain_status = STATUS_UNSUCCESSFUL);
++        }
++        else if (t->mpeg_es_assemble && t->mpeg_es_size)
++        {
++            data = t->mpeg_es_buf;
++            size = t->mpeg_es_size;
++        }
++        if (size)
+         {
+             av_packet_unref( t->parsed_packet );
+-            if ((ret = av_new_packet( t->parsed_packet, t->mpeg_es_size )) < 0)
+-                return STATUS_NO_MEMORY;
+-            memcpy( t->parsed_packet->data, t->mpeg_es_buf, t->mpeg_es_size );
+-            if ((ret = avcodec_send_packet( t->avctx, t->parsed_packet )) < 0 && ret != AVERROR(EAGAIN))
+-            {
+-                WARN( "avcodec_send_packet: %d\n", ret );
+-                return STATUS_UNSUCCESSFUL;
+-            }
+-            t->mpeg_es_size = 0;
++            if ((ret = av_new_packet( t->parsed_packet, size )) < 0)
++                return (t->drain_status = STATUS_NO_MEMORY);
++            memcpy( t->parsed_packet->data, data, size );
++            t->parsed_packet->pts = t->parser && t->parser->pts != AV_NOPTS_VALUE ? t->parser->pts : t->packet->pts;
++            t->parsed_packet->dts = t->parser && t->parser->dts != AV_NOPTS_VALUE ? t->parser->dts : t->packet->dts;
++            t->parsed_packet->duration = t->packet->duration;
++            t->parsed_packet->flags = t->packet->flags;
++            t->drain_packet_pending = true;
+         }
+-        avcodec_send_packet( t->avctx, NULL );
+-        t->draining = true;
+     }
+-    return STATUS_SUCCESS;
++    return advance_transform_drain( t );
+ }
+ 
+ NTSTATUS transform_flush( void *arg )
+@@ -1645,6 +1699,9 @@ NTSTATUS transform_flush( void *arg )
+     if (t->parsed_packet) av_packet_unref( t->parsed_packet );
+     t->frame_pending      = false;
+     t->draining           = false;
++    t->drain_requested    = false;
++    t->drain_packet_pending = false;
++    t->drain_status       = STATUS_SUCCESS;
+     t->audio_buf_filled   = 0;
+     t->audio_buf_pos      = 0;
+     t->video_buf_filled   = 0;
+

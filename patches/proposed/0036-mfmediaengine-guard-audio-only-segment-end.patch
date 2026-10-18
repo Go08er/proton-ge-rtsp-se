@@ -1,0 +1,28 @@
+Subject: [PATCH] mfmediaengine: guard segment-end notification for audio-only sources
+
+An audio-only presentation has no video frame sink. The segment-end event
+currently passes NULL into a helper that unconditionally writes sink->eos.
+Guard that call and hold engine->cs while borrowing its presentation sink,
+matching original Proton-RTSP's MediaEngine event handler.
+
+The lock also prevents concurrent source teardown from freeing this borrowed
+pointer during the call. It does not attribute a stale session event to a
+source generation. Do not add redundant caller checks around the already
+NULL-safe get_sample/reset helpers. Independent of 0033/0034; apply after SE1.
+Extracted-case tests are not actual MF session or audio-only playback proof.
+---
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -1264,7 +1264,10 @@
+             break;
+ 
+         case MEEndOfPresentationSegment:
+-            video_frame_sink_notify_end_of_presentation_segment(engine->presentation.frame_sink);
++            EnterCriticalSection(&engine->cs);
++            if (engine->presentation.frame_sink)
++                video_frame_sink_notify_end_of_presentation_segment(engine->presentation.frame_sink);
++            LeaveCriticalSection(&engine->cs);
+             break;
+ 
+         case MESessionRateChanged:

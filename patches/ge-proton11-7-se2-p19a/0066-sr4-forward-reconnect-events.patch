@@ -1,0 +1,18 @@
+Subject: [PROPOSED P19 SR4] mfreadwrite: forward source reconnect events
+
+The injected-source control queues buffering, connect, reconnect and a final
+metadata sentinel. P18 forwards every event except the reconnect pair.
+Use the existing OnEvent route, without creating retries or new event types.
+Not in a candidate series; runtime and cross-route qualification pending.
+
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -850,6 +850,8 @@
+         case MEBufferingStopped:
+         case MEConnectStart:
+         case MEConnectEnd:
++        case MEReconnectStart:
++        case MEReconnectEnd:
+         case MEExtendedType:
+         case MESourceCharacteristicsChanged:
+         case MESourceMetadataChanged:

@@ -1,0 +1,494 @@
+From: Go08er <149829787+Go08er@users.noreply.github.com>
+Subject: [PATCH] mfmediaengine: share immediate latest-target seeking between both APIs
+
+Follow the original -4 immediate/next_seek shape and the maintainer's
+September 22 decision. Remove the playing +/-3 s, previous-source +/-2 s,
+post-load zero rules and the 250 ms deferred timer machinery. Both APIs now
+use the existing non-Ex helper; retain its in-flight latest-target coalescing,
+seekability checks, preroll reset, paused target storage and terminal EOF path.
+
+P14 returned success without seek events for all eight isolated playing Ex
+requests; the matched ordinary-API control landed all eight.
+Retain the old Ex topology-readiness guard in the shared helper, so source
+replacement cannot send a premature seek to the outgoing topology. This is
+not a time/distance suppression on a ready source. No new debouncer or retry. Burst, sync correction,
+source replacement and paused-then-Play still require compiled runtime tests.
+
+---
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -101,9 +101,6 @@
+     FLAGS_ENGINE_SEEKING = 0x40000,
+     FLAGS_ENGINE_SCRUBBING = 0x80000,
+     FLAGS_ENGINE_PAUSE_PENDING = 0x100000,
+-    FLAGS_ENGINE_DEFERRED_SEEK = 0x200000,
+-    FLAGS_ENGINE_SUPPRESS_INITIAL_SEEK = 0x400000,
+-    FLAGS_ENGINE_SUPPRESS_SOURCE_SEEK = 0x800000,
+ };
+ 
+ struct vec3
+@@ -165,7 +162,6 @@
+     IMFAsyncCallback session_events;
+     IMFAsyncCallback sink_events;
+     IMFAsyncCallback load_handler;
+-    IMFAsyncCallback deferred_seek_callback;
+     LONG refcount;
+     IMFMediaEngineNotify *callback;
+     IMFAttributes *attributes;
+@@ -177,22 +173,17 @@
+     double playback_rate;
+     double default_playback_rate;
+     BOOL playback_requested;
+-    BOOL deferred_seek_work_scheduled;
+-    MFWORKITEM_KEY deferred_seek_work_key;
+     double volume;
+     double duration;
+     double current_seek;
+     double next_seek;
+-    double deferred_seek;
+     double last_committed_seek;
+     LONGLONG video_preroll_time;
+     MFTIME last_video_tick_clock;
+-    DWORD deferred_seek_time;
+     DWORD last_committed_seek_time;
+     DWORD last_video_tick_time;
+     DWORD stalled_clock_seek_time;
+     DWORD source_start_time;
+-    double suppressed_initial_seek;
+     MF_MEDIA_ENGINE_NETWORK network_state;
+     MF_MEDIA_ENGINE_ERR error_code;
+     HRESULT extended_code;
+@@ -880,11 +871,6 @@
+     return CONTAINING_RECORD(iface, struct media_engine, load_handler);
+ }
+ 
+-static struct media_engine *impl_from_deferred_seek_callback_IMFAsyncCallback(IMFAsyncCallback *iface)
+-{
+-    return CONTAINING_RECORD(iface, struct media_engine, deferred_seek_callback);
+-}
+-
+ static unsigned int get_gcd(unsigned int a, unsigned int b)
+ {
+     unsigned int m;
+@@ -1061,7 +1047,6 @@
+ }
+ 
+ static HRESULT media_engine_set_current_time(struct media_engine *engine, double seektime);
+-static HRESULT media_engine_flush_deferred_seek(struct media_engine *engine);
+ static void media_engine_start_playback(struct media_engine *engine);
+ 
+ static BOOL media_engine_handle_ended(struct media_engine *engine)
+@@ -1152,21 +1137,9 @@
+             EnterCriticalSection(&engine->cs);
+             if (engine->flags & FLAGS_ENGINE_SEEKING)
+             {
+-                BOOL deferred_seek_pending = engine->flags & FLAGS_ENGINE_DEFERRED_SEEK;
+-                double next_seek = deferred_seek_pending ? NAN : engine->next_seek; /* Deferred target wins. */
++                double next_seek = engine->next_seek;
+                 double current_seek = engine->current_seek;
+ 
+-                /* A deferred duplicate may still be waiting for its timer when
+-                 * the positioned Start() completes. It is the newest target,
+-                 * so it also supersedes any older queued seek. */
+-                if (deferred_seek_pending && isfinite(current_seek) && isfinite(engine->deferred_seek)
+-                        && fabs(engine->deferred_seek - current_seek) <= 0.001)
+-                {
+-                    engine->deferred_seek = NAN;
+-                    media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
+-                    deferred_seek_pending = FALSE;
+-                }
+-
+                 engine->current_seek = NAN;
+                 engine->next_seek = NAN;
+                 media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_IS_ENDED, FALSE);
+@@ -1174,8 +1147,7 @@
+                 IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
+                 if (isfinite(next_seek) && (!isfinite(current_seek) || fabs(next_seek - current_seek) > 0.001))
+                     media_engine_set_current_time(engine, next_seek);
+-                else if (!deferred_seek_pending
+-                        && !(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_SCRUBBING)))
++                else if (!(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_SCRUBBING)))
+                     restart_playback = TRUE;
+             }
+ 
+@@ -1239,8 +1211,7 @@
+             engine->playback_requested = FALSE;
+             engine->current_seek = NAN;
+             engine->next_seek = NAN;
+-            engine->deferred_seek = NAN;
+-            media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK
++            media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING
+                     | FLAGS_ENGINE_PLAY_PENDING | FLAGS_ENGINE_PAUSE_PENDING
+                     | FLAGS_ENGINE_WAITING | FLAGS_ENGINE_SCRUBBING, FALSE);
+             IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ERROR,
+@@ -2179,12 +2150,10 @@
+     struct media_engine_load_context *context = NULL;
+     enum media_engine_load_origin origin;
+     IPropertyStore *props = NULL;
+-    double previous_position = NAN;
+     BOOL start_pending;
+     unsigned int flags;
+     UINT64 generation;
+     HRESULT hr = S_OK;
+-    MFTIME clocktime;
+ 
+     generation = ++engine->source_generation;
+ 
+@@ -2201,15 +2170,6 @@
+     if (!media_engine_source_is_current(engine, generation))
+         return S_OK;
+ 
+-    if (isfinite(engine->deferred_seek))
+-        previous_position = engine->deferred_seek;
+-    else if (isfinite(engine->current_seek))
+-        previous_position = engine->current_seek;
+-    else if ((engine->flags & FLAGS_ENGINE_PAUSED) && engine->presentation.start_position.vt == VT_I8)
+-        previous_position = (double)engine->presentation.start_position.hVal.QuadPart / 10000000;
+-    else if (SUCCEEDED(IMFPresentationClock_GetTime(engine->clock, &clocktime)))
+-        previous_position = mftime_to_seconds(clocktime);
+-
+     start_pending = !(engine->flags & FLAGS_ENGINE_PAUSED) || (engine->flags & FLAGS_ENGINE_IS_ENDED);
+     engine->playback_requested = start_pending;
+ 
+@@ -2217,11 +2177,9 @@
+     engine->video_frame.pts = MINLONGLONG;
+     engine->current_seek = NAN;
+     engine->next_seek = NAN;
+-    engine->deferred_seek = NAN;
+     engine->last_committed_seek = NAN;
+     engine->video_preroll_time = MINLONGLONG;
+     engine->last_video_tick_clock = MINLONGLONG;
+-    engine->deferred_seek_time = 0;
+     engine->last_committed_seek_time = 0;
+     engine->last_video_tick_time = 0;
+     engine->stalled_clock_seek_time = 0;
+@@ -2230,13 +2188,9 @@
+     engine->presentation.start_position.hVal.QuadPart = 0;
+     video_frame_sink_reset(engine->presentation.frame_sink);
+     media_engine_set_flag(engine, FLAGS_ENGINE_FIRST_FRAME | FLAGS_ENGINE_IS_ENDED | FLAGS_ENGINE_WAITING
+-            | FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
++            | FLAGS_ENGINE_SEEKING, FALSE);
+     media_engine_set_flag(engine, FLAGS_ENGINE_PAUSED, !start_pending);
+     media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, start_pending);
+-    media_engine_set_flag(engine, FLAGS_ENGINE_SUPPRESS_SOURCE_SEEK, TRUE);
+-    engine->suppressed_initial_seek = previous_position;
+-    media_engine_set_flag(engine, FLAGS_ENGINE_SUPPRESS_INITIAL_SEEK,
+-            isfinite(previous_position) && previous_position > 0.001);
+ 
+     if (!url && !bytestream)
+     {
+@@ -2569,7 +2523,7 @@
+     BOOL value;
+ 
+     EnterCriticalSection(&engine->cs);
+-    value = !!(engine->flags & (FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK));
++    value = !!(engine->flags & FLAGS_ENGINE_SEEKING);
+     if (isinf(engine->duration))
+     {
+         LONG count = InterlockedIncrement(&live_seeking_count);
+@@ -2592,17 +2546,10 @@
+     MFTIME clocktime;
+ 
+     EnterCriticalSection(&engine->cs);
+-    if ((engine->flags & FLAGS_ENGINE_DEFERRED_SEEK) && GetTickCount() - engine->deferred_seek_time >= 250)
+-        media_engine_flush_deferred_seek(engine);
+-
+     if ((engine->flags & FLAGS_ENGINE_SEEKING) && isfinite(engine->current_seek))
+     {
+         ret = engine->current_seek;
+     }
+-    else if (engine->flags & FLAGS_ENGINE_DEFERRED_SEEK)
+-    {
+-        ret = engine->deferred_seek;
+-    }
+     else if (engine->flags & FLAGS_ENGINE_IS_ENDED)
+     {
+         ret = engine->duration;
+@@ -2658,6 +2605,11 @@
+     DWORD caps;
+     HRESULT hr;
+ 
++    /* Keep the old Ex readiness guard on the shared path: while a new source
++     * loads, session capabilities can still belong to the outgoing topology. */
++    if ((engine->flags & FLAGS_ENGINE_SOURCE_PENDING) || !engine->presentation.pd)
++        return S_OK;
++
+     seektime = min(max(0, seektime), engine->duration);
+ 
+     hr = IMFMediaSession_GetSessionCapabilities(engine->session, &caps);
+@@ -2668,11 +2620,10 @@
+     {
+         engine->current_seek = NAN;
+         engine->next_seek = NAN;
+-        engine->deferred_seek = NAN;
+         engine->last_committed_seek = seektime;
+         engine->video_preroll_time = MINLONGLONG;
+         engine->last_committed_seek_time = GetTickCount();
+-        media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
++        media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING, FALSE);
+         IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKING, 0, 0);
+         IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKED, 0, 0);
+         IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
+@@ -2732,157 +2683,6 @@
+     return hr;
+ }
+ 
+-static HRESULT media_engine_flush_deferred_seek(struct media_engine *engine)
+-{
+-    double seektime;
+-
+-    if (!(engine->flags & FLAGS_ENGINE_DEFERRED_SEEK))
+-        return S_OK;
+-
+-    if ((engine->flags & FLAGS_ENGINE_SOURCE_PENDING) || !engine->presentation.pd)
+-        return S_FALSE;
+-
+-    seektime = engine->deferred_seek;
+-    engine->deferred_seek = NAN;
+-    media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
+-    return media_engine_set_current_time(engine, seektime);
+-}
+-
+-static HRESULT media_engine_schedule_deferred_seek(struct media_engine *engine, DWORD delay)
+-{
+-    HRESULT hr;
+-
+-    if (engine->deferred_seek_work_scheduled)
+-        return S_OK;
+-
+-    if (!delay)
+-        delay = 1;
+-    engine->deferred_seek_work_key = 0;
+-    hr = MFScheduleWorkItem(&engine->deferred_seek_callback, NULL, -(INT64)delay,
+-            &engine->deferred_seek_work_key);
+-    if (SUCCEEDED(hr))
+-        engine->deferred_seek_work_scheduled = TRUE;
+-    else
+-    {
+-        engine->deferred_seek_work_key = 0;
+-        WARN("Failed to schedule deferred seek, hr %#lx; flushing synchronously.\n", hr);
+-        hr = media_engine_flush_deferred_seek(engine);
+-    }
+-
+-    return hr;
+-}
+-
+-static ULONG WINAPI media_engine_deferred_seek_callback_AddRef(IMFAsyncCallback *iface)
+-{
+-    struct media_engine *engine = impl_from_deferred_seek_callback_IMFAsyncCallback(iface);
+-    return IMFMediaEngineEx_AddRef(&engine->IMFMediaEngineEx_iface);
+-}
+-
+-static ULONG WINAPI media_engine_deferred_seek_callback_Release(IMFAsyncCallback *iface)
+-{
+-    struct media_engine *engine = impl_from_deferred_seek_callback_IMFAsyncCallback(iface);
+-    return IMFMediaEngineEx_Release(&engine->IMFMediaEngineEx_iface);
+-}
+-
+-static HRESULT WINAPI media_engine_deferred_seek_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+-{
+-    struct media_engine *engine = impl_from_deferred_seek_callback_IMFAsyncCallback(iface);
+-    DWORD elapsed;
+-    HRESULT hr = S_OK;
+-
+-    EnterCriticalSection(&engine->cs);
+-    engine->deferred_seek_work_scheduled = FALSE;
+-    engine->deferred_seek_work_key = 0;
+-
+-    if (!(engine->flags & FLAGS_ENGINE_SHUT_DOWN) && (engine->flags & FLAGS_ENGINE_DEFERRED_SEEK))
+-    {
+-        elapsed = GetTickCount() - engine->deferred_seek_time;
+-        if (elapsed < 250)
+-            hr = media_engine_schedule_deferred_seek(engine, 250 - elapsed);
+-        else
+-            hr = media_engine_flush_deferred_seek(engine);
+-
+-        if (FAILED(hr))
+-            WARN("Failed to flush deferred seek, hr %#lx.\n", hr);
+-    }
+-
+-    LeaveCriticalSection(&engine->cs);
+-    return S_OK;
+-}
+-
+-static const IMFAsyncCallbackVtbl media_engine_deferred_seek_callback_vtbl =
+-{
+-    media_engine_callback_QueryInterface,
+-    media_engine_deferred_seek_callback_AddRef,
+-    media_engine_deferred_seek_callback_Release,
+-    media_engine_callback_GetParameters,
+-    media_engine_deferred_seek_callback_Invoke,
+-};
+-
+-static HRESULT media_engine_defer_current_time(struct media_engine *engine, double seektime)
+-{
+-    MFTIME clocktime;
+-    double current;
+-    HRESULT hr;
+-
+-    if ((engine->flags & FLAGS_ENGINE_SOURCE_PENDING) || !engine->presentation.pd)
+-        return S_OK;
+-
+-    if (isfinite(engine->duration))
+-        seektime = min(max(0, seektime), engine->duration);
+-    else
+-        seektime = max(0, seektime);
+-
+-    if (engine->flags & FLAGS_ENGINE_SUPPRESS_INITIAL_SEEK)
+-    {
+-        if (isfinite(engine->suppressed_initial_seek) && engine->suppressed_initial_seek > 0.001
+-                && seektime <= 0.001)
+-            return S_OK;
+-        if (isfinite(engine->suppressed_initial_seek) && fabs(engine->suppressed_initial_seek - seektime) <= 2.0)
+-        {
+-            media_engine_set_flag(engine, FLAGS_ENGINE_SUPPRESS_INITIAL_SEEK, FALSE);
+-            engine->suppressed_initial_seek = NAN;
+-            return S_OK;
+-        }
+-        media_engine_set_flag(engine, FLAGS_ENGINE_SUPPRESS_INITIAL_SEEK, FALSE);
+-        engine->suppressed_initial_seek = NAN;
+-    }
+-
+-    if (engine->flags & FLAGS_ENGINE_SUPPRESS_SOURCE_SEEK)
+-    {
+-        if (seektime <= 0.001)
+-            return S_OK;
+-        else
+-            media_engine_set_flag(engine, FLAGS_ENGINE_SUPPRESS_SOURCE_SEEK, FALSE);
+-    }
+-
+-    if (!(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK))
+-            && SUCCEEDED(IMFPresentationClock_GetTime(engine->clock, &clocktime)))
+-    {
+-        current = mftime_to_seconds(clocktime);
+-        if (fabs(current - seektime) <= 3.0)
+-            return S_OK;
+-    }
+-
+-    if (engine->flags & FLAGS_ENGINE_PAUSED)
+-    {
+-        engine->deferred_seek = NAN;
+-        media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
+-        return media_engine_set_current_time(engine, seektime);
+-    }
+-
+-    if ((engine->flags & FLAGS_ENGINE_DEFERRED_SEEK) && fabs(engine->deferred_seek - seektime) <= 0.001)
+-        return S_OK;
+-
+-    engine->deferred_seek = seektime;
+-    engine->deferred_seek_time = GetTickCount();
+-    media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, TRUE);
+-    hr = media_engine_schedule_deferred_seek(engine, 250);
+-    IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
+-
+-    return hr;
+-}
+-
+ static HRESULT WINAPI media_engine_SetCurrentTime(IMFMediaEngineEx *iface, double time)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
+@@ -2895,11 +2695,7 @@
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+-    {
+-        engine->deferred_seek = NAN;
+-        media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
+         hr = media_engine_set_current_time(engine, time);
+-    }
+ 
+     LeaveCriticalSection(&engine->cs);
+ 
+@@ -3212,9 +3008,7 @@
+             media_engine_set_flag(engine, FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_IS_ENDED, FALSE);
+             media_engine_notify_live_event(engine, MF_MEDIA_ENGINE_EVENT_PLAY, 0, 0);
+ 
+-            if (engine->flags & FLAGS_ENGINE_DEFERRED_SEEK)
+-                hr = media_engine_flush_deferred_seek(engine);
+-            if (FAILED(hr) || (engine->flags & FLAGS_ENGINE_SEEKING))
++            if (engine->flags & FLAGS_ENGINE_SEEKING)
+                 media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, TRUE);
+             else if (engine->flags & FLAGS_ENGINE_PAUSE_PENDING)
+                 media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, TRUE);
+@@ -3485,8 +3279,6 @@
+ static HRESULT WINAPI media_engine_Shutdown(IMFMediaEngineEx *iface)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
+-    MFWORKITEM_KEY deferred_seek_work_key = 0;
+-    BOOL cancel_deferred_seek_work = FALSE;
+     HRESULT hr = S_OK;
+ 
+     TRACE("%p.\n", iface);
+@@ -3497,21 +3289,10 @@
+     else
+     {
+         media_engine_set_flag(engine, FLAGS_ENGINE_SHUT_DOWN, TRUE);
+-        if (engine->deferred_seek_work_scheduled)
+-        {
+-            deferred_seek_work_key = engine->deferred_seek_work_key;
+-            cancel_deferred_seek_work = TRUE;
+-            engine->deferred_seek_work_scheduled = FALSE;
+-            engine->deferred_seek_work_key = 0;
+-        }
+-        engine->deferred_seek = NAN;
+-        media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
+         media_engine_clear_presentation(engine);
+         /* critical section can not be held during shutdown, as shut down requires all pending
+          * callbacks to complete, and some callbacks require this cs */
+         LeaveCriticalSection(&engine->cs);
+-        if (cancel_deferred_seek_work)
+-            MFCancelWorkItem(deferred_seek_work_key);
+         IMFMediaSession_Shutdown(engine->session);
+         EnterCriticalSection(&engine->cs);
+     }
+@@ -4273,7 +4054,7 @@
+             if (hr == S_OK && engine->video_preroll_time != MINLONGLONG && *pts + 500000 >= engine->video_preroll_time)
+                 engine->video_preroll_time = MINLONGLONG;
+             else if (hr == S_FALSE && *pts != MINLONGLONG && *pts > clocktime + 300000000
+-                    && !(engine->flags & (FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK)))
++                    && !(engine->flags & FLAGS_ENGINE_SEEKING))
+             {
+                 WARN("Video sample %.6f is too far ahead of clock %.6f; resynchronizing.\n",
+                         mftime_to_seconds(*pts), mftime_to_seconds(clocktime));
+@@ -4282,7 +4063,7 @@
+             }
+ 
+             if (hr == S_OK && !(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_PAUSE_PENDING
+-                    | FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK | FLAGS_ENGINE_WAITING)))
++                    | FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_WAITING)))
+             {
+                 DWORD now = GetTickCount();
+ 
+@@ -4877,7 +4658,7 @@
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+-        hr = media_engine_defer_current_time(engine, seektime);
++        hr = media_engine_set_current_time(engine, seektime);
+ 
+     LeaveCriticalSection(&engine->cs);
+ 
+@@ -5049,7 +4830,6 @@
+     engine->session_events.lpVtbl = &media_engine_session_events_vtbl;
+     engine->sink_events.lpVtbl = &media_engine_sink_events_vtbl;
+     engine->load_handler.lpVtbl = &media_engine_load_handler_vtbl;
+-    engine->deferred_seek_callback.lpVtbl = &media_engine_deferred_seek_callback_vtbl;
+     engine->refcount = 1;
+     engine->flags = (flags & MF_MEDIA_ENGINE_CREATEFLAGS_MASK) | FLAGS_ENGINE_PAUSED;
+     engine->default_playback_rate = 1.0;
+@@ -5057,14 +4837,12 @@
+     engine->volume = 1.0;
+     engine->duration = NAN;
+     engine->current_seek = NAN;
+-    engine->deferred_seek = NAN;
+     engine->last_committed_seek = NAN;
+     engine->video_preroll_time = MINLONGLONG;
+     engine->last_video_tick_clock = MINLONGLONG;
+     engine->last_video_tick_time = 0;
+     engine->stalled_clock_seek_time = 0;
+     engine->source_start_time = 0;
+-    engine->suppressed_initial_seek = NAN;
+     engine->next_seek = NAN;
+     engine->video_frame.pts = MINLONGLONG;
+     InitializeCriticalSection(&engine->cs);

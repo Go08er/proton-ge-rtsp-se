@@ -1,0 +1,61 @@
+Subject: [PATCH] avformat/rtsp: keep TLS redirects secure and authority scoped
+
+Optional companion of WineDMO proposal 0031. The pinned RTSP code retains
+lower_rtsp_proto=tls once selected, even when a server redirects to an
+rtsp:// URL, yielding TLS with a plaintext control URI/default-port state.
+Reject non-rtsps redirects before replacing the URL. Continue accepting
+same-host and cross-host rtsps redirects with per-connection hostname checks.
+
+Clear inherited credentials and cached Basic/Digest challenge state when
+the secure URL authority changes (case-insensitive hostname, normalized
+default port). Explicit destination userinfo is handled by the existing
+parser on the next connection pass. Compare URLs, not the local host buffer
+which getpeername may have replaced with a numeric address.
+
+This does not alter unencrypted RTSP redirects, invent a reconnect loop or
+log redirect targets. It is source/native-policy tested only, not a TLS
+handshake/runtime claim. Apply after SE1 FFmpeg fixes, not to Wine, and
+require this companion before enabling the new secure aliases.
+---
+diff --git a/libavformat/rtsp.c b/libavformat/rtsp.c
+--- a/libavformat/rtsp.c
++++ b/libavformat/rtsp.c
+@@ -2180,7 +2180,37 @@
+     ff_rtsp_close_streams(s);
+     ff_rtsp_close_connections(s);
+     if (reply->status_code >=300 && reply->status_code < 400 && s->iformat) {
+-        int ret = ff_format_check_set_url(s, reply->location);
++        int ret;
++        /* TLS control URLs must remain secure across redirects.  In particular,
++         * do not reinterpret a plaintext Location using the previous TLS socket
++         * mode and secure default port. A new TLS connection verifies its own
++         * hostname; same-host and cross-host secure redirects remain allowed. */
++        if (!strcmp(lower_rtsp_proto, "tls") &&
++            !av_strstart(reply->location, "rtsps://", NULL)) {
++            err = AVERROR(EINVAL);
++            goto fail2;
++        }
++        if (!strcmp(lower_rtsp_proto, "tls")) {
++            char old_host[1024], new_host[1024];
++            int old_port, new_port;
++
++            /* The local host buffer may already hold getpeername()'s numeric
++             * address. Compare URL authorities, not that transport detail. */
++            av_url_split(NULL, 0, NULL, 0, old_host, sizeof(old_host), &old_port,
++                         NULL, 0, s->url);
++            av_url_split(NULL, 0, NULL, 0, new_host, sizeof(new_host), &new_port,
++                         NULL, 0, reply->location);
++            if (old_port < 0) old_port = RTSPS_DEFAULT_PORT;
++            if (new_port < 0) new_port = RTSPS_DEFAULT_PORT;
++            if (av_strcasecmp(old_host, new_host) || old_port != new_port) {
++                /* TLS authenticates the new server, not permission to send it
++                 * another authority's credentials or cached Digest challenge.
++                 * Explicit destination userinfo is parsed on the next pass. */
++                memset(rt->auth, 0, sizeof(rt->auth));
++                memset(&rt->auth_state, 0, sizeof(rt->auth_state));
++            }
++        }
++        ret = ff_format_check_set_url(s, reply->location);
+         if (ret < 0) {
+             err = ret;
+             goto fail2;

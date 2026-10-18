@@ -1,0 +1,61 @@
+Subject: [PATCH] mf: rearm audio sample demand after a stream flush
+
+End-of-segment markers can fulfill the session's final request without a
+ProcessSample call, leaving SAR_SAMPLE_REQUESTED set. A running seek then
+discards the queue, while retained preroll state prevents a fresh preroll.
+The empty render callback sees that stale request and never asks for audio.
+
+Remember successful end-marker submission until a sample supersedes it or
+Flush consumes it. Only that Flush invalidates the stale request latch; the
+existing render callback requests a sample and restores the latch. Ordinary
+Flush calls preserve outstanding demand, so repeated flushes do not create
+additional credits while a normal producer's response is delayed.
+
+Do not request synchronously, alter clock/client/silence state, or add a retry.
+
+This does not clear Media Session source EOS flags or change sink marker
+ordering. Those are separately reviewed lifecycle concerns.
+---
+diff --git a/dlls/mf/sar.c b/dlls/mf/sar.c
+--- a/dlls/mf/sar.c
++++ b/dlls/mf/sar.c
+@@ -44,6 +44,7 @@ enum audio_renderer_flags
+     SAR_REPORT_SEEK_TIME = 0x10,
+     SAR_ADDING_SILENCE = 0x20,
+     SAR_AUDIO_START_PENDING = 0x40,
++    SAR_END_OF_SEGMENT_RECEIVED = 0x80,
+ };
+ 
+ enum queued_object_type
+@@ -1677,7 +1678,7 @@ static HRESULT WINAPI audio_renderer_stream_ProcessSample(IMFStreamSink *iface, IMFSample *sample)
+         }
+         if (renderer->clock_state == MFCLOCK_STATE_RUNNING)
+             hr = stream_queue_sample(renderer, sample);
+-        renderer->flags &= ~SAR_SAMPLE_REQUESTED;
++        renderer->flags &= ~(SAR_SAMPLE_REQUESTED | SAR_END_OF_SEGMENT_RECEIVED);
+ 
+         if (renderer->queued_frames < renderer->max_frames && renderer->clock_state == MFCLOCK_STATE_RUNNING)
+         {
+@@ -1727,7 +1728,11 @@ static HRESULT WINAPI audio_renderer_stream_PlaceMarker(IMFStreamSink *iface, MFSTREAMSINK_MARKER_TYPE marker_type,
+     if (renderer->flags & SAR_SHUT_DOWN)
+         hr = MF_E_STREAMSINK_REMOVED;
+     else
++    {
+         hr = stream_place_marker(renderer, marker_type, context_value);
++        if (SUCCEEDED(hr) && marker_type == MFSTREAMSINK_MARKER_ENDOFSEGMENT)
++            renderer->flags |= SAR_END_OF_SEGMENT_RECEIVED;
++    }
+ 
+     LeaveCriticalSection(&renderer->cs);
+ 
+@@ -1757,6 +1762,10 @@ static HRESULT WINAPI audio_renderer_stream_Flush(IMFStreamSink *iface)
+             }
+             release_pending_object(obj);
+         }
++        /* A marker can fulfill the last request without ProcessSample.
++         * Rearm that demand once; preserve ordinary outstanding requests. */
++        if (renderer->flags & SAR_END_OF_SEGMENT_RECEIVED)
++            renderer->flags &= ~(SAR_SAMPLE_REQUESTED | SAR_END_OF_SEGMENT_RECEIVED);
+     }
+     renderer->queued_frames = 0;
+ 

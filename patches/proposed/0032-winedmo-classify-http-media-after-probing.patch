@@ -1,0 +1,157 @@
+Subject: [PATCH] winedmo: configure HLS policy for auto-probed HTTP sources
+
+Optional HTTP/HLS module, independent of the secure RTSP aliases. HLS does
+not require a .m3u8 URL: the pinned FFmpeg also probes its signature plus
+response MIME. SE1 opens these URLs through its progressive branch, which
+omits crypto and HLS options and incorrectly ties seekability to Range on
+the root manifest.
+
+Use one direct-HTTP open with the same source URL. Preserve the explicit HLS
+hint for existing named routes. Pass the HLS private options before probing,
+then require them to be consumed only when HLS was selected. Move the
+existing HLS child-format list into seg_format_options, so progressive
+containers remain unrestricted by that list. HTTPS still cannot downgrade;
+the sole added protocol for ordinary HTTP opens is the existing crypto
+wrapper needed by a playlist discovered during probing.
+
+After open, HLS uses its existing 30-second read budget and demuxer-provided
+seek capability; progressive input keeps its 15-second budget and AVIO
+Range requirement. Existing HTTP INVALIDDATA-only URLMon eligibility,
+cancellation handling, HLS zero-based timestamps and seek recovery stay in
+place. This is NOT generic signature sniffing: an extensionless playlist
+with a wrong MIME still fails FFmpeg's own probe. No second HLS engine,
+extra preflight request, reconnect, timeout increase or new logging channel.
+
+Source/native-mock tests are not real FFmpeg or MF playback proof. Before
+promotion require old-failure/new-success extensionless MIME HLS, named-HLS,
+AES-128/opaque segment, TLS, Range/no-Range progressive and seeking gates.
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -852,12 +852,6 @@
+     return url && (!strncasecmp( url, "http://", 7 ) || !strncasecmp( url, "https://", 8 ));
+ }
+ 
+-static const char *http_protocol_whitelist( const char *url )
+-{
+-    return !strncasecmp( url, "https://", 8 )
+-            ? HTTPS_PROTOCOL_WHITELIST : HTTP_PROTOCOL_WHITELIST;
+-}
+-
+ static const char *hls_protocol_whitelist( const char *url )
+ {
+     return !strncasecmp( url, "https://", 8 )
+@@ -975,81 +969,59 @@
+     demuxer->hls_timestamp_base = AV_NOPTS_VALUE;
+ 
+     if (!(demuxer->ctx = avformat_alloc_context())) goto failed;
+-    if (is_http_hls_url( params->url ))
++    if (is_http_url( params->url ))
+     {
+-        const AVInputFormat *hls = av_find_input_format( "hls" );
++        BOOL hls_hint = is_http_hls_url( params->url ), interrupted, detected_hls;
++        const AVInputFormat *hint = hls_hint ? av_find_input_format( "hls" ) : NULL;
+         const char *protocol_whitelist = hls_protocol_whitelist( params->url );
+ 
+-        TRACE( "media-route=direct-hls\n" );
+-        /* HLS playlists need the source URL as their base URI so relative
+-         * segment URLs can be resolved.  The custom bytestream path only
+-         * exposes the downloaded manifest bytes, which breaks YouTube HLS
+-         * streams used by VRChat's in-game video player.  Verify the root TLS
+-         * connection and prevent an HTTPS-root playlist from downgrading.  The
+-         * HLS-only crypto wrapper is required for AES-128 segments; its nested
+-         * URL remains constrained by the same root-sensitive allowlist. */
++        if (hls_hint && !hint) goto failed;
++        TRACE( "media-route=direct-http-probe\n" );
++        /* Let FFmpeg recognize extensionless HLS by content and response MIME.
++         * Give every HTTP open the same verified, root-sensitive network policy
++         * so an auto-detected HLS playlist can use AES-128 and relative URLs too.
++         * This does not add a manifest parser or a second open/probe request. */
+         if (av_dict_set( &options, "protocol_whitelist", protocol_whitelist, 0 ) < 0) goto failed;
+         if (av_dict_set( &options, "user_agent", HTTP_USER_AGENT, 0 ) < 0) goto failed;
+         if (av_dict_set_int( &options, "tls_verify", 1, 0 ) < 0) goto failed;
+-        /* HTTP segment names need not describe their container. Restrict the
+-         * detected HLS formats instead; retain the nested protocol allowlist. */
++        /* These two private options are consumed only if FFmpeg selects HLS.
++         * Constrain its child demuxers, not unrelated progressive containers. */
+         if (av_dict_set_int( &options, "extension_picky", 0, 0 ) < 0) goto failed;
+-        if (av_dict_set( &options, "format_whitelist", "hls,mpegts,mov,aac,ac3,eac3,mp3,webvtt", 0 ) < 0) goto failed;
+-        demuxer->direct_url = TRUE;
+-        demuxer->io_timeout = HLS_IO_TIMEOUT_US;
+-        demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
+-        demuxer->ctx->interrupt_callback.opaque = demuxer;
+-        demuxer_set_deadline( demuxer, HLS_IO_TIMEOUT_US );
+-        if ((ret = avformat_open_input( &demuxer->ctx, params->url, hls, &options )) < 0)
+-        {
+-            demuxer_set_deadline( demuxer, 0 );
+-            ERR( "Failed to open remote URL, error %s.\n", debugstr_averr(ret) );
+-            goto failed;
+-        }
+-        demuxer_set_deadline( demuxer, 0 );
+-        av_dict_set( &options, "tls_verify", NULL, 0 );
+-        if (av_dict_count( options ))
+-        {
+-            ERR( "FFmpeg left %d required HLS option(s) unused.\n", av_dict_count( options ) );
+-            goto failed;
+-        }
+-        av_dict_free( &options );
+-    }
+-    else if (is_http_url( params->url ))
+-    {
+-        const char *protocol_whitelist;
+-        BOOL interrupted;
+-
+-        TRACE( "media-route=direct-http-progressive\n" );
+-        /* Progressive HTTP media should start as FFmpeg receives bytes instead
+-         * of waiting for URLMon to cache the complete response.  Keep the
+-         * protocol surface deliberately narrower than the configured FFmpeg
+-         * build.  Plain HTTP may upgrade to verified HTTPS, while HTTPS cannot
+-         * downgrade to plaintext. */
+-        protocol_whitelist = http_protocol_whitelist( params->url );
+-        if (av_dict_set( &options, "protocol_whitelist", protocol_whitelist, 0 ) < 0) goto failed;
+-        if (av_dict_set( &options, "user_agent", HTTP_USER_AGENT, 0 ) < 0) goto failed;
+-        if (av_dict_set_int( &options, "tls_verify", 1, 0 ) < 0) goto failed;
+-
++        if (av_dict_set( &options, "seg_format_options",
++                        "format_whitelist=mpegts,mov,aac,ac3,eac3,mp3,webvtt", 0 ) < 0) goto failed;
+         demuxer->direct_url = TRUE;
+         demuxer->require_avio_seek = TRUE;
+         demuxer->io_timeout = HTTP_IO_TIMEOUT_US;
+         demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
+         demuxer->ctx->interrupt_callback.opaque = demuxer;
+         demuxer_set_deadline( demuxer, HTTP_OPEN_TIMEOUT_US );
+-        ret = avformat_open_input( &demuxer->ctx, params->url, NULL, &options );
++        ret = avformat_open_input( &demuxer->ctx, params->url, hint, &options );
+         interrupted = demuxer_interrupt_callback( demuxer );
+         demuxer_set_deadline( demuxer, 0 );
+         if (ret < 0)
+         {
+             /* A timeout or cancellation must stay terminal.  Falling back to
+              * uncancellable URLMon after an interrupt would defeat the bound. */
+-            if (!interrupted && http_open_allows_urlmon_fallback( params->url, ret ))
++            if (!hls_hint && !interrupted && http_open_allows_urlmon_fallback( params->url, ret ))
+                 failure_status = STATUS_BAD_NETWORK_PATH;
+-            WARN( "Failed to open progressive HTTP URL directly, error %s.\n", debugstr_averr(ret) );
++            WARN( "Failed to open HTTP media directly, error %s.\n", debugstr_averr(ret) );
+             goto failed;
+         }
+-        TRACE( "media-route=direct-http-progressive-opened\n" );
++        detected_hls = !strcmp( demuxer->ctx->iformat->name, "hls" );
++        if (detected_hls)
++        {
++            /* Playlist seeking is implemented by HLS, not Range on the root
++             * manifest. AVFMTCTX_UNSEEKABLE still overrides this for live HLS. */
++            demuxer->require_avio_seek = FALSE;
++            demuxer->io_timeout = HLS_IO_TIMEOUT_US;
++            TRACE( "media-route=direct-hls\n" );
++        }
++        else
++        {
++            av_dict_set( &options, "extension_picky", NULL, 0 );
++            av_dict_set( &options, "seg_format_options", NULL, 0 );
++            TRACE( "media-route=direct-http-progressive-opened\n" );
++        }
+         /* The HTTP protocol keeps chained options for redirects and range
+          * reopens.  A plaintext-only request leaves tls_verify in this outer
+          * dictionary even though a later HTTPS hop still consumes it. */

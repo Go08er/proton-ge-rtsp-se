@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import sys
 
 
@@ -27,6 +28,22 @@ def require_order(body: str, *needles: str) -> None:
         position = body.find(needle, position + 1)
         if position < 0:
             fail(f"required ordering term is absent: {needle}")
+
+
+def braced_body(text: str, condition: str) -> str:
+    """Isolate a braced arm in this known source layout, not a general C parser."""
+    try:
+        tail = text[text.index(condition) + len(condition):].lstrip()
+    except ValueError:
+        fail(f"missing guarded block: {condition}")
+    if not tail.startswith("{"):
+        fail(f"condition does not own a braced body: {condition}")
+    depth = 0
+    for index, char in enumerate(tail):
+        depth += (char == "{") - (char == "}")
+        if depth == 0:
+            return tail[1:index]
+    fail(f"unterminated guarded block: {condition}")
 
 
 def main() -> None:
@@ -58,6 +75,44 @@ def main() -> None:
         "static void session_set_sink_stream_state(",
         "static HRESULT transform_get_external_output_sample(",
     )
+    state_helper = region(
+        session,
+        "static enum object_state session_get_object_state_for_event(",
+        "static HRESULT session_start_clock(",
+    )
+    state_call = "session_get_object_state_for_event(event_type)"
+    if ("session_get_object_state_for_event(struct media_session *session, MediaEventType event)"
+            in state_helper):
+        # New GE also ignores attachment-induced Stop notifications while sinks
+        # start. This complements, rather than replaces, our one-shot barrier.
+        stopped = region(state_helper, "case MEStreamSinkStopped:",
+                         "case MEStreamSinkPrerolled:")
+        stopped = re.sub(r"/\*.*?\*/", "", stopped, flags=re.S)
+        expected = """
+            case MEStreamSinkStopped:
+                if (session->command_state == COMMAND_STATE_PREROLLING_SINKS || session->command_state == COMMAND_STATE_STARTING_SINKS)
+                    return OBJ_STATE_INVALID;
+            case MESourceStopped:
+            case MEStreamStopped:
+                return OBJ_STATE_STOPPED;
+        """
+        if " ".join(stopped.split()) != " ".join(expected.split()):
+            fail("sink Stop filtering must be limited to prerolling/starting sinks")
+        state_call = "session_get_object_state_for_event(session, event_type)"
+        require_order(
+            sink_state,
+            f"if ((state = {state_call}) == OBJ_STATE_INVALID)",
+            "return;",
+            "session_set_node_object_state(session, (IUnknown *)stream, MF_TOPOLOGY_OUTPUT_NODE, state)",
+        )
+    elif "session_get_object_state_for_event(MediaEventType event)" not in state_helper:
+        fail("unrecognized event-state helper signature")
+    legacy_arm = "topo_node->flags |= TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP;"
+    legacy_terms = (
+        "LIST_FOR_EACH_ENTRY(topo_node, &session->presentation.nodes, struct topo_node, entry)",
+        "topo_node->type == MF_TOPOLOGY_OUTPUT_NODE",
+        legacy_arm,
+    ) if legacy_arm in session_start else ()
     require_order(
         session_start,
         "sources_stopped = session_is_source_nodes_state(session, OBJ_STATE_STOPPED);",
@@ -72,9 +127,7 @@ def main() -> None:
         'WARN("Failed to stop replacement presentation clock %p, hr %#lx.\\n", session, hr);',
         "session_command_complete_with_event(session, MESessionStarted, hr, NULL);",
         "return;",
-        "LIST_FOR_EACH_ENTRY(topo_node, &session->presentation.nodes, struct topo_node, entry)",
-        "topo_node->type == MF_TOPOLOGY_OUTPUT_NODE",
-        "topo_node->flags |= TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP;",
+        *legacy_terms,
         "session->state = SESSION_STATE_STOPPED;",
         "session->clock_started = FALSE;",
         "case SESSION_STATE_STOPPED:",
@@ -84,6 +137,38 @@ def main() -> None:
     )
     if session_start.count("IMFPresentationClock_Stop(session->clock)") != 1:
         fail("replacement branch must own exactly one physical-clock stop")
+    if len(re.findall(r"\bflags\s*\|=\s*\(*\s*TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP\b", session)) != 1:
+        fail("initial clock-Stop expectation must have exactly one arming owner")
+    if not legacy_terms:
+        # Updated candidates arm at actual first attachment, including a new
+        # source after MESessionEnded. Retained pins keep their historical audit.
+        attachment = region(session, "static void session_set_presentation_clock(",
+                            "static void session_set_rate(")
+        attachment = braced_body(attachment,
+            "if (!(session->presentation.flags & SESSION_FLAG_PRESENTATION_CLOCK_SET))")
+        arming = braced_body(attachment,
+            "if (SUCCEEDED(IMFPresentationClock_GetState(session->clock, 0, &clock_state))\n"
+            "                && clock_state == MFCLOCK_STATE_STOPPED)")
+        expected = """
+            LIST_FOR_EACH_ENTRY(node, &session->presentation.nodes, struct topo_node, entry)
+            {
+                if (node->type == MF_TOPOLOGY_OUTPUT_NODE)
+                    node->flags |= TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP;
+            }
+        """
+        if " ".join(arming.split()) != " ".join(expected.split()):
+            fail("stopped-clock arming must be exactly the guarded output-node loop")
+        require_order(
+            attachment,
+            "IMFPresentationClock_SetTimeSource(session->clock,",
+            "if (SUCCEEDED(IMFPresentationClock_GetState(session->clock, 0, &clock_state))",
+            "&& clock_state == MFCLOCK_STATE_STOPPED)",
+            "LIST_FOR_EACH_ENTRY(node, &session->presentation.nodes, struct topo_node, entry)",
+            "if (node->type == MF_TOPOLOGY_OUTPUT_NODE)",
+            "node->flags |= TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP;",
+            "IMFMediaSink_SetPresentationClock(sink->sink, session->clock)",
+            "session->presentation.flags |= SESSION_FLAG_PRESENTATION_CLOCK_SET;",
+        )
     require_order(
         clear_presentation,
         "LIST_FOR_EACH_ENTRY_SAFE(sink, sink2, &session->presentation.sinks",
@@ -101,7 +186,7 @@ def main() -> None:
         "return;",
         "event_type == MEStreamSinkStarted",
         "node->flags &= ~TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP;",
-        "session_get_object_state_for_event(event_type)",
+        state_call,
     )
     if session.count("TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP = 0x10") != 1:
         fail("one-shot initial-Stop node flag is absent or duplicated")

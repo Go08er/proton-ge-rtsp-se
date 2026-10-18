@@ -1,0 +1,78 @@
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -945,9 +945,10 @@
+ 
+     if (demuxer->direct_url)
+     {
+-        if (demuxer->io_timeout) demuxer_set_deadline( demuxer, demuxer->io_timeout );
++        /* Do not renew an expired open/probe deadline during failure cleanup. */
++        if (demuxer->io_timeout && !__atomic_load_n( &demuxer->deadline, __ATOMIC_RELAXED ))
++            demuxer_set_deadline( demuxer, demuxer->io_timeout );
+         avformat_close_input( &demuxer->ctx );
+-        if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
+     }
+     else
+     {
+@@ -1014,7 +1015,6 @@
+         demuxer_set_deadline( demuxer, HTTP_OPEN_TIMEOUT_US );
+         ret = avformat_open_input( &demuxer->ctx, params->url, hint, &options );
+         interrupted = demuxer_interrupt_callback( demuxer );
+-        demuxer_set_deadline( demuxer, 0 );
+         if (ret < 0)
+         {
+             /* A timeout or cancellation must stay terminal.  Falling back to
+@@ -1076,11 +1076,9 @@
+         demuxer_set_deadline( demuxer, RTSP_OPEN_TIMEOUT_US );
+         if ((ret = avformat_open_input( &demuxer->ctx, direct_url, rtsp, &options )) < 0)
+         {
+-            demuxer_set_deadline( demuxer, 0 );
+             ERR( "Failed to open RTSP input, error %s.\n", debugstr_averr(ret) );
+             goto failed;
+         }
+-        demuxer_set_deadline( demuxer, 0 );
+         if (av_dict_count( options ))
+         {
+             ERR( "FFmpeg left %d required RTSP option(s) unused.\n", av_dict_count( options ) );
+@@ -1110,14 +1108,12 @@
+         context_has_video_missing_frame_rate( demuxer->ctx ) ||
+         (strstr( format->name, "mp4" ) && context_has_h264_codec_aligned_dimensions( demuxer->ctx )))
+     {
+-        if (demuxer->io_timeout) demuxer_set_deadline( demuxer, RTSP_OPEN_TIMEOUT_US );
++        /* Opening and probing share one absolute network deadline. */
+         if ((ret = avformat_find_stream_info( demuxer->ctx, NULL )) < 0)
+         {
+-            if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
+             ERR( "Failed to find stream info, error %s.\n", debugstr_averr(ret) );
+             goto failed;
+         }
+-        if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
+         params->duration = get_context_duration( demuxer->ctx, !demuxer->direct_url );
+     }
+     demuxer->duration = params->duration;
+@@ -1145,6 +1141,7 @@
+     if (!(demuxer->streams = calloc( demuxer->stream_count, sizeof(*demuxer->streams) ))) goto failed;
+     if (demuxer_create_streams( demuxer )) goto failed;
+ 
++    if (demuxer->direct_url && demuxer_interrupt_callback( demuxer )) goto failed;
+     params->demuxer.handle = (UINT_PTR)demuxer;
+     params->stream_count = demuxer->stream_count;
+     if (strstr( format->name, "mp4" )) strcpy( params->mime_type, "video/mp4" );
+@@ -1173,6 +1170,7 @@
+     /* parse_mp4_streams_metadata() operates on Wine's custom stream_context.
+      * A direct URL owns an FFmpeg network AVIO context instead. */
+     if (!demuxer->direct_url && strstr( format->name, "mp4" )) parse_mp4_streams_metadata( demuxer );
++    demuxer_set_deadline( demuxer, 0 );
+     return STATUS_SUCCESS;
+ 
+ failed:
+@@ -1180,6 +1178,10 @@
+     free( direct_url );
+     i = demuxer->stream_count;
+     demuxer_free_context( demuxer );
++    /* Cleanup may cross the deadline too: never fall back after that. */
++    if (demuxer->direct_url && demuxer_interrupt_callback( demuxer ))
++        failure_status = __atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )
++                ? STATUS_CANCELLED : STATUS_IO_TIMEOUT;
+     if (demuxer->streams)
+     {
+         for (UINT j = 0; j < i; j++)

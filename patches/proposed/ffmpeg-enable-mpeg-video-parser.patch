@@ -1,0 +1,33 @@
+Subject: [PATCH] build: enable the MPEG video parser already requested by WineDMO
+
+The existing --disable-everything configuration enables MPEG-1/2 decoders,
+but not their mpegvideo parser. WineDMO's av_parser_init() therefore returns
+NULL and selects GE's custom picture assembler. That assembler retains one
+picture until the next picture arrives, then tags the earlier bytes with
+the later input's timestamps. A 301-frame B-frame fixture returns 101
+backward decoded timestamps and one duplicate through both P14 and P15.
+The extracted fallback reproduces those counts against P15's real FFmpeg;
+sending the same complete packets directly does not.
+
+Enable the upstream parser that WineDMO already selects. Do not add another
+assembler, change the sink queue, or adjust timestamps to conceal the fault.
+This also affects FFmpeg's MPEG video demux parsing and needs runtime
+qualification; it is not a validated fix merely because the patch applies.
+
+Apply to the GE superproject after the crypto and dav1d build patches.
+Requires fresh pin provenance and a new whole-file Makefile.in postimage.
+No existing candidate pin or prepared tree may be updated in place. P16
+review proposal only: not compiled or playback-qualified. Place the flag
+after the decoder list so the immutable crypto patch's context stays intact.
+---
+diff --git a/Makefile.in b/Makefile.in
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -364,6 +364,7 @@ FFMPEG_CONFIGURE_ARGS := \
+ 	--enable-encoders \
+ 	--enable-bsfs \
+ 	--disable-decoder=vvc \
++	--enable-parser=mpegvideo \
+ 
+ FFMPEG_i386-unix_CONFIGURE_ARGS := \
+ 	--cross-prefix=i686-linux-gnu- \

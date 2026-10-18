@@ -1,0 +1,49 @@
+Subject: [PATCH] winedmo: bound audio output channels and allow canonical 6.1/7.1
+
+The generic/AAC decoder rejects seven and eight input channels because its
+default-mask table ends at six. SetOutputType has no corresponding upper
+bound and indexes that table for any nonzero output channel count.
+
+Append canonical 6.1 and 7.1-surround masks matching the existing Unix
+resampler's av_channel_layout_default() choices. Validate output counts
+before TEST_ONLY succeeds or any output state is changed. Keep native-first
+enumeration, stereo fallback and all one-through-six channel masks unchanged.
+
+This is not arbitrary channel-layout preservation: the existing output path
+normalizes requested masks to these defaults. The original parser can carry
+eight-channel raw audio, but an actual reference 7.1 playback pass has not
+been established. Apply after SE1; independent of 0027-0032. Source tests are
+not speaker-routing or real decoder playback evidence.
+---
+diff --git a/dlls/winedmo/audio_decoder.c b/dlls/winedmo/audio_decoder.c
+--- a/dlls/winedmo/audio_decoder.c
++++ b/dlls/winedmo/audio_decoder.c
+@@ -47,7 +47,7 @@
+                 .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},
+ };
+ 
+-static const UINT32 default_channel_mask[7] =
++static const UINT32 default_channel_mask[9] =
+ {
+     0,
+     SPEAKER_FRONT_CENTER,
+@@ -56,6 +56,9 @@
+     KSAUDIO_SPEAKER_QUAD,
+     KSAUDIO_SPEAKER_QUAD | SPEAKER_FRONT_CENTER,
+     KSAUDIO_SPEAKER_5POINT1,
++    /* Match FFmpeg's default layouts, not Windows' 7.1-wide mask. */
++    KSAUDIO_SPEAKER_5POINT1_SURROUND | SPEAKER_BACK_CENTER,
++    KSAUDIO_SPEAKER_7POINT1_SURROUND,
+ };
+ 
+ static inline UINT32 wave_format_size(const WAVEFORMATEX *format)
+@@ -472,7 +475,8 @@
+     if (i == ARRAY_SIZE(audio_decoder_output_types))
+         return MF_E_INVALIDMEDIATYPE;
+ 
+-    if (!wfx.Format.nChannels || !wfx.Format.nSamplesPerSec)
++    if (!wfx.Format.nChannels || wfx.Format.nChannels >= ARRAY_SIZE(default_channel_mask)
++            || !wfx.Format.nSamplesPerSec)
+         return MF_E_INVALIDMEDIATYPE;
+     if (flags & MFT_SET_TYPE_TEST_ONLY)
+         return S_OK;

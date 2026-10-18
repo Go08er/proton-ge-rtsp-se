@@ -1,0 +1,100 @@
+From: RTSP-on-GE contributors
+Subject: [PATCH] winedmo: Expose existing AC3 and EAC3 audio decoding
+
+FFmpeg already provides both decoders, and WineDMO already recognizes the
+canonical AC3 subtype on the Unix side. Admit both exact Dolby subtypes in
+the generic audio MFT and keep EAC3 distinct through demux and transform
+mapping: the RIFF table assigns AC3 and EAC3 the same 0x2000 tag.
+
+Dolby sync frames do not require AudioSpecificConfig. Exempt only these two
+subtypes from the existing two-byte codec-data requirement; leave the
+existing AAC, Vorbis, Opus, FLAC, WMA and channel/layout policies intact.
+Do not pass the fixed 22-byte WAVEFORMATEXTENSIBLE header as codec data when
+there are no bytes after it. The >22 case is otherwise unchanged.
+
+This is admission/mapping for existing FFmpeg decode, not passthrough,
+Atmos rendering, a new parser, or a playback qualification claim.
+
+diff --git a/dlls/msauddecmft/msauddecmft.c b/dlls/msauddecmft/msauddecmft.c
+--- a/dlls/msauddecmft/msauddecmft.c
++++ b/dlls/msauddecmft/msauddecmft.c
+@@ -128,6 +128,8 @@ HRESULT WINAPI DllRegisterServer(void)
+         {MFMediaType_Audio, MFAudioFormat_Opus},
+         {MFMediaType_Audio, MFAudioFormat_ADPCM},
+         {MFMediaType_Audio, MFAudioFormat_FLAC},
++        {MFMediaType_Audio, MFAudioFormat_Dolby_AC3},
++        {MFMediaType_Audio, MFAudioFormat_Dolby_DDPlus},
+     };
+     MFT_REGISTER_TYPE_INFO audio_decoder_mft_outputs[] =
+     {
+diff --git a/dlls/winedmo/audio_decoder.c b/dlls/winedmo/audio_decoder.c
+--- a/dlls/winedmo/audio_decoder.c
++++ b/dlls/winedmo/audio_decoder.c
+@@ -415,8 +415,11 @@ static HRESULT WINAPI transform_SetInputType(IMFTransform *iface, DWORD id, IMFMediaType *type, DWORD flags)
+         return MF_E_INVALIDMEDIATYPE;
+ 
+     if (wfx.Format.nChannels >= ARRAY_SIZE(default_channel_mask) || !wfx.Format.nSamplesPerSec
+-            /* 2 is the minimum size of AudioSpecificConfig() */
+-            || wfx.Format.cbSize < 2 + CBSIZE(WAVEFORMATEXTENSIBLE))
++            /* Dolby sync frames carry their configuration in-band. Other
++             * inputs retain the existing two-byte codec-data requirement. */
++            || (wfx.Format.cbSize < 2 + CBSIZE(WAVEFORMATEXTENSIBLE)
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_Dolby_AC3)
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_Dolby_DDPlus)))
+         return MF_E_INVALIDMEDIATYPE;
+     if (flags & MFT_SET_TYPE_TEST_ONLY)
+         return S_OK;
+@@ -842,6 +845,12 @@ static WAVEFORMATEXTENSIBLE audio_decoder_input_types[] =
+     {.Format = {.wFormatTag = 0x0161, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},  /* WMA v2/v8 */
+     {.Format = {.wFormatTag = 0x0162, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},  /* WMA Pro/v9 */
+     {.Format = {.wFormatTag = 0x0163, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},  /* WMA Lossless */
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {0xe06d802c,0xdb46,0x11cf,{0xb4,0xd1,0x00,0x80,0x5f,0x6c,0xbb,0xea}}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {0xa7fb87af,0x2d02,0x42fb,{0xa4,0xd4,0x05,0xcd,0x93,0x84,0x3b,0xdd}}},
+ };
+ 
+ HRESULT audio_decoder_create(REFIID riid, void **ret)
+diff --git a/dlls/winedmo/unix_media_type.c b/dlls/winedmo/unix_media_type.c
+--- a/dlls/winedmo/unix_media_type.c
++++ b/dlls/winedmo/unix_media_type.c
+@@ -187,7 +187,8 @@ static NTSTATUS audio_format_from_codec_params( const AVCodecParameters *params, void *format, UINT32 *format_size )
+ 
+     format_tag = wave_format_tag_from_codec_id( params->codec_id );
+     if (params->codec_id == AV_CODEC_ID_OPUS) format_tag = WAVE_FORMAT_OPUS;
+-    else if (params->codec_id == AV_CODEC_ID_AC3) format_tag = WAVE_FORMAT_EXTENSIBLE;
++    else if (params->codec_id == AV_CODEC_ID_AC3 || params->codec_id == AV_CODEC_ID_EAC3)
++        format_tag = WAVE_FORMAT_EXTENSIBLE;
+     /* Big-endian PCM in native Windows is given the usual WAVE_FORMAT_PCM tag. */
+     else if (params->codec_id == AV_CODEC_ID_PCM_S16BE) format_tag = WAVE_FORMAT_PCM;
+ 
+@@ -198,6 +199,7 @@ static NTSTATUS audio_format_from_codec_params( const AVCodecParameters *params, void *format, UINT32 *format_size )
+ 
+         if (params->codec_id == AV_CODEC_ID_VORBIS) subtype = MFAudioFormat_Vorbis;
+         else if (params->codec_id == AV_CODEC_ID_AC3) subtype = MFAudioFormat_Dolby_AC3;
++        else if (params->codec_id == AV_CODEC_ID_EAC3) subtype = MFAudioFormat_Dolby_DDPlus;
+         else subtype.Data1 = format_tag;
+ 
+         wave_format_size += sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -157,6 +157,7 @@ static enum AVCodecID codec_id_from_audio_format( const WAVEFORMATEX *wfx )
+          * lower WORD (0xD10B) is not a valid WAVE tag, so check the full GUID. */
+         if (IsEqualGUID( &ext->SubFormat, &MFAudioFormat_Vorbis )) return AV_CODEC_ID_VORBIS;
+         if (IsEqualGUID( &ext->SubFormat, &MFAudioFormat_Dolby_AC3 )) return AV_CODEC_ID_AC3;
++        if (IsEqualGUID( &ext->SubFormat, &MFAudioFormat_Dolby_DDPlus )) return AV_CODEC_ID_EAC3;
+         tag = (WORD)ext->SubFormat.Data1;
+     }
+ 
+@@ -753,7 +754,7 @@ NTSTATUS transform_create( void *args )
+             extradata      = (const BYTE *)(wfx + 1);
+             extradata_size = wfx->cbSize;
+             /* For WAVEFORMATEXTENSIBLE, extra codec data starts past the fixed ext part */
+-            if (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE && wfx->cbSize > 22)
++            if (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE && wfx->cbSize >= 22)
+             {
+                 extradata      += 22;
+                 extradata_size -= 22;

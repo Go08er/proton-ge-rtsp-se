@@ -1,0 +1,41 @@
+build_contrib_manifest_version	3
+source_commit	01bfbf67b35418fdd705f2be09e0bfb43eece24b
+# GE-Proton11-9: unchanged Gecko/xrandr/Piper/nested, zenity, NVML and Mono inputs.
+# Versions/gitlinks and all retained bytes locally reverified 2026-10-16.
+# GE11-9 ProtonFixes changes Debian unzip revision 29 to 29+deb13u1;
+# replacement archive independently hashed from the observed local download.
+# Piper pic.zip is branch-derived; retain the observed hash, never drift.
+entry	contrib/wine-gecko-2.47.4-x86.tar.xz	0644	43025064	2cfc8d5c948602e21eff8a78613e1826f2d033df9672cace87fed56e8310afb6
+fetch	contrib/wine-gecko-2.47.4-x86.tar.xz	https://dl.winehq.org/wine/wine-gecko/2.47.4/wine-gecko-2.47.4-x86.tar.xz
+entry	contrib/wine-gecko-2.47.4-x86_64.tar.xz	0644	41935496	fd88fc7e537d058d7a8abf0c1ebc90c574892a466de86706a26d254710a82814
+fetch	contrib/wine-gecko-2.47.4-x86_64.tar.xz	https://dl.winehq.org/wine/wine-gecko/2.47.4/wine-gecko-2.47.4-x86_64.tar.xz
+entry	contrib/xrandr-1.5.4.tar.xz	0644	182784	2cafccb2aaf2491a4068676117a0d4f90ab307724b96fffc54cd1da953779400
+fetch	contrib/xrandr-1.5.4.tar.xz	https://www.x.org/releases/individual/app/xrandr-1.5.4.tar.xz
+entry	contrib/protonfixes/downloads/unzip/unzip_6.0.orig.tar.gz	0644	1376845	036d96991646d0449ed0aa952e4fbe21b476ce994abc276e49d30e686708bd37
+fetch	contrib/protonfixes/downloads/unzip/unzip_6.0.orig.tar.gz	https://deb.debian.org/debian/pool/main/u/unzip/unzip_6.0.orig.tar.gz
+entry	contrib/protonfixes/downloads/unzip/unzip_6.0-29+deb13u1.debian.tar.xz	0644	27112	32716adbdf903ee4e7e28f8c9884fc3459b22b2214e0ff4cefc0ab9839f43481
+fetch	contrib/protonfixes/downloads/unzip/unzip_6.0-29+deb13u1.debian.tar.xz	https://deb.debian.org/debian/pool/main/u/unzip/unzip_6.0-29+deb13u1.debian.tar.xz
+entry	contrib/piper/downloads/fmt/10.0.0.zip	0644	920667	5bf4d5358301fdf3bd100c01b9d4c1fbb2091dc2267fb4fa6d7cd522b3e47179
+fetch	contrib/piper/downloads/fmt/10.0.0.zip	https://github.com/fmtlib/fmt/archive/refs/tags/10.0.0.zip
+entry	contrib/piper/downloads/spdlog/v1.12.0.zip	0644	331280	6174bf8885287422a6c6a0312eb8a30e8d22bcfcee7c48a6d02d1835d7769232
+fetch	contrib/piper/downloads/spdlog/v1.12.0.zip	https://github.com/gabime/spdlog/archive/refs/tags/v1.12.0.zip
+entry	contrib/piper/downloads/piper-phonemize/pic.zip	0644	9800149	728800cd310c64e6b6877866161b32ff0dc2d9c52ebdc54281fa21e448d2adef
+fetch	contrib/piper/downloads/piper-phonemize/pic.zip	https://github.com/shaunren/piper-phonemize/archive/refs/heads/pic.zip
+entry	contrib/piper/downloads/piper-phonemize/onnxruntime/onnxruntime-linux-x64-1.14.1.tgz	0644	6233648	010585f534d822bf02d54c7cfc53b57aa3eb0cf34f8fb7503ee519ed18e25d29
+fetch	contrib/piper/downloads/piper-phonemize/onnxruntime/onnxruntime-linux-x64-1.14.1.tgz	https://github.com/microsoft/onnxruntime/releases/download/v1.14.1/onnxruntime-linux-x64-1.14.1.tgz
+entry	contrib/piper/downloads/piper-phonemize/espeak-ng/0f65aa301e0d6bae5e172cc74197d32a6182200f.zip	0644	18003706	150fc955926a084a77ebe25c9e8287bde2e2a17bbf9b23a25c147b556837949f
+fetch	contrib/piper/downloads/piper-phonemize/espeak-ng/0f65aa301e0d6bae5e172cc74197d32a6182200f.zip	https://github.com/rhasspy/espeak-ng/archive/0f65aa301e0d6bae5e172cc74197d32a6182200f.zip
+entry	contrib/piper/downloads/piper-phonemize/espeak-ng/sonic/fbf75c3d6d846bad3bb3d456cbc5d07d9fd8c104.zip	0644	5343518	d7c5a715f574a4a2a5afe970f489d3950bcd5229f1bed3f0e010a5413957ec20
+fetch	contrib/piper/downloads/piper-phonemize/espeak-ng/sonic/fbf75c3d6d846bad3bb3d456cbc5d07d9fd8c104.zip	https://github.com/waywardgeek/sonic/archive/fbf75c3d6d846bad3bb3d456cbc5d07d9fd8c104.zip
+entry	contrib/protonfixes/zenity-rs/zenity-rs	0644	1714624	797bd492a8723d741d888320ab87b934b0c4571a1ff2c128963a08daa35df8c7
+fetch	contrib/protonfixes/zenity-rs/zenity-rs	https://github.com/QaidVoid/zenity-rs/releases/download/v0.2.8/zenity-rs-x86_64-linux
+entry	contrib/nvidia-libs/wine-nvml/nvml_610.43.02.h	0644	795795	31a26e3ce6f0b98a76cea38a3cf28aa112a20cfb37e9057786c768712d6a487f
+fetch	contrib/nvidia-libs/wine-nvml/nvml_610.43.02.h	https://raw.githubusercontent.com/NVIDIA/nvidia-settings/610.43.02/src/nvml.h
+# GE-Proton11-7 additions/replacements, downloaded and hashed 2026-09-16.
+# No compiler or container was run to obtain these input identities.
+entry	contrib/wine-mono-11.3.0-x86.tar.xz	0644	39412620	54a1b0111c3fe4b785eae688af94d27e64995707ad648b6fee8000381b80d298
+fetch	contrib/wine-mono-11.3.0-x86.tar.xz	https://github.com/madewokherd/wine-mono/releases/download/wine-mono-11.3.0/wine-mono-11.3.0-x86.tar.xz
+entry	contrib/xalia-0.5.0-net48-mono.zip	0644	2242074	cf32efdacfa1593f73cf9fecc38918353bc5cb99bc7271f555748e0b7f6e9799
+fetch	contrib/xalia-0.5.0-net48-mono.zip	https://github.com/madewokherd/xalia/releases/download/xalia-0.5.0/xalia-0.5.0-net48-mono.zip
+entry	contrib/wine-mono-11.3.0-src.tar.xz	0644	306872028	9f4f03285fbeed484980efbb1eba1c19069244aea401d2ff1585e3990782edf7
+fetch	contrib/wine-mono-11.3.0-src.tar.xz	https://github.com/wine-mono/wine-mono/releases/download/wine-mono-11.3.0/wine-mono-11.3.0-src.tar.xz

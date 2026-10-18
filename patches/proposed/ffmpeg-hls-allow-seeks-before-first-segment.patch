@@ -1,0 +1,27 @@
+From: RTSP-on-GE development <noreply@localhost>
+Subject: [PATCH E5] avformat/hls: accept a seek before the first segment
+
+A timestamp below the playlist floor already selects its first segment.
+Report that selection as successful and initialize its start timestamp,
+instead of making hls_read_seek fail with EIO. The existing unseekable-live
+guard and beyond-end rejection are unchanged.
+
+--- a/libavformat/hls.c
++++ b/libavformat/hls.c
+@@ -1914,4 +1914,4 @@
+-/* if timestamp was in valid range: returns 1 and sets seq_no
++/* if timestamp is before start or in valid range: returns 1 and sets seq_no
+  * if not: returns 0 and sets seq_no to closest segment */
+ static int find_timestamp_in_playlist(HLSContext *c, struct playlist *pls,
+                                       int64_t timestamp, int64_t *seq_no,
+@@ -1923,7 +1923,9 @@
+ 
+     if (timestamp < pos) {
+         *seq_no = pls->start_seq_no;
+-        return 0;
++        if (seg_start_ts)
++            *seg_start_ts = pos;
++        return 1;
+     }
+ 
+     for (i = 0; i < pls->n_segments; i++) {

@@ -10,9 +10,13 @@ GE's `Makefile.in`, not Wine or FFmpeg decoder code, and does not bypass the
 media route's protocol restrictions. The [series file](series) is the
 machine-readable order; the linked patch contains the explanation and diff.
 
-The provenance below includes historical base hashes. For SE1, use the
+The provenance below includes historical base hashes. For SE2, use the
 release-specific expected postimage in its
-[pin](../../config/ge-proton11-6-se1.env), not those historical postimages.
+[pin](../../config/ge-proton11-9-se2.env), not those historical postimages.
+SE2 applies this series from [series-ge-proton11-9](series-ge-proton11-9);
+SE1's [pin](../../config/ge-proton11-6-se1.env) keeps using [series](series).
+The other SE2 FFmpeg build modules are listed in the
+[patch index](../README.md#ffmpeg-build-and-companion-modules).
 
 ## Provenance
 

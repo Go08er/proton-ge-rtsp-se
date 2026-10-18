@@ -1,0 +1,38 @@
+Subject: [PATCH] mfmediaengine: remove an unused topology-event variant cleanup
+
+The topology-ready event handler declares a PROPVARIANT which is never
+initialized or populated, then calls PropVariantClear on it. That function
+reads the variant type and can release/free its payload. Clearing arbitrary
+stack contents is not safe, even if the usual stack contents happen to be
+VT_EMPTY or another harmless scalar type.
+
+Remove the unused variable and cleanup, rather than initializing a value
+which has no purpose. The event's topology status is obtained directly with
+GetUINT32; no owned object or allocation is associated with this variable.
+Notification ordering, locking, volume application and scrubbing are unchanged.
+
+This is a pre-existing Wine defect also present in SE2-P1 and SE2-P3. It is
+not an attribution of the Volare player stall to this code path. The extracted
+topology-handler regression test diagnoses the old uninitialized read with
+GCC's analyzer and verifies the fixed ready/not-ready notification behavior.
+---
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -1120,7 +1120,6 @@
+         case MESessionTopologyStatus:
+         {
+             UINT32 topo_status = 0;
+-            PROPVARIANT value;
+ 
+             IMFMediaEvent_GetUINT32(event, &MF_EVENT_TOPOLOGY_STATUS, &topo_status);
+             if (topo_status != MF_TOPOSTATUS_READY)
+@@ -1147,8 +1146,6 @@
+ 
+             LeaveCriticalSection(&engine->cs);
+ 
+-            PropVariantClear(&value);
+-
+             break;
+         }
+         case MESessionStarted:

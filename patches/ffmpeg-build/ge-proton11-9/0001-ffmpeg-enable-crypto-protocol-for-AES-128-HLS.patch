@@ -1,0 +1,20 @@
+From b4e5b7566addfaa86a81b84d4f07259d1861c217 Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Subject: [PATCH] ffmpeg: enable crypto protocol for AES-128 HLS (GE11-9 context)
+
+Same one-line policy as the retained crypto integration patch. GE11-9 now
+enables libdav1d immediately after gnutls; refresh context without dropping
+that upstream decoder. No protocol whitelist or TLS policy is changed here.
+The new pin binds this patch and its release-specific Makefile postimage.
+---
+diff --git a/Makefile.in b/Makefile.in
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -359,6 +359,7 @@ FFMPEG_CONFIGURE_ARGS := \
+ 	--enable-libdav1d \
+ 	--enable-demuxers \
+ 	--enable-protocol=https \
++	--enable-protocol=crypto \
+ 	--enable-decoders \
+ 	--enable-encoders \
+ 	--enable-bsfs \

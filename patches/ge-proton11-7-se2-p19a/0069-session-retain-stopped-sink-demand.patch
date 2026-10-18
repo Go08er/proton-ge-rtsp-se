@@ -1,0 +1,59 @@
+From: RTSP-on-GE development <development@localhost>
+Subject: [PROPOSED] mf: retain late sink demand until stopped sources restart
+
+After natural EOS, SAR can queue a request after the Session's final flush.
+Pulling a stopped source returns MF_E_MEDIA_SOURCE_WRONGSTATE while the
+intervening transforms retain their output requests. Later preroll adds
+demand but sees an already outstanding transform pull, so audio never restarts.
+
+Keep the sink demand during stop/stopped-start gaps using the existing
+RESTARTING flag. Re-prime at the all-sources-started barrier before either
+preroll or ordinary clock start. Do not reset EOS generations again, change
+timeouts, or retry failed reads/seeks. This is a proposal, not an active pin.
+
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -3374,6 +3374,12 @@
+             }
+             session_set_presentation_clock(session);
+ 
++            if (session->presentation.flags & SESSION_FLAG_RESTARTING)
++            {
++                session->presentation.flags &= ~SESSION_FLAG_RESTARTING;
++                session_flush_sinks(session);
++            }
++
+             if (session->presentation.rate != 0.0f && (session->presentation.flags & SESSION_FLAG_NEEDS_PREROLL)
+                     && session_is_output_nodes_state(session, OBJ_STATE_STOPPED))
+             {
+@@ -3411,12 +3417,6 @@
+             }
+             else
+             {
+-                if (session->presentation.flags & SESSION_FLAG_RESTARTING)
+-                {
+-                    session->presentation.flags &= ~SESSION_FLAG_RESTARTING;
+-                    session_flush_sinks(session);
+-                }
+-
+                 if (SUCCEEDED(hr = session_start_clock(session)))
+                 {
+                     /* If sinks are already started, start session immediately. This can happen when doing a
+@@ -4372,6 +4372,17 @@
+     }
+ 
+     sink_node->u.sink.requests++;
++    /* Late sink demand can outlive EOS/Stop. Do not strand transform requests
++     * on a stopped source. Retain the demand for the all-sources-started
++     * barrier, including restarts which need to preroll the sinks again. */
++    if (session->command_state == COMMAND_STATE_STOPPING_SINKS
++            || session->command_state == COMMAND_STATE_STOPPING_SOURCES
++            || (session->state == SESSION_STATE_STOPPED
++                && !session_is_source_nodes_state(session, OBJ_STATE_STARTED)))
++    {
++        session->presentation.flags |= SESSION_FLAG_RESTARTING;
++        return;
++    }
+     /* Keep sink demand while stopped seek sources restart. Pulling now can
+      * leave a transform request stranded after MF_E_MEDIA_SOURCE_WRONGSTATE.
+      * The all-sources-started barrier clears RESTARTING before re-priming. */

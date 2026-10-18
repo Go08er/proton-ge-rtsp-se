@@ -6,10 +6,13 @@ video and continuous audio; a loaded poster frame is not a playback pass.
 For seeking, check forward/backward movement and sustained playback afterward.
 For a live stream without a clock, say that rather than inventing timing data.
 
-The SE1 development baseline, A3.23, passed the maintainer's reported service
+The SE2 development baseline, candidate P24 (the same Wine series and FFmpeg
+build modules as SE2), passed quiet-host qualification and a maintainer VRChat
+live test; the SE1 baseline, A3.23, passed the maintainer's reported service
 seek, YouTube seek, Waterwolf RTSP and multiplayer join-in-progress checks.
-Exact attempt counts, recovery latency and synchronization offsets were not
-measured. No all-codec, all-world or long-soak claim follows.
+Exact synchronization offsets were not measured. See the
+[release notes](../RELEASE.md#qualification-and-limits) for the SE2 results
+and known limits. No all-codec, all-world or long-soak claim follows.
 
 The focused MediaEngine test consumes frames and checks clock advancement.
 The prior R2 candidate reproduces a finite-HLS seek freeze while a matching

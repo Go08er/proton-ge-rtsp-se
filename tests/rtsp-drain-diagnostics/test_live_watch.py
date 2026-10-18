@@ -89,8 +89,125 @@ MTX_LINES = [
 
 FFMPEG_LINES = ["Connection reset by peer"]
 
+# Fixed message templates observed during the P3 session; no private log data.
+APP_LINES = [
+    "2026.09.12 23:00:49 Error      -  [UdonBehaviour] An exception occurred "
+    "during Udon execution, this UdonBehaviour will be halted.",
+    "VRC.Udon.VM.UdonVMException: PRIVATE_SENTINEL",
+    "Program execution time exceeded max VM time of 10.0 seconds. "
+    "You may want to check for infinite loops/recursion.",
+]
+
+PROTON_NOTICE_LINES = [
+    '23406.425:01a8:06c0:warn:dmo:vlog [hls @ 0x1234] '
+    'skipping 1 segments ahead, expired from playlists PRIVATE_SENTINEL',
+    '23388.275:01a8:01ac:err:sync:RtlpWaitForCriticalSection '
+    'section 0000000012345678 "PRIVATE_SENTINEL" wait timed out in '
+    'thread 01ac, blocked by 02cc, retrying (60 sec)',
+]
+
 
 class MonitorTests(unittest.TestCase):
+    def test_udon_halt_and_budget_are_visible_without_private_payloads(self):
+        output = []
+        monitor = live_watch.Monitor(output.append)
+        for line in APP_LINES:
+            monitor.feed('vrchat', line)
+        self.assertEqual(output, [
+            'APP UDON_HALTED #1 wall=2026.09.12T23:00:49',
+            'APP VM_BUDGET #1 wall=2026.09.12T23:00:49 limit=10.0s',
+        ])
+        monitor.finish()
+        self.assertIn('udon_halt=1', output[-1])
+        self.assertIn('vm_budget=1', output[-1])
+        self.assertNotIn('PRIVATE_SENTINEL', '\n'.join(output))
+
+    def test_app_budget_requires_a_current_halt_and_resets_on_rotation(self):
+        output = []
+        monitor = live_watch.Monitor(output.append)
+        monitor.feed('vrchat', APP_LINES[2])
+        monitor.feed('vrchat', '2026.09.12 23:00:49 Debug - chat: ' + APP_LINES[0])
+        self.assertEqual(output, [])
+        monitor.feed('vrchat', APP_LINES[0])
+        monitor.file_event('vrchat', 'recreated', 'vrchat-02.log')
+        monitor.feed('vrchat', APP_LINES[2])
+        self.assertFalse(any('VM_BUDGET' in line for line in output))
+        monitor.feed('vrchat', APP_LINES[0])
+        monitor.feed('vrchat', '2026.09.12 23:00:50 Debug - unrelated message')
+        monitor.feed('vrchat', APP_LINES[2])
+        self.assertFalse(any('VM_BUDGET' in line for line in output))
+
+    def test_later_application_halts_are_not_hidden_by_prior_incidents(self):
+        output = []
+        monitor = live_watch.Monitor(output.append)
+        for _ in range(5):
+            monitor.feed('vrchat', APP_LINES[0])
+        self.assertEqual(len(output), 5)
+        self.assertIn('UDON_HALTED #5', output[-1])
+
+    def test_hls_expiry_and_lock_wait_are_numeric_separate_notices(self):
+        output = []
+        monitor = live_watch.Monitor(output.append)
+        for line in PROTON_NOTICE_LINES:
+            monitor.feed('proton', line)
+        self.assertEqual(output, [
+            'HLS EXPIRED #1 wine=23406.425 skipped=1',
+            'LOCK WAIT #1 wine=23388.275 waiter=01ac owner=02cc',
+        ])
+        monitor.finish()
+        self.assertIn('hls_expiry=1', output[-1])
+        self.assertIn('lock_wait=1', output[-1])
+        self.assertNotIn('PRIVATE_SENTINEL', '\n'.join(output))
+
+    def test_session_sized_warning_flood_stays_glanceable(self):
+        output = []
+        monitor = live_watch.Monitor(output.append)
+        for _ in range(348769):
+            monitor.feed('proton', '1.000:01a8:0610:warn:mfplat:memory_buffer_QueryInterface PRIVATE_SENTINEL')
+        self.assertLessEqual(len(output), 10)
+        monitor.finish()
+        self.assertIn('warn:mfplat=348769', output[-1])
+        self.assertNotIn('PRIVATE_SENTINEL', '\n'.join(output))
+
+    def test_once_cli_preserves_optional_application_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / 'output_log.txt'
+            app.write_text('\n'.join(APP_LINES) + '\n')
+            result = subprocess.run([
+                sys.executable, str(Path(live_watch.__file__)), '--once',
+                '--proton-log', str(root / 'missing-proton'),
+                '--mediamtx-log', str(root / 'missing-mtx'),
+                '--publisher-log', str(root / 'missing-publisher'),
+                '--vrchat-log', str(app), '--capture-dir', str(root / 'capture'),
+            ], capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('APP VM_BUDGET #1', result.stdout)
+            captured = root / 'capture/vrchat-01.log'
+            self.assertEqual(captured.read_bytes(), app.read_bytes())
+            self.assertEqual(captured.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn('PRIVATE_SENTINEL', result.stdout)
+
+    def test_filter_error_context_is_numeric_glanceable_and_collapsed(self):
+        output = []
+        monitor = live_watch.Monitor(output.append)
+        line = ('1:00a:00b:warn:dmo:demuxer_filter_packet Failed to send packet to filter, '
+                'error Invalid argument; empty_inputs=1 input_eofs=0 stream=1 eos=1 '
+                'avio_error=-22 cancelled=0. unknown=PRIVATE_SENTINEL')
+        for _ in range(12):
+            monitor.feed('proton', line)
+        self.assertEqual(len(output), 4)
+        self.assertEqual(output[0], 'FILTER #1 stream=1 eos=1 eof=0 empty=1 avio=-22 cancel=0')
+        self.assertIn('FILTER #10', output[-1])
+        self.assertNotIn('PRIVATE_SENTINEL', '\n'.join(output))
+
+    def test_filter_context_never_echoes_non_numeric_fields(self):
+        output = []
+        monitor = live_watch.Monitor(output.append)
+        monitor.feed('proton', ':warn:dmo:demuxer_filter_packet Failed to send packet to filter, '
+                     'input_eofs=PRIVATE_SENTINEL empty_inputs=0 stream=1 avio_error=SECRET')
+        self.assertEqual(output, ['FILTER #1 stream=1 eos=? eof=? empty=0 avio=? cancel=?'])
+
     def test_generic_parser_ignores_field_order_and_unknown_fields(self) -> None:
         fields = live_watch.parse_fields(PROTON_LINES[0])
         self.assertEqual(fields["event"], "source_start")
@@ -370,7 +487,6 @@ class MonitorTests(unittest.TestCase):
                 "WINE warn:mfplat #2 (inspect local log)",
                 "WINE warn:mfplat #3 (inspect local log)",
                 "WINE warn:mfplat #10 (inspect local log)",
-                "WINE warn:mfplat #50 (inspect local log)",
             ],
         )
 
@@ -436,6 +552,7 @@ class MonitorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             proton = root / "steam-438100.log"
+            app = root / "output_log.txt"
             capture = root / "capture"
             process = subprocess.Popen(
                 [
@@ -449,6 +566,8 @@ class MonitorTests(unittest.TestCase):
                     str(root / "mediamtx.log"),
                     "--publisher-log",
                     str(root / "ffmpeg.log"),
+                    "--vrchat-log",
+                    str(app),
                     "--capture-dir",
                     str(capture),
                 ],
@@ -466,7 +585,8 @@ class MonitorTests(unittest.TestCase):
                 deadline = time.monotonic() + 3
                 while (
                     time.monotonic() < deadline
-                    and not any(line.startswith("B01 START") for line in observed)
+                    and not (any(line.startswith("B01 START") for line in observed)
+                             and any(line.startswith("APP VM_BUDGET") for line in observed))
                 ):
                     for key, _ in selector.select(timeout=0.1):
                         chunk = os.read(key.fileobj.fileno(), 4096)
@@ -486,6 +606,7 @@ class MonitorTests(unittest.TestCase):
                             PROTON_LINES[0] + "\n",
                             encoding="utf-8",
                         )
+                        app.write_text("\n".join(APP_LINES) + "\n", encoding="utf-8")
                         proton_created = True
                 self.assertIsNone(
                     process.poll(),
@@ -493,6 +614,10 @@ class MonitorTests(unittest.TestCase):
                 )
                 self.assertTrue(
                     any(line.startswith("B01 START") for line in observed),
+                    observed,
+                )
+                self.assertTrue(
+                    any(line.startswith("APP VM_BUDGET") for line in observed),
                     observed,
                 )
             finally:
@@ -509,10 +634,11 @@ def demo() -> int:
             "proton": root / "steam-438100.log",
             "mediamtx": root / "a316-mediamtx.log",
             "publisher": root / "a316-ffmpeg.log",
+            "vrchat": root / "output_log.txt",
             "capture": root / "capture",
         }
         paths["proton"].write_text(
-            "\n".join(PROTON_LINES) + "\n",
+            "\n".join(PROTON_LINES + PROTON_NOTICE_LINES) + "\n",
             encoding="utf-8",
         )
         paths["mediamtx"].write_text(
@@ -523,6 +649,7 @@ def demo() -> int:
             "\n".join(FFMPEG_LINES) + "\n",
             encoding="utf-8",
         )
+        paths["vrchat"].write_text("\n".join(APP_LINES) + "\n", encoding="utf-8")
         return live_watch.main(
             [
                 "--once",
@@ -532,6 +659,8 @@ def demo() -> int:
                 str(paths["mediamtx"]),
                 "--publisher-log",
                 str(paths["publisher"]),
+                "--vrchat-log",
+                str(paths["vrchat"]),
                 "--capture-dir",
                 str(paths["capture"]),
             ]

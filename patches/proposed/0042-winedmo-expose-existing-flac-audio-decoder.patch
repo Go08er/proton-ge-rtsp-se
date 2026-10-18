@@ -1,0 +1,41 @@
+Subject: [PATCH] winedmo: expose the existing FLAC decoder to Media Foundation
+
+FFmpeg already decodes FLAC and the demux source already publishes its RIFF
+subtype with STREAMINFO as codec user data. The generic Wine audio MFT is
+neither registered for that subtype nor willing to accept it, so a valid
+FLAC source cannot resolve a playable topology. P5's FLAC HLS test discovers
+audio but never reaches CANPLAY.
+
+Add FLAC to the two existing tables. Keep format conversion, codec data,
+channel/rate bounds, resampling, output negotiation and flush unchanged.
+The existing RIFF codec lookup maps WAVE_FORMAT_FLAC to AV_CODEC_ID_FLAC;
+no additional decoder, container implementation or private GUID is needed.
+
+This admits source-shaped FLAC with codec data. It does not relax the shared
+minimum codec-data check, add inline-header-only MF input, claim arbitrary
+channel masks, or fix missing topology-error forwarding. Float output can
+represent 16/24-bit PCM; actual preservation requires the decode tests, and
+32-bit lossless output is not claimed.
+---
+diff --git a/dlls/msauddecmft/msauddecmft.c b/dlls/msauddecmft/msauddecmft.c
+--- a/dlls/msauddecmft/msauddecmft.c
++++ b/dlls/msauddecmft/msauddecmft.c
+@@ -127,6 +127,7 @@
+         {MFMediaType_Audio, MFAudioFormat_Vorbis},
+         {MFMediaType_Audio, MFAudioFormat_Opus},
+         {MFMediaType_Audio, MFAudioFormat_ADPCM},
++        {MFMediaType_Audio, MFAudioFormat_FLAC},
+     };
+     MFT_REGISTER_TYPE_INFO audio_decoder_mft_outputs[] =
+     {
+diff --git a/dlls/winedmo/audio_decoder.c b/dlls/winedmo/audio_decoder.c
+--- a/dlls/winedmo/audio_decoder.c
++++ b/dlls/winedmo/audio_decoder.c
+@@ -836,6 +836,7 @@
+     {.Format = {.wFormatTag = WAVE_FORMAT_OPUS, .nChannels = 6, .nSamplesPerSec = 48000, .nAvgBytesPerSec = 1152000,
+                 .nBlockAlign = 24, .wBitsPerSample = 32, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},
+     {.Format = {.wFormatTag = WAVE_FORMAT_ADPCM, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_FLAC, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},
+     {.Format = {.wFormatTag = 0x0160, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},  /* WMA v1 */
+     {.Format = {.wFormatTag = 0x0161, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},  /* WMA v2/v8 */
+     {.Format = {.wFormatTag = 0x0162, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},  /* WMA Pro/v9 */

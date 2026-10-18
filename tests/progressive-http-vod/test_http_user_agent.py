@@ -15,8 +15,14 @@ class HttpUserAgentTests(unittest.TestCase):
     def setUpClass(cls):
         cls.text = (WINE_TREE / "dlls/winedmo/unix_demuxer.c").read_text()
         create = cls.text.split("NTSTATUS demuxer_create( void *arg )", 1)[1]
-        cls.hls, rest = create.split("else if (is_http_url( params->url ))", 1)
-        cls.http, cls.rtsp = rest.split("else if ((rtsp_kind = get_rtsp_url_kind( params->url )))", 1)
+        cls.combined = "\n    if (is_http_url( params->url ))" in create
+        if cls.combined:
+            rest = create.split("\n    if (is_http_url( params->url ))", 1)[1]
+            cls.http, cls.rtsp = rest.split("else if ((rtsp_kind = get_rtsp_url_kind( params->url )))", 1)
+            cls.hls = cls.http  # One identity-bearing open before format detection.
+        else:
+            cls.hls, rest = create.split("else if (is_http_url( params->url ))", 1)
+            cls.http, cls.rtsp = rest.split("else if ((rtsp_kind = get_rtsp_url_kind( params->url )))", 1)
 
     def test_windows_media_foundation_identity(self):
         self.assertIn(f'#define HTTP_USER_AGENT "{AGENT}"', self.text)
@@ -31,7 +37,7 @@ class HttpUserAgentTests(unittest.TestCase):
 
     def test_no_rtsp_identity_change(self):
         self.assertNotIn('"user_agent"', self.rtsp)
-        self.assertEqual(self.text.count(SET_AGENT), 2)
+        self.assertEqual(self.text.count(SET_AGENT), 1 if self.combined else 2)
 
     def test_tls_and_option_consumption_remain_checked(self):
         for branch in (self.hls, self.http):

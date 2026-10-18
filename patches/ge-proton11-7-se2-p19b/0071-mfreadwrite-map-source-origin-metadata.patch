@@ -1,0 +1,414 @@
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -36,6 +36,7 @@
+ 
+ #include "wine/debug.h"
+ #include "wine/list.h"
++#include "wine/mforigin.h"
+ 
+ #include "mf_private.h"
+ 
+@@ -193,6 +194,8 @@
+     unsigned int flags;
+     BOOL unthrottled_audio_output;
+     unsigned int seek_serial;
++    BOOL has_presentation_origin;
++    LONGLONG presentation_origin; /* effective source coordinate offset; zero for HLS */
+     unsigned int completed_seek_serial;
+     DWORD queue;
+     enum media_source_state source_state;
+@@ -509,13 +512,26 @@
+     }
+ }
+ 
++static BOOL source_reader_add_timestamp(LONGLONG timestamp, LONGLONG offset, LONGLONG *result)
++{
++    /* Do not turn an unknown timestamp into a plausible value or saturate
++     * negative preroll.  A representational overflow is an invalid timestamp. */
++    if (timestamp == INT64_MIN || timestamp == INT64_MAX
++            || (offset > 0 && timestamp > INT64_MAX - offset)
++            || (offset < 0 && timestamp < INT64_MIN - offset))
++        return FALSE;
++    *result = timestamp + offset;
++    return *result != INT64_MIN && *result != INT64_MAX;
++}
++
+ static void source_reader_reset_stream_timing(struct media_stream *stream)
+ {
+     stream->last_sample_ts = 0;
+     stream->delivered_sample_ts = 0;
+     stream->queued_sample_ts = 0;
+     stream->last_sample_duration = 0;
+-    stream->timestamp_adjust = 0;
++    stream->timestamp_adjust = stream->reader->has_presentation_origin
++            ? -stream->reader->presentation_origin : 0;
+     stream->have_sample_ts = FALSE;
+     stream->is_new_stream = TRUE;
+     stream->preserve_seek_epoch = FALSE;
+@@ -576,7 +592,17 @@
+     response->status = status;
+     response->stream_index = stream->index;
+     response->stream_flags = stream_flags;
+-    if (!sample && timestamp && stream->timestamp_adjust)
++    if (!sample && reader->has_presentation_origin && SUCCEEDED(status)
++            && (stream_flags & MF_SOURCE_READERF_STREAMTICK))
++    {
++        if (!source_reader_add_timestamp(timestamp, stream->timestamp_adjust, &timestamp))
++        {
++            response->status = MF_E_INVALID_TIMESTAMP;
++            response->stream_flags = MF_SOURCE_READERF_ERROR;
++            timestamp = 0;
++        }
++    }
++    else if (!sample && !reader->has_presentation_origin && timestamp && stream->timestamp_adjust)
+         timestamp += stream->timestamp_adjust;
+     response->timestamp = timestamp;
+     response->sample = sample;
+@@ -592,6 +618,9 @@
+     {
+         LONGLONG duration;
+ 
++        /* An untimestamped sample cannot establish or advance the epoch. */
++        if (reader->has_presentation_origin && FAILED(IMFSample_GetSampleTime(sample, &timestamp)))
++            return S_OK;
+         stream->last_sample_ts = timestamp;
+         stream->queued_sample_ts = timestamp;
+         stream->last_sample_duration = SUCCEEDED(IMFSample_GetSampleDuration(sample, &duration)) ? duration : 0;
+@@ -614,13 +643,24 @@
+     stream->flags &= ~STREAM_FLAG_EOS_REPORTED;
+ 
+     if (FAILED(IMFSample_GetSampleTime(sample, &timestamp)))
++    {
+         WARN("Sample time wasn't set.\n");
++        /* Preserve absence, rather than relabeling a fabricated zero with the
++         * common origin.  The first timestamped sample still establishes timing. */
++        if (reader->has_presentation_origin)
++            return source_reader_queue_response(reader, stream, S_OK, flags, 0, sample);
++    }
+     if (FAILED(IMFSample_GetSampleDuration(sample, &duration)))
+         duration = 0;
+ 
++    if (reader->has_presentation_origin
++            && !source_reader_add_timestamp(timestamp, stream->timestamp_adjust, &adjusted_timestamp))
++        return MF_E_INVALID_TIMESTAMP;
++
+     if (stream->is_new_stream)
+     {
+         if (!(reader->flags & SOURCE_READER_PRESERVE_SOURCE_TIMESTAMPS)
++                && !reader->has_presentation_origin
+                 && !stream->preserve_seek_epoch && timestamp > startup_threshold)
+         {
+             stream->timestamp_adjust = -timestamp;
+@@ -648,7 +688,13 @@
+         }
+     }
+ 
+-    adjusted_timestamp = timestamp + stream->timestamp_adjust;
++    if (reader->has_presentation_origin)
++    {
++        if (!source_reader_add_timestamp(timestamp, stream->timestamp_adjust, &adjusted_timestamp))
++            return MF_E_INVALID_TIMESTAMP;
++    }
++    else
++        adjusted_timestamp = timestamp + stream->timestamp_adjust;
+ 
+     if (source_reader_stream_is_video(stream) && stream->have_sample_ts)
+     {
+@@ -3414,6 +3460,8 @@
+ {
+     struct source_reader *reader = impl_from_IMFSourceReaderEx(iface);
+     struct source_reader_async_command *command;
++    PROPVARIANT source_position;
++    const PROPVARIANT *effective_position = position;
+     unsigned int i;
+     DWORD flags;
+     HRESULT hr;
+@@ -3425,6 +3473,19 @@
+ 
+     if (!(flags & MFMEDIASOURCE_CAN_SEEK))
+         return MF_E_INVALIDREQUEST;
++
++    /* Inverse of the reader-only sample shift.  Copy once before either sync
++     * Start() or async dispatch; HLS already uses normalized source positions,
++     * so its effective origin is zero and 0025 remains the sole inverse there.
++     * Native MP4 still reaches the existing SR2 demuxer seek-anchor selection. */
++    if (reader->has_presentation_origin && IsEqualGUID(format, &GUID_NULL) && position->vt == VT_I8)
++    {
++        source_position = *position;
++        if (!source_reader_add_timestamp(position->hVal.QuadPart, reader->presentation_origin,
++                &source_position.hVal.QuadPart))
++            return MF_E_INVALID_POSITION;
++        effective_position = &source_position;
++    }
+ 
+     EnterCriticalSection(&reader->cs);
+ 
+@@ -3455,7 +3516,7 @@
+             if (SUCCEEDED(hr = source_reader_create_async_op(SOURCE_READER_ASYNC_SEEK, &command)))
+             {
+                 command->u.seek.format = *format;
+-                PropVariantCopy(&command->u.seek.position, position);
++                PropVariantCopy(&command->u.seek.position, effective_position);
+ 
+                 reader->flags |= SOURCE_READER_ASYNC_SEEK_QUEUED;
+                 hr = MFPutWorkItem(reader->queue, &reader->async_commands_callback, &command->IUnknown_iface);
+@@ -3468,7 +3529,7 @@
+         {
+             ++reader->seek_serial;
+             reader->flags |= SOURCE_READER_SEEKING;
+-            if (FAILED(hr = IMFMediaSource_Start(reader->source, reader->descriptor, format, position)))
++            if (FAILED(hr = IMFMediaSource_Start(reader->source, reader->descriptor, format, effective_position)))
+             {
+                 reader->completed_seek_serial = reader->seek_serial;
+                 reader->flags &= ~SOURCE_READER_SEEKING;
+@@ -3965,6 +4026,8 @@
+         BOOL shutdown_on_release, REFIID riid, void **out)
+ {
+     struct source_reader *object;
++    struct wine_mf_presentation_origin origin;
++    UINT32 origin_size;
+     unsigned int i;
+     HRESULT hr;
+ 
+@@ -3991,6 +4054,18 @@
+     if (FAILED(hr = IMFMediaSource_CreatePresentationDescriptor(object->source, &object->descriptor)))
+         goto failed;
+ 
++    /* Capture once for this presentation.  Selection, flush, stream replacement
++     * and ordinary seeks must not select a new origin from sample arrival order.
++     * Missing, invalid or unknown-coordinate metadata retains GE's old policy. */
++    if (SUCCEEDED(IMFPresentationDescriptor_GetBlob(object->descriptor, &MF_WINE_PD_PRESENTATION_ORIGIN,
++            (BYTE *)&origin, sizeof(origin), &origin_size)) && origin_size == sizeof(origin)
++            && origin.valid == TRUE && origin.origin != INT64_MIN && origin.origin != INT64_MAX
++            && (origin.coordinates == WINE_MF_ORIGIN_NATIVE || origin.coordinates == WINE_MF_ORIGIN_NORMALIZED))
++    {
++        object->has_presentation_origin = TRUE;
++        object->presentation_origin = origin.coordinates == WINE_MF_ORIGIN_NATIVE ? origin.origin : 0;
++    }
++
+     if (FAILED(hr = IMFPresentationDescriptor_GetStreamDescriptorCount(object->descriptor, &object->stream_count)))
+         goto failed;
+ 
+--- a/dlls/mfsrcsnk/media_source.c
++++ b/dlls/mfsrcsnk/media_source.c
+@@ -23,6 +23,9 @@
+ #include "wine/list.h"
+ #include "wine/debug.h"
+ #include "wine/winedmo.h"
++
++#include "initguid.h"
++#include "wine/mforigin.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
+ 
+@@ -328,6 +331,7 @@
+ 
+     struct winedmo_demuxer winedmo_demuxer;
+     struct winedmo_stream winedmo_stream;
++    struct wine_mf_presentation_origin origin;
+     UINT64 file_size;
+     UINT64 position;
+     INT64 duration;
+@@ -1491,6 +1495,9 @@
+             WARN("Failed to set presentation descriptor MF_PD_TOTAL_FILE_SIZE, hr %#lx\n", hr);
+         if (FAILED(hr = IMFPresentationDescriptor_SetUINT64(*descriptor, &MF_PD_DURATION, source->duration)))
+             WARN("Failed to set presentation descriptor MF_PD_DURATION, hr %#lx\n", hr);
++        if (FAILED(hr = IMFPresentationDescriptor_SetBlob(*descriptor, &MF_WINE_PD_PRESENTATION_ORIGIN,
++                (const BYTE *)&source->origin, sizeof(source->origin))))
++            WARN("Failed to set presentation origin, hr %#lx\n", hr);
+ 
+         for (i = 0; i < source->stream_count; ++i)
+         {
+@@ -2028,6 +2035,7 @@
+         hr = HRESULT_FROM_NT(status);
+         goto done;
+     }
++    winedmo_demuxer_get_origin(source->winedmo_demuxer, &source->origin);
+ 
+     if (!(source->stream_map = calloc(stream_count, sizeof(*source->stream_map)))
+             || !(source->streams = calloc(stream_count, sizeof(*source->streams))))
+--- a/dlls/winedmo/main.c
++++ b/dlls/winedmo/main.c
+@@ -521,6 +521,20 @@
+         WARN( "demuxer_get_flags failed, status %#lx\n", status );
+     else
+         *flags = params.flags;
++    return status;
++}
++
++NTSTATUS CDECL winedmo_demuxer_get_origin( struct winedmo_demuxer demuxer,
++        struct wine_mf_presentation_origin *origin )
++{
++    struct demuxer_get_flags_params params = {.demuxer = demuxer};
++    NTSTATUS status;
++
++    if (!origin) return STATUS_INVALID_PARAMETER;
++    memset( origin, 0, sizeof(*origin) );
++    if (!demuxer.handle) return STATUS_INVALID_HANDLE;
++    if (!(status = UNIX_CALL( demuxer_get_flags, &params )))
++        *origin = params.origin;
+     return status;
+ }
+ 
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -374,6 +374,7 @@
+     UINT64 duration;
+     bool has_duration;
+     bool seekable;
++    struct wine_mf_presentation_origin origin;
+ 
+     struct winedmo_demuxer demuxer;
+     struct
+@@ -2764,6 +2765,12 @@
+                 && FAILED(hr = IMFPresentationDescriptor_SetUINT64(*descriptor, &MF_PD_DURATION, source->duration)))
+             WARN("Failed to set presentation descriptor MF_PD_DURATION, hr %#lx\n", hr);
+ 
++        /* One immutable origin for this media source.  Consumers other than the
++         * SourceReader ignore this private metadata and see unchanged samples. */
++        if (FAILED(hr = IMFPresentationDescriptor_SetBlob(*descriptor, &MF_WINE_PD_PRESENTATION_ORIGIN,
++                (const BYTE *)&source->origin, sizeof(source->origin))))
++            WARN("Failed to set presentation origin, hr %#lx.\n", hr);
++
+         for (i = 0; i < source->stream_count; ++i)
+         {
+             if (FAILED(hr = IMFPresentationDescriptor_SelectStream(*descriptor, i)))
+@@ -3066,6 +3073,7 @@
+     }
+     if (!(status = winedmo_demuxer_get_flags(object->demuxer, &demuxer_flags)))
+         object->seekable = !!(demuxer_flags & WINEDMO_DEMUXER_FLAG_SEEKABLE);
++    winedmo_demuxer_get_origin(object->demuxer, &object->origin);
+ 
+     if (duration > 0)
+     {
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -76,6 +76,7 @@
+     UINT stream_count; /* allocated filters and published Windows streams */
+     INT64 duration;
+     INT64 hls_timestamp_base;
++    struct wine_mf_presentation_origin origin;
+     BOOL direct_url;
+     BOOL require_avio_seek;
+     BOOL cancelled_read_pending_recovery;
+@@ -1126,6 +1127,20 @@
+     {
+         demuxer->hls_timestamp_base = get_user_time( demuxer->ctx->start_time, AV_TIME_BASE_Q );
+     }
++    /* Snapshot only timing established by the existing open/probe.  This is
++     * metadata, not a new source-wide rebase or a reason to probe/read further.
++     * ASF already applies per-stream normalization, so a container origin would
++     * describe the wrong coordinates there.  Keep its current reader fallback. */
++    demuxer->origin.origin = AV_NOPTS_VALUE;
++    if (!strstr( format->name, "asf" ) && demuxer->ctx->start_time != AV_NOPTS_VALUE
++            && demuxer->ctx->start_time >= INT64_MIN / 10
++            && demuxer->ctx->start_time <= INT64_MAX / 10)
++    {
++        demuxer->origin.origin = demuxer->ctx->start_time * 10;
++        demuxer->origin.valid = TRUE;
++        demuxer->origin.coordinates = demuxer->hls_timestamp_base != AV_NOPTS_VALUE
++                ? WINE_MF_ORIGIN_NORMALIZED : WINE_MF_ORIGIN_NATIVE;
++    }
+     demuxer->stream_count = demuxer->ctx->nb_streams;
+     if (!(demuxer->streams = calloc( demuxer->stream_count, sizeof(*demuxer->streams) ))) goto failed;
+     if (demuxer_create_streams( demuxer )) goto failed;
+@@ -1217,6 +1232,7 @@
+ 
+     if (!demuxer || !demuxer->ctx) return STATUS_INVALID_HANDLE;
+     params->flags = demuxer_is_seekable( demuxer ) ? WINEDMO_DEMUXER_FLAG_SEEKABLE : 0;
++    params->origin = demuxer->origin;
+     return STATUS_SUCCESS;
+ }
+ 
+--- a/dlls/winedmo/unixlib.h
++++ b/dlls/winedmo/unixlib.h
+@@ -31,6 +31,7 @@
+ 
+ #include "wine/unixlib.h"
+ #include "wine/winedmo.h"
++#include "wine/mforigin.h"
+ 
+ struct process_attach_params
+ {
+@@ -129,7 +130,12 @@
+ {
+     struct winedmo_demuxer demuxer;
+     UINT32 flags;
+-};
++    UINT32 reserved;
++    struct wine_mf_presentation_origin origin;
++};
++
++C_ASSERT(offsetof(struct demuxer_get_flags_params, origin) == 16);
++C_ASSERT(sizeof(struct demuxer_get_flags_params) == 32);
+ 
+ struct demuxer_read_params
+ {
+--- a/dlls/winedmo/winedmo.spec
++++ b/dlls/winedmo/winedmo.spec
+@@ -32,3 +32,4 @@
+ @ stdcall winedmo_create_wm_sync_reader(ptr ptr)
+ @ stdcall winedmo_create_video_decoder(ptr)
+ @ stdcall winedmo_create_wma_decoder(ptr ptr)
++@ cdecl winedmo_demuxer_get_origin(int64 ptr)
+--- a/dlls/winedmo/winedmo_private.h
++++ b/dlls/winedmo/winedmo_private.h
+@@ -36,6 +36,7 @@
+ #include "wine/debug.h"
+ #include "wine/strmbase.h"
+ #include "wine/mfinternal.h"
++#include "wine/mforigin.h"
+ 
+ #include "media_format.h"
+ 
+--- /dev/null
++++ b/include/wine/mforigin.h
+@@ -0,0 +1,29 @@
++/* Private WineDMO / SourceReader presentation-coordinate contract. */
++#ifndef __WINE_MFORIGIN_H
++#define __WINE_MFORIGIN_H
++
++#include <stdint.h>
++#include "windef.h"
++#include "guiddef.h"
++
++/* Versioned by this GUID and the exact blob size, never a public MF attribute. */
++DEFINE_GUID(MF_WINE_PD_PRESENTATION_ORIGIN, 0xf5604b90, 0xe493, 0x48ba,
++        0x94, 0x9c, 0x72, 0x3f, 0xb1, 0x3a, 0x5e, 0x2d);
++
++enum wine_mf_origin_coordinates
++{
++    WINE_MF_ORIGIN_UNKNOWN,
++    WINE_MF_ORIGIN_NATIVE,
++    WINE_MF_ORIGIN_NORMALIZED,
++};
++
++struct wine_mf_presentation_origin
++{
++    INT64 origin; /* signed 100ns source origin; zero is a valid origin */
++    UINT32 valid;
++    UINT32 coordinates; /* whether source samples / seeks already subtract origin */
++};
++
++C_ASSERT(sizeof(struct wine_mf_presentation_origin) == 16);
++
++#endif
+--- a/include/wine/winedmo.h
++++ b/include/wine/winedmo.h
+@@ -43,6 +43,7 @@
+ struct winedmo_demuxer   { UINT64 handle; };
+ struct winedmo_muxer     { UINT64 handle; };
+ struct winedmo_transform { UINT64 handle; };
++struct wine_mf_presentation_origin;
+ 
+ #define WINEDMO_DEMUXER_FLAG_SEEKABLE 0x00000001
+ 
+@@ -69,6 +70,8 @@
+ NTSTATUS CDECL winedmo_demuxer_destroy( struct winedmo_demuxer *demuxer );
+ NTSTATUS CDECL winedmo_demuxer_set_cancelled( struct winedmo_demuxer demuxer, BOOL cancelled );
+ NTSTATUS CDECL winedmo_demuxer_get_flags( struct winedmo_demuxer demuxer, UINT32 *flags );
++NTSTATUS CDECL winedmo_demuxer_get_origin( struct winedmo_demuxer demuxer,
++                                           struct wine_mf_presentation_origin *origin );
+ NTSTATUS CDECL winedmo_demuxer_read( struct winedmo_demuxer demuxer, UINT *stream, DMO_OUTPUT_DATA_BUFFER *buffer, UINT *buffer_size );
+ NTSTATUS CDECL winedmo_demuxer_seek( struct winedmo_demuxer demuxer, INT64 timestamp );
+ NTSTATUS CDECL winedmo_demuxer_stream_lang( struct winedmo_demuxer demuxer, UINT stream, WCHAR *buffer, UINT len );

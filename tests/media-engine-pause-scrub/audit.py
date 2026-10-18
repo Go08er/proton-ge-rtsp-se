@@ -34,6 +34,29 @@ def require_order(body: str, *needles: str) -> None:
         fail(f"required order changed: {' -> '.join(needles)}")
 
 
+def audit_autoplay(autoplay: str, text: str) -> None:
+    flag = "media_engine_set_flag(engine, FLAGS_ENGINE_AUTO_PLAY, autoplay);"
+    require(autoplay, flag, "SetAutoPlay no longer stores the requested property")
+    if "autoplay_armed" in text:
+        fail("unreviewed pending-load autoplay intent was added")
+    if "IMFMediaEngineEx_Play(iface)" not in autoplay:
+        return  # Historical GE/A3.8/SE1 property-only setter remains accepted.
+
+    # Optional module 0034 starts only an idle, live, not-already-requested
+    # presentation. It must store the property before synchronous Play callbacks
+    # so a nested setter is the latest intent, and propagate Play's HRESULT.
+    guard = ("if (autoplay && !(engine->flags & FLAGS_ENGINE_SHUT_DOWN)\n"
+             "            && engine->network_state == MF_MEDIA_ENGINE_NETWORK_IDLE\n"
+             "            && !engine->playback_requested)\n"
+             "        hr = IMFMediaEngineEx_Play(iface);")
+    require(autoplay, "HRESULT hr = S_OK;", "ready-source autoplay has no success default")
+    require(autoplay, guard, "ready-source autoplay lost its source/intent guards")
+    require_order(autoplay, "EnterCriticalSection(&engine->cs);", flag, guard,
+                  "LeaveCriticalSection(&engine->cs);", "return hr;")
+    if autoplay.count("media_engine_set_flag") != 1 or autoplay.count("IMFMediaEngineEx_Play") != 1:
+        fail("ready-source autoplay repeats playback or overwrites a newer setter")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("source_root", type=Path)
@@ -116,11 +139,7 @@ def main() -> None:
 
     require(play, "engine->playback_requested = TRUE;",
             "Play does not record latest caller intent")
-    require(autoplay,
-            "media_engine_set_flag(engine, FLAGS_ENGINE_AUTO_PLAY, autoplay);",
-            "SetAutoPlay no longer preserves GE's property-only behavior")
-    if "IMFMediaEngineEx_Play(iface)" in autoplay or "autoplay_armed" in text:
-        fail("A3.8 unexpectedly broadens property-only autoplay behavior")
+    audit_autoplay(autoplay, text)
 
     trace_markers = (
         "call Play",

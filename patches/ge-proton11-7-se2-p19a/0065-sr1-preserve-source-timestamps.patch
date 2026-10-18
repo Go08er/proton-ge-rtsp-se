@@ -1,0 +1,148 @@
+Subject: [PROPOSED P19 SR1 v2] mfreadwrite: keep seek epochs and sample/callback agreement
+
+Retain GE's >200 ms new-source/replacement normalization and >2 s positive
+timestamp-jump correction, including its duration/EOS machinery. An explicit
+SetCurrentPosition is not a new movie: preserve that first sample's epoch.
+Apply any correction exactly once to both sample and callback timestamps,
+including already queued responses and zero-valued timestamps.
+
+Six injected GE-shape controls retain P18's compatibility behavior and fix
+its timestamp/seek assertions. This is intentionally narrower than v1:
+the separate staggered-native-stream absolute-offset test remains failing.
+No claim that GE's initial per-stream normalization is Windows-equivalent.
+No SR2 demux change. Proposed only, not in an active candidate series.
+
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -113,6 +113,7 @@
+     LONGLONG timestamp_adjust;
+     BOOL have_sample_ts;
+     BOOL is_new_stream;
++    BOOL preserve_seek_epoch;
+     BOOL unthrottled_audio_output;
+     struct transform_entry *draining_transform;
+     struct transform_entry *draining_sample_transform;
+@@ -517,6 +518,7 @@
+     stream->timestamp_adjust = 0;
+     stream->have_sample_ts = FALSE;
+     stream->is_new_stream = TRUE;
++    stream->preserve_seek_epoch = FALSE;
+     media_stream_release_retained_audio_samples(stream);
+ }
+ 
+@@ -535,6 +537,7 @@
+         if (!response->sample)
+             continue;
+         response->timestamp += adjust;
++        IMFSample_SetSampleTime(response->sample, response->timestamp);
+     }
+ 
+     if (stream->have_sample_ts)
+@@ -573,7 +576,7 @@
+     response->status = status;
+     response->stream_index = stream->index;
+     response->stream_flags = stream_flags;
+-    if (timestamp && stream->timestamp_adjust)
++    if (!sample && timestamp && stream->timestamp_adjust)
+         timestamp += stream->timestamp_adjust;
+     response->timestamp = timestamp;
+     response->sample = sample;
+@@ -617,12 +620,11 @@
+ 
+     if (stream->is_new_stream)
+     {
+-        if (!(reader->flags & SOURCE_READER_PRESERVE_SOURCE_TIMESTAMPS) && timestamp > startup_threshold)
++        if (!(reader->flags & SOURCE_READER_PRESERVE_SOURCE_TIMESTAMPS)
++                && !stream->preserve_seek_epoch && timestamp > startup_threshold)
+         {
+             stream->timestamp_adjust = -timestamp;
+             source_reader_adjust_queued_stream_timestamps(reader, stream, stream->timestamp_adjust);
+-            IMFSample_SetSampleTime(sample, 0);
+-            timestamp = 0;
+         }
+ 
+         flags |= MF_SOURCE_READERF_NEWSTREAM;
+@@ -643,13 +645,10 @@
+                     stream->index, wine_dbgstr_longlong(adjusted), wine_dbgstr_longlong(expected));
+             stream->timestamp_adjust += expected - adjusted;
+             source_reader_adjust_queued_stream_timestamps(reader, stream, expected - adjusted);
+-            IMFSample_SetSampleTime(sample, expected);
+         }
+     }
+ 
+-    adjusted_timestamp = timestamp;
+-    if (adjusted_timestamp && stream->timestamp_adjust)
+-        adjusted_timestamp += stream->timestamp_adjust;
++    adjusted_timestamp = timestamp + stream->timestamp_adjust;
+ 
+     if (source_reader_stream_is_video(stream) && stream->have_sample_ts)
+     {
+@@ -660,13 +659,11 @@
+                 && delta < stream->last_sample_duration && stream->last_sample_duration < max_frame_duration)
+         {
+             adjusted_timestamp = stream->queued_sample_ts + stream->last_sample_duration;
+-            timestamp = adjusted_timestamp - stream->timestamp_adjust;
+             delta = stream->last_sample_duration;
+ 
+             TRACE("Advancing stream %u video sample timestamp to %s from previous duration %s.\n",
+                     stream->index, wine_dbgstr_longlong(adjusted_timestamp),
+                     wine_dbgstr_longlong(stream->last_sample_duration));
+-            IMFSample_SetSampleTime(sample, adjusted_timestamp);
+         }
+ 
+         if (delta > 0 && delta < max_frame_duration && !duration)
+@@ -677,7 +674,10 @@
+         }
+     }
+ 
+-    return source_reader_queue_response(reader, stream, S_OK, flags, timestamp, sample);
++    /* GE's epoch correction must describe the sample and its callback equally.
++     * Apply it once, after all existing duration/discontinuity corrections. */
++    IMFSample_SetSampleTime(sample, adjusted_timestamp);
++    return source_reader_queue_response(reader, stream, S_OK, flags, adjusted_timestamp, sample);
+ }
+ 
+ static BOOL source_reader_request_sample_eos(HRESULT hr)
+@@ -780,6 +780,8 @@
+                 reader->streams[i].requests = 0;
+                 reader->streams[i].responses = 0;
+                 source_reader_reset_stream_timing(&reader->streams[i]);
++                reader->streams[i].preserve_seek_epoch = !!(reader->flags
++                        & (SOURCE_READER_SEEKING | SOURCE_READER_ASYNC_SEEK_QUEUED));
+                 IMFMediaStream_AddRef(reader->streams[i].stream);
+                 if (FAILED(hr = IMFMediaStream_BeginGetEvent(stream, &reader->stream_events_callback,
+                         (IUnknown *)stream)))
+@@ -1737,6 +1739,7 @@
+ 
+         if (id == stream->id)
+         {
++            BOOL preserve_seek_epoch = stream->preserve_seek_epoch;
+             switch (event_type)
+             {
+                 case MEEndOfStream:
+@@ -1746,6 +1749,7 @@
+                     source_reader_cancel_stream_drain(stream, STREAM_STATE_READY);
+                     stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED | STREAM_FLAG_STOPPED);
+                     source_reader_reset_stream_timing(stream);
++                    stream->preserve_seek_epoch = preserve_seek_epoch;
+ 
+                     if ((ptr = list_head(&stream->transforms)))
+                     {
+@@ -1760,6 +1764,7 @@
+                     source_reader_cancel_stream_drain(stream, STREAM_STATE_READY);
+                     stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED | STREAM_FLAG_STOPPED);
+                     source_reader_reset_stream_timing(stream);
++                    stream->preserve_seek_epoch = preserve_seek_epoch;
+ 
+                     if ((ptr = list_head(&stream->transforms)))
+                     {
+@@ -3438,6 +3443,9 @@
+             source_reader_flush_stream(reader, i);
+             reader->streams[i].state = STREAM_STATE_READY;
+             source_reader_reset_stream_timing(&reader->streams[i]);
++            /* This is an explicit client seek, not a new movie epoch. Keep its
++             * first sample time; GE's later discontinuity correction remains. */
++            reader->streams[i].preserve_seek_epoch = TRUE;
+         }
+ 
+         if (reader->async_callback)

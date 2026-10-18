@@ -167,7 +167,7 @@ def main() -> None:
         " * source_async_commands_Invoke",
     )
     require(
-        demux,
+        demux.replace("winedmo_demuxer_read_timed(", "winedmo_demuxer_read("),
         "status = winedmo_demuxer_read(source->demuxer",
         "read diagnostic no longer wraps the real WineDMO read",
     )

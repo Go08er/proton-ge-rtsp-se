@@ -1,0 +1,26 @@
+Subject: [PATCH] winedmo: allow supported audio containers in HLS children
+
+The HLS-only format fence introduced during direct HTTP playback excludes
+containers the pinned FFmpeg already handles. An actual-library fixture
+decodes 96000 samples from each WAV/PCM, FLAC, Ogg/Opus and Matroska/PCM HLS
+child without that exclusion; the previous list rejects all four before
+decoding. Add these containers, not another demuxer or a retry policy.
+
+Keep the list scoped to HLS child contexts by 0032. The protocol allowlist,
+TLS verification, cancellation and read deadlines are unchanged. Tests also
+check file rejection and HTTPS-root downgrade rejection; these are separate
+boundaries, not a claim that every excluded format is intrinsically unsafe.
+No attribution to an observed VRChat error is claimed.
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -1001,7 +1001,7 @@
+          * Constrain its child demuxers, not unrelated progressive containers. */
+         if (av_dict_set_int( &options, "extension_picky", 0, 0 ) < 0) goto failed;
+         if (av_dict_set( &options, "seg_format_options",
+-                        "format_whitelist=mpegts,mov,aac,ac3,eac3,mp3,webvtt", 0 ) < 0) goto failed;
++                        "format_whitelist=mpegts,mov,aac,ac3,eac3,mp3,webvtt,wav,flac,ogg,matroska", 0 ) < 0) goto failed;
+         demuxer->direct_url = TRUE;
+         demuxer->require_avio_seek = TRUE;
+         demuxer->io_timeout = HTTP_IO_TIMEOUT_US;

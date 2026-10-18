@@ -1,0 +1,58 @@
+Subject: [PATCH] winedmo: include EOF history in an existing filter failure warning
+
+SE2-P1's HEVC co-test recorded a null bitstream filter rejecting a packet
+after EOF. The software-frame and actual-FFmpeg interruption probes do not
+reproduce that live failure. Do not reset the filter or retry the request on
+speculation. Include the number of demux EOFs and empty input packets since
+the last successful seek in the warning that already reports this failure.
+
+This distinguishes explicit demux EOF draining from an empty packet being
+interpreted as the filter's EOF sentinel. Include only numeric state, never
+URLs, packet contents or credentials. There is no new log site, channel,
+retry, timeout change or change to return values. Normal playback is silent.
+The two counters saturate and are cleared at the existing seek reset.
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -84,6 +84,8 @@ struct demuxer
+ 
+     AVPacket *last_packet; /* last read packet */
+     struct stream *last_stream; /* last read packet stream */
++    UINT input_eofs;
++    UINT empty_input_packets;
+ };
+ 
+ static struct demuxer *get_demuxer( struct winedmo_demuxer demuxer )
+@@ -1274,5 +1276,9 @@ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packet )
+             ret = av_read_frame( demuxer->ctx, *packet );
+             if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
++            if (ret == AVERROR_EOF && demuxer->input_eofs != ~0u) ++demuxer->input_eofs;
++            if (!ret && !(*packet)->data && !(*packet)->side_data_elems
++                    && demuxer->empty_input_packets != ~0u)
++                ++demuxer->empty_input_packets;
+             input_error = ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN);
+             if (demuxer->require_avio_seek
+                     && __atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )
+@@ -1310,7 +1316,13 @@ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packet )
+                 stream = demuxer->streams + (*packet)->stream_index;
+                 ret = av_bsf_send_packet( stream->filter, (*packet) );
+                 input_error = FALSE;
+-                if (ret < 0) WARN( "Failed to send packet to filter, error %s.\n", debugstr_averr( ret ) );
++                if (ret < 0) WARN( "Failed to send packet to filter, error %s; stream=%u eos=%u "
++                        "size=%d side_data=%d input_eofs=%u empty_inputs=%u avio_error=%d cancelled=%u.\n",
++                        debugstr_averr( ret ), (unsigned int)(stream - demuxer->streams), !!stream->eos,
++                        (*packet)->size, (*packet)->side_data_elems,
++                        demuxer->input_eofs, demuxer->empty_input_packets,
++                        demuxer->ctx->pb ? demuxer->ctx->pb->error : 0,
++                        !!__atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE ) );
+                 else demuxer->last_stream = stream;
+             }
+         }
+@@ -1466,4 +1478,6 @@ done:
+     demuxer->cancelled_read_pending_recovery = FALSE;
++    demuxer->input_eofs = 0;
++    demuxer->empty_input_packets = 0;
+     for (i = 0; i < demuxer->stream_count; i++)
+     {
+         av_bsf_flush( demuxer->streams[i].filter );

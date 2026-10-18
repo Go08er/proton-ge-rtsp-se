@@ -1,0 +1,32 @@
+From: Go08er <149829787+Go08er@users.noreply.github.com>
+Subject: [PATCH] winedmo: probe content behind site-specific HLS paths
+
+Do not force the HLS demuxer from a provider's /hls_playlist/ path. Keep
+the .m3u8 hint, content/MIME detection and the existing restricted failure
+fallback. Match the scheme-handler and Unix-side classifications.
+
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -880,7 +880,7 @@
+     if (*cursor != '/') return FALSE;
+ 
+     for (; *cursor && *cursor != '?' && *cursor != '#'; cursor++)
+-        if (!strncasecmp( cursor, ".m3u8", 5 ) || !strncasecmp( cursor, "/hls_playlist/", 14 )) return TRUE;
++        if (!strncasecmp( cursor, ".m3u8", 5 )) return TRUE;
+ 
+     return FALSE;
+ }
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -3739,7 +3739,7 @@
+         return FALSE;
+ 
+     for (; *cursor && *cursor != '?' && *cursor != '#'; cursor++)
+-        if (!wcsnicmp(cursor, L".m3u8", 5) || !wcsnicmp(cursor, L"/hls_playlist/", 14))
++        if (!wcsnicmp(cursor, L".m3u8", 5))
+             return TRUE;
+ 
+     return FALSE;

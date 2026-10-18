@@ -1,0 +1,21 @@
+Subject: [PROPOSED P19 SR6] mfreadwrite: complete asynchronous pre-start Flush
+
+Microsoft documents OnFlush on async completion, without a pre-start
+exception. The injected P18 control returns S_OK but never calls OnFlush.
+Use the existing serialized flush operation even while the source is stopped.
+
+The queued-seek early return remains a separately unqualified interaction;
+this patch does not claim all concurrent Flush/seek combinations are repaired.
+Not in a candidate series; runtime and cross-route qualification pending.
+
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -3574,7 +3574,7 @@
+     unsigned int stream_index;
+     HRESULT hr;
+ 
+-    if ((reader->flags & SOURCE_READER_ASYNC_SEEK_QUEUED) || reader->source_state != SOURCE_STATE_STARTED)
++    if (reader->flags & SOURCE_READER_ASYNC_SEEK_QUEUED)
+         return S_OK;
+ 
+     if (reader->flags & SOURCE_READER_FLUSHING)

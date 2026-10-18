@@ -1,0 +1,48 @@
+--- a/dlls/mfsrcsnk/media_source.c
++++ b/dlls/mfsrcsnk/media_source.c
+@@ -465,6 +465,8 @@
+     IUnknown_Release(op);
+ }
+ 
++static HRESULT media_source_send_eos(struct media_source *source, struct media_stream *stream);
++
+ static void media_stream_start(struct media_stream *stream, UINT index, const PROPVARIANT *position)
+ {
+     struct media_source *source = media_source_from_IMFMediaSource(stream->source);
+@@ -500,7 +502,7 @@
+         }
+ 
+         token_count = list_count(&stream->tokens);
+-        while (source->pending_reads < token_count)
++        while (!source->demux_eos && source->pending_reads < token_count)
+             queue_media_source_read(source);
+     }
+ }
+@@ -579,6 +581,9 @@
+     source->state = SOURCE_RUNNING;
+ 
+     queue_media_event_value(source->queue, seeking ? MESourceSeeked : MESourceStarted, position);
++    if (source->demux_eos)
++        for (i = 0; i < source->stream_count; i++)
++            media_source_send_eos(source, source->streams[i]);
+     return hr;
+ }
+ 
+@@ -763,7 +768,7 @@
+     PROPVARIANT empty = {.vt = VT_EMPTY};
+     UINT i;
+ 
+-    if (stream->active && !stream->eos)
++    if (stream->active && !stream->eos && list_empty(&stream->samples))
+     {
+         WARN("Queueing MEEndOfStream for stream %p, queued samples %u.\n",
+                 stream, list_count(&stream->samples));
+@@ -996,7 +1001,7 @@
+         return S_OK;
+     }
+ 
+-    if (source->demux_eos)
++    if (source->demux_eos && list_empty(&stream->samples))
+     {
+         media_source_send_eos(source, stream);
+         return S_OK;

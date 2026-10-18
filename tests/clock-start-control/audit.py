@@ -60,9 +60,23 @@ def main() -> None:
 
     events = region(text, "static HRESULT WINAPI session_events_callback_Invoke(",
                     "static const IMFAsyncCallbackVtbl session_events_callback_vtbl")
-    require(events, "else if (session->clock_started)\n"
-                    "                    IMFPresentationClock_Start(session->clock, PRESENTATION_CURRENT_POSITION);",
-            "buffering-stop can start a never-started presentation clock")
+    if "static BOOL session_is_buffering(struct media_session *session)\n{" in text:
+        buffering = " ".join(region(events, "case MEBufferingStarted:",
+                                    "case MEReconnectStart:").split())
+        require(buffering, "if (!(source->flags & SOURCE_FLAG_BUFFERING)) goto buffering_done; "
+                           "source->flags &= ~SOURCE_FLAG_BUFFERING; "
+                           "if (!session_is_buffering(session) && session->clock_started "
+                           "&& session->state == SESSION_STATE_STARTED "
+                           "&& (session->command_state == COMMAND_STATE_COMPLETE "
+                           "|| session->command_state == COMMAND_STATE_SUBMITTED)) "
+                           "if (FAILED(hr = IMFPresentationClock_Start(session->clock, PRESENTATION_CURRENT_POSITION)))",
+                "buffering-stop clock resume lacks paired buffering and started-state guards")
+        if buffering.count("IMFPresentationClock_Start(") != 1:
+            fail("buffering events contain another unguarded clock start")
+    else:
+        require(events, "else if (session->clock_started)\n"
+                        "                    IMFPresentationClock_Start(session->clock, PRESENTATION_CURRENT_POSITION);",
+                "buffering-stop can start a never-started presentation clock")
 
     print("clock-start source audit passed")
 

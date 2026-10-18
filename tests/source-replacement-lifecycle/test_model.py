@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import sys
 import unittest
+from unittest.mock import patch
 
 
 HERE = Path(__file__).resolve().parent
@@ -30,6 +31,9 @@ PATCH15 = SERIES.parent / COMBINED_PATCH15_NAME
 PATCH16 = PATCH15
 ACTIVE_REPLACEMENT_WINDOW = (PATCH14_NAME, COMBINED_PATCH15_NAME, PATCH17_NAME)
 SPLIT_PATCH_PRESENTATION = False
+CONSOLIDATED_PRESENTATION = False
+CONSOLIDATED_SESSION = "ge-proton11-9-se2-p20/0006-mf-retain-session-lifecycle-and-demand-accounting.patch"
+CONSOLIDATED_ENGINE = "ge-proton11-9-se2-p20/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch"
 VT_EMPTY = "VT_EMPTY"
 VT_I8 = "VT_I8"
 
@@ -242,6 +246,8 @@ def configure_patch_contract(series: Path) -> None:
     global PATCH16
     global SERIES
     global SPLIT_PATCH_PRESENTATION
+    global CONSOLIDATED_PRESENTATION
+    global CONSOLIDATED_SESSION, CONSOLIDATED_ENGINE
 
     SERIES = series.resolve()
     if not SERIES.is_file():
@@ -251,12 +257,47 @@ def configure_patch_contract(series: Path) -> None:
         for raw in SERIES.read_text(encoding="utf-8").splitlines()
         if (line := raw.strip()) and not line.startswith("#")
     )
+    CONSOLIDATED_PRESENTATION = False
+    consolidated = {entry.split("/", 1)[0] for entry in entries
+                    if entry.startswith(("ge-proton11-9-se2-p20/", "ge-proton11-9-se2-p21/",
+                                         "ge-proton11-9-se2-p22/",
+                                         "ge-proton11-9-se2-p23/",
+                                         "ge-proton11-9-se2-p24/"))}
+    if consolidated:
+        if len(consolidated) != 1:
+            raise SystemExit("replacement model cannot mix immutable GE11-9 candidates")
+        prefix = consolidated.pop()
+        CONSOLIDATED_SESSION = prefix + "/0006-mf-retain-session-lifecycle-and-demand-accounting.patch"
+        CONSOLIDATED_ENGINE = prefix + "/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch"
+        # GE11-9 groups residuals by component rather than historical patch number.
+        # Keep the models below unchanged and check their actual replacement
+        # ownership/clock statements in the two consolidated patches instead.
+        if (entries.count(CONSOLIDATED_SESSION) != 1
+                or entries.count(CONSOLIDATED_ENGINE) != 1
+                or entries.index(CONSOLIDATED_SESSION) >= entries.index(CONSOLIDATED_ENGINE)
+                or any(Path(entry).name.startswith(("0014-", "0015-", "0016-", "0017-"))
+                       for entry in entries)):
+            raise SystemExit("replacement model requires ordered, unique GE11-9 lifecycle components without legacy mixing")
+        PATCH14_NAME, COMBINED_PATCH15_NAME = CONSOLIDATED_ENGINE, CONSOLIDATED_SESSION
+        PATCH14 = SERIES.parent / CONSOLIDATED_ENGINE
+        PATCH15 = PATCH16 = SERIES.parent / CONSOLIDATED_SESSION
+        NOTICE = SERIES.parent.parent / "NOTICE.md"
+        ACTIVE_REPLACEMENT_WINDOW = (CONSOLIDATED_SESSION, CONSOLIDATED_ENGINE)
+        SPLIT_PATCH_PRESENTATION = False
+        CONSOLIDATED_PRESENTATION = True
+        return
     # Same lifecycle contract, two immutable source-base presentations.
     prefix = "ge-proton11-6" if any(
         entry.startswith("ge-proton11-6/") for entry in entries
     ) else "experimental"
     PATCH14_NAME = prefix + "/0014-mfmediaengine-preserve-pending-start-position.patch"
-    COMBINED_PATCH15_NAME = prefix + "/0015-mf-order-immediate-replacement-start.patch"
+    combined_basename = "0015-mf-order-immediate-replacement-start.patch"
+    combined_entries = [entry for entry in entries if Path(entry).name == combined_basename]
+    if len(combined_entries) > 1:
+        raise SystemExit("replacement model series declares duplicate combined-0015 basenames")
+    # New candidates may amend our combined patch in their own directory while
+    # retained series keep the original bytes. The surrounding window is fixed.
+    COMBINED_PATCH15_NAME = combined_entries[0] if combined_entries else prefix + "/" + combined_basename
     PATCH17_NAME = prefix + "/0017-winedmo-propagate-terminal-network-read-errors.patch"
     a320_terminal = "ge-proton11-6-a320/0017-winedmo-propagate-terminal-network-read-errors.patch"
     if a320_terminal in entries:
@@ -475,6 +516,8 @@ class ReplacementLifecycleModelTests(unittest.TestCase):
 class Patch14ContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        if CONSOLIDATED_PRESENTATION:
+            raise unittest.SkipTest("consolidated component layout uses ConsolidatedContractTests")
         cls.patch = PATCH14.read_text(encoding="utf-8")
         cls.added = added_lines(cls.patch)
 
@@ -512,6 +555,8 @@ class Patch14ContractTests(unittest.TestCase):
 class Patch15ContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        if CONSOLIDATED_PRESENTATION:
+            raise unittest.SkipTest("consolidated component layout uses ConsolidatedContractTests")
         cls.patch = PATCH15.read_text(encoding="utf-8")
         cls.added = added_lines(cls.patch)
 
@@ -538,6 +583,8 @@ class Patch15ContractTests(unittest.TestCase):
 class Patch16ContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        if CONSOLIDATED_PRESENTATION:
+            raise unittest.SkipTest("consolidated component layout uses ConsolidatedContractTests")
         cls.patch = PATCH16.read_text(encoding="utf-8")
         cls.added = added_lines(cls.patch)
 
@@ -566,6 +613,164 @@ class Patch16ContractTests(unittest.TestCase):
         self.assertNotIn("winedmo", self.patch)
         self.assertNotIn("dlls/mf/sar.c", self.patch)
         self.assertNotIn("video_frame_sink.c", self.patch)
+
+
+class ConsolidatedContractTests(unittest.TestCase):
+    """The same lifetime/clock policy, independent of historical patch names."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not CONSOLIDATED_PRESENTATION:
+            raise unittest.SkipTest("historical layout retains its original Patch14/15/16 checks")
+        cls.engine = PATCH14.read_text(encoding="utf-8")
+        cls.session = PATCH15.read_text(encoding="utf-8")
+
+    def test_component_scope_and_authorship_provenance(self) -> None:
+        for text, target in ((self.engine, "dlls/mfmediaengine/main.c"),
+                             (self.session, "dlls/mf/session.c")):
+            self.assertEqual(re.findall(r"^diff --git a/(\S+) b/(\S+)$", text, re.M), [(target, target)])
+        original = "ge-proton11-6/0014-mfmediaengine-preserve-pending-start-position.patch"
+        self.assertIn(original, self.engine)
+        self.assertIn("From: RTSP-on-GE design <rtsp-on-ge@example.invalid>",
+                      (SERIES.parent / original).read_text())
+        self.assertIn("0015-mf-order-immediate-replacement-start.patch", self.session)
+        self.assertIn("Wine LGPL-2.1-or-later licensing boundary", NOTICE.read_text())
+
+    def test_clear_preserves_pending_value_and_detaches_before_shutdown(self) -> None:
+        postimage = "\n".join(line[1:] for line in self.engine.splitlines()
+                              if line[:1] in (" ", "+") and not line.startswith("+++"))
+        clear = re.search(r"static void media_engine_clear_presentation\([^{}]*\)\n\{.*?^}",
+                          postimage, re.M | re.S)
+        self.assertIsNotNone(clear, "complete replacement clear body missing from component")
+        body = clear.group()
+        for statement in ("engine->presentation.source = NULL;", "engine->presentation.pd = NULL;",
+                          "engine->presentation.frame_sink = NULL;"):
+            self.assertEqual(body.count(statement), 1)
+            self.assertLess(body.index(statement), body.index("LeaveCriticalSection(&engine->cs)"))
+        self.assertNotIn("memset(&engine->presentation", body)
+        self.assertNotRegex(body, r"engine->presentation\.start_position[^;]*=")
+        self.assertIn("always VT_EMPTY or VT_I8", postimage)
+        self.assertIn("media_engine_start_playback() consumes it", body)
+
+    def test_replacement_clock_and_one_shot_sink_stop_contract(self) -> None:
+        added = added_lines(self.session)
+        for statement in ("sources_stopped = session_is_source_nodes_state", "if (sources_stopped)",
+                          "session->state = SESSION_STATE_STOPPED;", "session->clock_started = FALSE;",
+                          "else if (!keep_position)", "IMFPresentationClock_GetState", "MFCLOCK_STATE_INVALID",
+                          "MFCLOCK_STATE_STOPPED", "session_command_complete_with_event",
+                          "IMFMediaSink_SetPresentationClock(sink->sink, NULL)",
+                          "TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP", "event_type == MEStreamSinkStopped",
+                          "event_type == MEStreamSinkStarted"):
+            self.assertIn(statement, added)
+        # The component also includes the independent first-start clock repair;
+        # count the replacement-specific guarded Stop, not every clock operation.
+        self.assertEqual(added.count("FAILED(hr = IMFPresentationClock_Stop(session->clock))"), 1)
+
+    def test_consolidated_contract_rejects_ownership_and_clock_mutations(self) -> None:
+        for attribute, old, new, verify in (
+                ("engine", "engine->presentation.source = NULL;", "/* source not detached */",
+                 self.test_clear_preserves_pending_value_and_detaches_before_shutdown),
+                ("engine", "engine->presentation.pd = NULL;", "/* descriptor not detached */",
+                 self.test_clear_preserves_pending_value_and_detaches_before_shutdown),
+                ("session", "TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP", "TOPO_NODE_STOP_FILTER_REMOVED",
+                 self.test_replacement_clock_and_one_shot_sink_stop_contract),
+                ("session", "FAILED(hr = IMFPresentationClock_Stop(session->clock))", "FALSE",
+                 self.test_replacement_clock_and_one_shot_sink_stop_contract)):
+            original = getattr(self, attribute)
+            self.assertIn(old, original)
+            try:
+                setattr(self, attribute, original.replace(old, new))
+                with self.subTest(mutation=old), self.assertRaises(AssertionError):
+                    verify()
+            finally:
+                setattr(self, attribute, original)
+
+
+class PatchSelectionTests(unittest.TestCase):
+    """Exercise selection only; synthetic series never create patch/source files."""
+
+    def setUp(self) -> None:
+        self.addCleanup(configure_patch_contract, SERIES)
+
+    def configure(self, entries: tuple[str, ...]) -> None:
+        with patch.object(Path, "read_text", return_value="\n".join(entries) + "\n"):
+            configure_patch_contract(SERIES)
+
+    def test_unique_combined_basename_selects_candidate_directory(self) -> None:
+        candidate = "candidate-copy/0015-mf-order-immediate-replacement-start.patch"
+        window = ("ge-proton11-6/0014-mfmediaengine-preserve-pending-start-position.patch",
+                  candidate, "ge-proton11-6-a320/0017-winedmo-propagate-terminal-network-read-errors.patch")
+        self.configure(window)
+        self.assertEqual(COMBINED_PATCH15_NAME, candidate)
+        self.assertEqual(PATCH15, SERIES.parent / candidate)
+        self.assertEqual(PATCH16, PATCH15)
+        self.assertEqual(ACTIVE_REPLACEMENT_WINDOW, window)
+        self.assertFalse(SPLIT_PATCH_PRESENTATION)
+
+    def test_consolidated_components_select_and_reject_missing_duplicate_or_mixed(self) -> None:
+        good = (CONSOLIDATED_SESSION, "unrelated.patch", CONSOLIDATED_ENGINE)
+        self.configure(good)
+        self.assertTrue(CONSOLIDATED_PRESENTATION)
+        self.assertEqual((PATCH14, PATCH15, PATCH16),
+                         (SERIES.parent / CONSOLIDATED_ENGINE, SERIES.parent / CONSOLIDATED_SESSION,
+                          SERIES.parent / CONSOLIDATED_SESSION))
+        for bad in ((CONSOLIDATED_ENGINE,), good + (CONSOLIDATED_ENGINE,),
+                    (CONSOLIDATED_ENGINE, CONSOLIDATED_SESSION),
+                    good + ("experimental/0015-mf-order-immediate-replacement-start.patch",)):
+            with self.subTest(entries=bad), self.assertRaises(SystemExit):
+                self.configure(bad)
+
+    def test_consolidated_p21_selects_without_mixing_p20(self) -> None:
+        session = "ge-proton11-9-se2-p21/0006-mf-retain-session-lifecycle-and-demand-accounting.patch"
+        engine = "ge-proton11-9-se2-p21/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch"
+        self.configure((session, engine))
+        self.assertEqual((PATCH15, PATCH14), (SERIES.parent / session, SERIES.parent / engine))
+        old_session = session.replace("-p21/", "-p20/")
+        with self.assertRaises(SystemExit):
+            self.configure((old_session, session, engine))
+
+    def test_historical_combined_and_split_layouts_remain_selectable(self) -> None:
+        for prefix in ("experimental", "ge-proton11-6"):
+            window = (prefix + "/0014-mfmediaengine-preserve-pending-start-position.patch",
+                      prefix + "/0015-mf-order-immediate-replacement-start.patch",
+                      prefix + "/0017-winedmo-propagate-terminal-network-read-errors.patch")
+            self.configure(window)
+            self.assertEqual(ACTIVE_REPLACEMENT_WINDOW, window)
+            self.assertFalse(SPLIT_PATCH_PRESENTATION)
+        window = ("experimental/0014-mfmediaengine-preserve-pending-start-position.patch",
+                  SPLIT_PATCH15_NAME, SPLIT_PATCH16_NAME,
+                  "experimental/0017-winedmo-propagate-terminal-network-read-errors.patch")
+        self.configure(window)
+        self.assertEqual(ACTIVE_REPLACEMENT_WINDOW, window)
+        self.assertTrue(SPLIT_PATCH_PRESENTATION)
+
+    def test_duplicate_combined_basename_rejected_across_directories(self) -> None:
+        candidate = "candidate-copy/0015-mf-order-immediate-replacement-start.patch"
+        window = ("ge-proton11-6/0014-mfmediaengine-preserve-pending-start-position.patch",
+                  candidate, "ge-proton11-6-a320/0017-winedmo-propagate-terminal-network-read-errors.patch")
+        for duplicate in (candidate, "ge-proton11-6/0015-mf-order-immediate-replacement-start.patch",
+                          "another-copy/0015-mf-order-immediate-replacement-start.patch"):
+            with self.subTest(duplicate=duplicate), self.assertRaisesRegex(SystemExit, "duplicate combined-0015"):
+                self.configure(window + (duplicate,))
+
+    def test_missing_reordered_or_nonadjacent_window_rejected(self) -> None:
+        first = "ge-proton11-6/0014-mfmediaengine-preserve-pending-start-position.patch"
+        middle = "candidate-copy/0015-mf-order-immediate-replacement-start.patch"
+        last = "ge-proton11-6-a320/0017-winedmo-propagate-terminal-network-read-errors.patch"
+        for entries in ((first, last), (first, last, middle), (middle, first, last),
+                        (first, middle, "unrelated.patch", last), (first, middle, last, first)):
+            with self.subTest(entries=entries), self.assertRaises(SystemExit):
+                self.configure(entries)
+
+    def test_split_and_candidate_combined_layout_cannot_mix(self) -> None:
+        first = "experimental/0014-mfmediaengine-preserve-pending-start-position.patch"
+        middle = "candidate-copy/0015-mf-order-immediate-replacement-start.patch"
+        last = "experimental/0017-winedmo-propagate-terminal-network-read-errors.patch"
+        for entries in ((first, SPLIT_PATCH15_NAME, SPLIT_PATCH16_NAME, last, middle),
+                        (first, middle, last, SPLIT_PATCH15_NAME),
+                        (first, middle, last, SPLIT_PATCH16_NAME)):
+            with self.subTest(entries=entries), self.assertRaises(SystemExit):
+                self.configure(entries)
 
 
 if __name__ == "__main__":

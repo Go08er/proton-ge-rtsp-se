@@ -1,0 +1,114 @@
+Subject: [PATCH] winedmo: preserve compressed video presentation and decode times
+
+The MF source uses a lightweight IMediaBuffer, so buffer_unlock cannot store
+metadata on IMFSample. Its legacy rtTimestamp is min(PTS,DTS); the source then
+copies that decode-oriented value into BOTH packet times. Reordered H.264 and
+HEVC reach their MFT with corrupted PTS before drain. Both P14 and P15 return
+one duplicate and one backwards decoded timestamp at the tail.
+
+An explicit public-MFT control on P15 reproduces this under greedy and
+backpressured input. Restoring native packet PTS/DTS, without changing packet
+payloads or the decoder, restores all 1200 exact output times.
+
+Expose both times through a DLL-internal read helper. Keep the exported DMO
+read ABI, its legacy timestamp choice, audio packet timing, Unix-call layout,
+allocation and failure/seek ordering unchanged. Missing PTS still falls back
+to DTS; negative presentation time is clamped by the existing sample sender.
+
+P17 retains the P16 timestamp logic and uses only a forward declaration in
+its private header: do not import the public, overlapping flag macros here.
+This is a proposal for fresh P17. Causal controls are not a built patched-Wine
+runtime pass: require the exact SourceReader corpus and the full regressions.
+---
+diff --git a/dlls/winedmo/main.c b/dlls/winedmo/main.c
+index 884e846..1cca338 100644
+--- a/dlls/winedmo/main.c
++++ b/dlls/winedmo/main.c
+@@ -524,12 +524,16 @@ NTSTATUS CDECL winedmo_demuxer_get_flags( struct winedmo_demuxer demuxer, UINT32
+     return status;
+ }
+ 
+-NTSTATUS CDECL winedmo_demuxer_read( struct winedmo_demuxer demuxer, UINT *stream, DMO_OUTPUT_DATA_BUFFER *buffer, UINT *buffer_size )
++NTSTATUS winedmo_demuxer_read_timed( struct winedmo_demuxer demuxer, UINT *stream,
++        DMO_OUTPUT_DATA_BUFFER *buffer, UINT *buffer_size, INT64 *pts, INT64 *dts )
+ {
+     struct demuxer_read_params params = {.demuxer = demuxer};
+     NTSTATUS status;
+     DWORD capacity = 0;
+ 
++    if (pts) *pts = INT64_MIN;
++    if (dts) *dts = INT64_MIN;
++
+     TRACE( "demuxer %#I64x, stream %p, buffer %p, buffer_size %p\n", demuxer.handle, stream, buffer, buffer_size );
+ 
+     IMediaBuffer_GetMaxLength( buffer->pBuffer, &capacity );
+@@ -553,10 +557,20 @@ NTSTATUS CDECL winedmo_demuxer_read( struct winedmo_demuxer demuxer, UINT *strea
+         return status;
+     }
+ 
++    /* Do not recover these from rtTimestamp: legacy DMO uses min(PTS,DTS),
++     * which loses the presentation order of compressed B-frame packets. */
++    if (pts) *pts = params.sample.pts;
++    if (dts) *dts = params.sample.dts;
+     TRACE( "Got buffer %p, buffer_size %#x on stream %u\n", buffer->pBuffer, *buffer_size, *stream );
+     return status;
+ }
+ 
++NTSTATUS CDECL winedmo_demuxer_read( struct winedmo_demuxer demuxer, UINT *stream,
++        DMO_OUTPUT_DATA_BUFFER *buffer, UINT *buffer_size )
++{
++    return winedmo_demuxer_read_timed( demuxer, stream, buffer, buffer_size, NULL, NULL );
++}
++
+ NTSTATUS CDECL winedmo_demuxer_seek( struct winedmo_demuxer demuxer, INT64 timestamp )
+ {
+     struct demuxer_seek_params params = {.demuxer = demuxer, .timestamp = timestamp};
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+index 4d4c341..df97899 100644
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -1810,6 +1810,7 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+         LONG read_epoch;
+         BYTE *src_data;
+         DWORD data_len;
++        INT64 packet_pts, packet_dts;
+         ULONGLONG read_start, read_elapsed;
+ 
+         if (source->flushing)
+@@ -1853,7 +1854,8 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+             read_start = GetTickCount64();
+             ++source->drain_diag_read_calls;
+         }
+-        status = winedmo_demuxer_read(source->demuxer, &stream_idx, &output, &needed_size);
++        status = winedmo_demuxer_read_timed(source->demuxer, &stream_idx, &output, &needed_size,
++                &packet_pts, &packet_dts);
+         if (drain_diag)
+         {
+             read_elapsed = GetTickCount64() - read_start;
+@@ -1967,6 +1969,11 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+                             ? output.rtTimestamp : INT64_MIN;
+             pkt->duration = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIMELENGTH)
+                             ? output.rtTimelength : INT64_MIN;
++            if (stream->is_video)
++            {
++                pkt->pts = packet_pts != INT64_MIN ? packet_pts : packet_dts;
++                pkt->dts = packet_dts;
++            }
+             list_init(&pkt->entry);
+ 
+             EnterCriticalSection(&stream->queue_cs);
+diff --git a/dlls/winedmo/winedmo_private.h b/dlls/winedmo/winedmo_private.h
+--- a/dlls/winedmo/winedmo_private.h
++++ b/dlls/winedmo/winedmo_private.h
+@@ -106,6 +106,11 @@ void winedmo_sample_release(struct winedmo_sample *winedmo_sample);
+ 
+ HRESULT winedmo_byte_stream_handler_create(REFIID riid, void **obj);
+ 
++struct winedmo_demuxer;
++/* Internal MF route; the exported DMO read keeps its single legacy timestamp. */
++NTSTATUS winedmo_demuxer_read_timed(struct winedmo_demuxer demuxer, UINT *stream,
++        DMO_OUTPUT_DATA_BUFFER *buffer, UINT *buffer_size, INT64 *pts, INT64 *dts);
++
+ unsigned int winedmo_format_get_stride(const struct winedmo_codec_format *format);
+ 
+ bool winedmo_video_format_is_rgb(enum winedmo_video_format format);

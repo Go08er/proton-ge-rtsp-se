@@ -1,0 +1,222 @@
+From: Go08er <149829787+Go08er@users.noreply.github.com>
+Subject: [PATCH] media: add bounded opt-in attribution summaries
+
+Extend rtspdrain only: HTTP queue counters, timer-driven requests,
+readiness drops, recovery-seek calls and HTTP hint/probe outcomes.
+Counters never influence playback. Numeric payloads only; no URL or content.
+Engine/source, sink and Unix route IDs are separate namespaces, not a join key.
+At most 4160 engine summaries, 64 sink summaries and 64 HTTP-open records
+per process, plus the unchanged 1728-line source/SAR budget shared by HTTP
+and RTSP. Disabled by default. Apply after 0057, 0058 and 0059.
+
+---
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -39,6 +39,9 @@
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
++WINE_DECLARE_DEBUG_CHANNEL(rtspdrain);
++
++static LONG drain_diag_next_engine;
+ 
+ static BOOL mf_array_reserve(void **elements, size_t *capacity, size_t count, size_t size)
+ {
+@@ -169,6 +172,8 @@
+     HANDLE device_handle;
+     enum media_engine_mode mode;
+     UINT64 source_generation;
++    LONG drain_diag_id;
++    UINT64 drain_diag_dropped_seeks, drain_diag_stalled_seeks, drain_diag_ahead_seeks;
+     unsigned int flags;
+     double playback_rate;
+     double default_playback_rate;
+@@ -2145,6 +2150,18 @@
+     return E_NOTIMPL;
+ }
+ 
++/* Called under engine->cs. At most 65 summaries per each of the first 64
++ * engines (initial generation 0 plus 64 sources), never one line per seek. */
++static void media_engine_drain_summary(struct media_engine *engine)
++{
++    if (engine->drain_diag_id && engine->source_generation <= 64)
++        TRACE_(rtspdrain)("event=engine_summary engine_id=%ld generation=%I64u "
++                "dropped_seeks=%I64u stalled_seek_calls=%I64u ahead_seek_calls=%I64u\n",
++                engine->drain_diag_id, engine->source_generation, engine->drain_diag_dropped_seeks,
++                engine->drain_diag_stalled_seeks, engine->drain_diag_ahead_seeks);
++    engine->drain_diag_dropped_seeks = engine->drain_diag_stalled_seeks = engine->drain_diag_ahead_seeks = 0;
++}
++
+ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStream *bytestream, BSTR url)
+ {
+     struct media_engine_load_context *context = NULL;
+@@ -2155,6 +2172,7 @@
+     UINT64 generation;
+     HRESULT hr = S_OK;
+ 
++    media_engine_drain_summary(engine);
+     generation = ++engine->source_generation;
+ 
+     engine->error_code = MF_MEDIA_ENGINE_ERR_NOERROR;
+@@ -2608,7 +2626,10 @@
+     /* Keep the old Ex readiness guard on the shared path: while a new source
+      * loads, session capabilities can still belong to the outgoing topology. */
+     if ((engine->flags & FLAGS_ENGINE_SOURCE_PENDING) || !engine->presentation.pd)
++    {
++        if (engine->drain_diag_id) ++engine->drain_diag_dropped_seeks;
+         return S_OK;
++    }
+ 
+     seektime = min(max(0, seektime), engine->duration);
+ 
+@@ -3289,6 +3310,7 @@
+     else
+     {
+         media_engine_set_flag(engine, FLAGS_ENGINE_SHUT_DOWN, TRUE);
++        media_engine_drain_summary(engine);
+         media_engine_clear_presentation(engine);
+         /* critical section can not be held during shutdown, as shut down requires all pending
+          * callbacks to complete, and some callbacks require this cs */
+@@ -4058,6 +4080,7 @@
+             {
+                 WARN("Video sample %.6f is too far ahead of clock %.6f; resynchronizing.\n",
+                         mftime_to_seconds(*pts), mftime_to_seconds(clocktime));
++                if (engine->drain_diag_id) ++engine->drain_diag_ahead_seeks;
+                 media_engine_set_current_time(engine, mftime_to_seconds(clocktime));
+                 *pts = MINLONGLONG;
+             }
+@@ -4076,6 +4099,7 @@
+                         WARN("Presentation clock stalled at %.6f; restarting stream.\n",
+                                 mftime_to_seconds(clocktime));
+                         engine->stalled_clock_seek_time = now;
++                        if (engine->drain_diag_id) ++engine->drain_diag_stalled_seeks;
+                         media_engine_set_current_time(engine, mftime_to_seconds(clocktime));
+                         *pts = MINLONGLONG;
+                     }
+@@ -4831,6 +4855,11 @@
+     engine->sink_events.lpVtbl = &media_engine_sink_events_vtbl;
+     engine->load_handler.lpVtbl = &media_engine_load_handler_vtbl;
+     engine->refcount = 1;
++    if (TRACE_ON(rtspdrain))
++    {
++        LONG id = InterlockedIncrement(&drain_diag_next_engine);
++        if (id > 0 && id <= 64) engine->drain_diag_id = id;
++    }
+     engine->flags = (flags & MF_MEDIA_ENGINE_CREATEFLAGS_MASK) | FLAGS_ENGINE_PAUSED;
+     engine->default_playback_rate = 1.0;
+     engine->playback_rate = 1.0;
+diff --git a/dlls/mfmediaengine/video_frame_sink.c b/dlls/mfmediaengine/video_frame_sink.c
+--- a/dlls/mfmediaengine/video_frame_sink.c
++++ b/dlls/mfmediaengine/video_frame_sink.c
+@@ -35,6 +35,9 @@
+ #include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
++WINE_DECLARE_DEBUG_CHANNEL(rtspdrain);
++
++static LONG drain_diag_next_sink;
+ 
+ enum sink_state
+ {
+@@ -99,6 +102,8 @@
+     IMFTimer *timer;
+     IUnknown *request_timer_key;
+     IMFAsyncResult *request_timer_state;
++    LONG drain_diag_id;
++    UINT64 drain_diag_timer_requests;
+     IMFAsyncCallback *callback;
+     float rate;
+     enum sink_state state;
+@@ -488,6 +493,7 @@
+ static HRESULT WINAPI request_timer_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+ {
+     struct video_frame_sink *sink = impl_from_request_timer_callback(iface);
++    BOOL pending;
+ 
+     EnterCriticalSection(&sink->cs);
+     if (sink->request_timer_state && IMFAsyncResult_GetStateNoAddRef(result)
+@@ -496,7 +502,10 @@
+         video_frame_sink_cancel_request_timer(sink);
+         /* Recheck state and the newest sample, not the sample which armed us.
+          * The clock may dispatch up to 5 ms early; rearm instead of losing demand. */
++        pending = sink->sample_request_pending;
+         video_frame_sink_schedule_request_sample(sink);
++        if (sink->drain_diag_id && !pending && sink->sample_request_pending)
++            ++sink->drain_diag_timer_requests;
+     }
+     LeaveCriticalSection(&sink->cs);
+     return S_OK;
+@@ -1100,6 +1109,9 @@
+     {
+         sink->is_shut_down = TRUE;
+         video_frame_sink_set_presentation_clock(sink, NULL);
++        if (sink->drain_diag_id)
++            TRACE_(rtspdrain)("event=video_sink_summary sink_id=%ld timer_requests=%I64u\n",
++                    sink->drain_diag_id, sink->drain_diag_timer_requests);
+         IMFMediaType_Release(sink->current_media_type);
+         sink->current_media_type = NULL;
+         IMFAsyncCallback_Release(sink->callback);
+@@ -1355,6 +1367,11 @@
+     object->IMFGetService_iface.lpVtbl = &video_frame_sink_stream_get_service_vtbl;
+     object->request_timer_callback.lpVtbl = &request_timer_vtbl;
+     object->refcount = 1;
++    if (TRACE_ON(rtspdrain))
++    {
++        LONG id = InterlockedIncrement(&drain_diag_next_sink);
++        if (id > 0 && id <= 64) object->drain_diag_id = id;
++    }
+     object->rate = 1.0f;
+     object->queue.back = ARRAY_SIZE(object->queue.samples) - 1;
+     if ((object->device_manager = device_manager))
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -3001,9 +3001,12 @@
+             && (!wcsnicmp(context->url, L"rtsp://", 7)
+             || !wcsnicmp(context->url, L"rtspt://", 8)
+             || !wcsnicmp(context->url, L"rtsps://", 8)
+-            || !wcsnicmp(context->url, L"rtspst://", 9)))
++            || !wcsnicmp(context->url, L"rtspst://", 9)
++            || !wcsnicmp(context->url, L"http://", 7)
++            || !wcsnicmp(context->url, L"https://", 8)))
+     {
+-        object->drain_diag_forced_tcp = wcsnicmp(context->url, L"rtsp://", 7) != 0;
++        object->drain_diag_forced_tcp = !wcsnicmp(context->url, L"rtspt://", 8)
++                || !wcsnicmp(context->url, L"rtsps://", 8) || !wcsnicmp(context->url, L"rtspst://", 9);
+         object->drain_diag_id = InterlockedIncrement(&rtspdrain_next_source_id);
+         object->drain_diag_enabled =
+                 object->drain_diag_id <= MEDIA_SOURCE_DRAIN_DIAG_SOURCE_LIMIT;
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -34,6 +34,9 @@
+ #include <libavutil/time.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
++WINE_DECLARE_DEBUG_CHANNEL(rtspdrain);
++
++static unsigned int drain_diag_next_http;
+ 
+ #define RTSP_OPEN_TIMEOUT_US INT64_C(30000000)
+ #define RTSP_IO_TIMEOUT_US   INT64_C(15000000)
+@@ -985,6 +988,8 @@
+         BOOL hls_hint = is_http_hls_url( params->url ), interrupted, detected_hls;
+         const AVInputFormat *hint = hls_hint ? av_find_input_format( "hls" ) : NULL;
+         const char *protocol_whitelist = hls_protocol_whitelist( params->url );
++        unsigned int diag_id = TRACE_ON(rtspdrain)
++                ? __atomic_add_fetch( &drain_diag_next_http, 1, __ATOMIC_RELAXED ) : 0;
+ 
+         if (hls_hint && !hint) goto failed;
+         TRACE( "media-route=direct-http-probe\n" );
+@@ -1009,6 +1014,10 @@
+         ret = avformat_open_input( &demuxer->ctx, params->url, hint, &options );
+         interrupted = demuxer_interrupt_callback( demuxer );
+         demuxer_set_deadline( demuxer, 0 );
++        if (diag_id && diag_id <= 64)
++            TRACE_(rtspdrain)( "event=http_open route_id=%u hint=%u opened=%u hls=%u error=%d interrupted=%u\n",
++                    diag_id, hls_hint, ret >= 0,
++                    ret >= 0 && !strcmp( demuxer->ctx->iformat->name, "hls" ), ret, interrupted );
+         if (ret < 0)
+         {
+             /* A timeout or cancellation must stay terminal.  Falling back to

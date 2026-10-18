@@ -78,7 +78,7 @@ while IFS=$'\t' read -r kind field1 field2 field3 extra \
   esac
 done <"$MANIFEST"
 
-[[ "$manifest_version" == 1 ]] \
+[[ "$manifest_version" == 1 || "$manifest_version" == 2 ]] \
   || pinned_ge_fail "unsupported GE media-cleanup manifest version"
 [[ "$manifest_commit" == "$PIN_SOURCE_COMMIT" ]] \
   || pinned_ge_fail "GE media cleanup is pinned to a different source commit"
@@ -99,6 +99,14 @@ for index in "${!DELETE_PATHS[@]}"; do
   path="${DELETE_PATHS[$index]}"
   blob="${DELETE_BLOBS[$index]}"
   content_sha256="${DELETE_SHA256S[$index]}"
+  if [[ "$manifest_version" == 2 ]]; then
+    # Master's regenerated removal patch omits even the old delete-mode
+    # summaries. Version 2 covers only these same three reviewed leftovers.
+    case "$path" in
+      dlls/winegstreamer/main.c|dlls/winegstreamer/media-converter/videoconv.c|dlls/winegstreamer/wg_parser.c) ;;
+      *) pinned_ge_fail "unreviewed version-2 media-cleanup path: $path" ;;
+    esac
+  fi
   [[ -f "$path" && ! -L "$path" ]] \
     || pinned_ge_fail "expected dormant WineGStreamer source is absent or unsafe: $path"
   [[ "$(pinned_ge_git rev-parse "HEAD:$path")" == "$blob" ]] \
@@ -107,10 +115,14 @@ for index in "${!DELETE_PATHS[@]}"; do
     || pinned_ge_fail "GE patching modified a media-cleanup path: $path"
   [[ "$(pinned_ge_sha256 "$path")" == "$content_sha256" ]] \
     || pinned_ge_fail "content digest changed for GE media-cleanup path: $path"
-  [[ "$(grep -Fxc " delete mode 100644 $path" "$UPSTREAM_PATCH")" == 1 ]] \
-    || pinned_ge_fail "GE removal patch does not advertise exactly one deletion: $path"
   if grep -Fq "diff --git a/$path b/$path" "$UPSTREAM_PATCH"; then
     pinned_ge_fail "GE removal patch now contains a real diff body; drop the local cleanup: $path"
+  fi
+  if [[ "$manifest_version" == 1 ]]; then
+    [[ "$(grep -Fxc " delete mode 100644 $path" "$UPSTREAM_PATCH")" == 1 ]] \
+      || pinned_ge_fail "GE removal patch does not advertise exactly one deletion: $path"
+  elif grep -Fq " delete mode 100644 $path" "$UPSTREAM_PATCH"; then
+    pinned_ge_fail "version-2 cleanup expects an unadvertised omission: $path"
   fi
 done
 

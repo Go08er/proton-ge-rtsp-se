@@ -1,0 +1,162 @@
+Subject: [PROPOSED P19 SR5] mfreadwrite: complete async demand on fatal source errors
+
+Prior-failing controls: tests/source-reader-game/injected.c start-error,
+request-error, source-error; immutable P18 loses all three callbacks.
+Latch terminal failure, retire outstanding requests with ERROR (not EOS),
+and report a failed source Start to the command's own caller. No retry.
+
+Not in a candidate series. Runtime and cross-route qualification pending.
+
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -195,6 +195,7 @@
+     unsigned int completed_seek_serial;
+     DWORD queue;
+     enum media_source_state source_state;
++    HRESULT terminal_error;
+     struct media_stream *streams;
+     struct list responses;
+     CRITICAL_SECTION cs;
+@@ -239,6 +240,7 @@
+ static HRESULT source_reader_flush_transform_samples(struct source_reader *reader, struct media_stream *stream,
+         struct transform_entry *entry);
+ static void source_reader_cancel_stream_drain(struct media_stream *stream, enum media_stream_state state);
++static void source_reader_set_terminal_error(struct source_reader *reader, HRESULT status);
+ 
+ static ULONG source_reader_addref(struct source_reader *reader)
+ {
+@@ -695,6 +697,9 @@
+ {
+     HRESULT hr = S_OK;
+ 
++    if (FAILED(reader->terminal_error))
++        return reader->terminal_error;
++
+     if (stream->state == STREAM_STATE_DRAINING)
+         return source_reader_service_stream_drain(reader, stream);
+ 
+@@ -707,7 +712,10 @@
+                 hr = source_reader_end_stream(reader, stream);
+             }
+             else
++            {
+                 WARN("Sample request failed, hr %#lx.\n", hr);
++                source_reader_set_terminal_error(reader, hr);
++            }
+         }
+         else
+         {
+@@ -871,6 +879,14 @@
+ 
+     switch (event_type)
+     {
++        case MEError:
++            if (FAILED(IMFMediaEvent_GetStatus(event, &hr)) || SUCCEEDED(hr))
++                hr = E_FAIL;
++            EnterCriticalSection(&reader->cs);
++            source_reader_set_terminal_error(reader, hr);
++            LeaveCriticalSection(&reader->cs);
++            hr = S_OK;
++            break;
+         case MENewStream:
+             hr = source_reader_new_stream_handler(reader, event);
+             break;
+@@ -1478,6 +1494,26 @@
+     return hr;
+ }
+ 
++/* Called under reader->cs. A fatal source failure is not EOF and cannot be
++ * recovered by another read/seek on this reader. Complete outstanding demand;
++ * commands not yet processed observe terminal_error when they start. */
++static void source_reader_set_terminal_error(struct source_reader *reader, HRESULT status)
++{
++    unsigned int i;
++
++    if (SUCCEEDED(status) || FAILED(reader->terminal_error))
++        return;
++    reader->terminal_error = status;
++    reader->flags &= ~(SOURCE_READER_SEEKING | SOURCE_READER_ASYNC_SEEK_QUEUED);
++    for (i = 0; i < reader->stream_count; ++i)
++    {
++        reader->streams[i].flags &= ~STREAM_FLAG_SAMPLE_REQUESTED;
++        source_reader_fail_stream_drain(reader, &reader->streams[i], status);
++    }
++    WakeAllConditionVariable(&reader->state_event);
++    WakeAllConditionVariable(&reader->sample_event);
++}
++
+ static HRESULT source_reader_start_transform_drain(struct transform_entry *entry)
+ {
+     HRESULT hr;
+@@ -1664,7 +1700,8 @@
+         {
+             /* FIXME: propagate processing errors? */
+             reader->streams[i].flags &= ~STREAM_FLAG_SAMPLE_REQUESTED;
+-            hr = source_reader_process_sample(reader, &reader->streams[i], sample);
++            hr = FAILED(reader->terminal_error) ? reader->terminal_error
++                    : source_reader_process_sample(reader, &reader->streams[i], sample);
+             break;
+         }
+     }
+@@ -1932,6 +1969,9 @@
+     HRESULT hr = S_OK;
+     unsigned int i;
+ 
++    if (FAILED(reader->terminal_error))
++        return reader->terminal_error;
++
+     for (i = 0; i < reader->stream_count; ++i)
+     {
+         source_reader_get_stream_selection(reader, i, &selected);
+@@ -2554,7 +2594,7 @@
+                     {
+                         stream->requests++;
+                         source_reader_request_sample(reader, stream);
+-                        /* FIXME: set error stream/reader state on request failure */
++                        /* Request failure completes pending reads through the terminal-error path. */
+                     }
+                 }
+                 else
+@@ -2563,6 +2603,15 @@
+                     source_reader_queue_response(reader, &stub_stream, hr, MF_SOURCE_READERF_ERROR, 0, NULL);
+                 }
+             }
++            else
++            {
++                source_reader_set_terminal_error(reader, hr);
++                status = hr;
++                stream_index = command->u.read.stream_index;
++                source_reader_get_stream_read_index(reader, command->u.read.stream_index, &stream_index);
++                stream_flags = MF_SOURCE_READERF_ERROR;
++                report_sample = TRUE;
++            }
+ 
+             LeaveCriticalSection(&reader->cs);
+ 
+@@ -2578,6 +2627,11 @@
+         case SOURCE_READER_ASYNC_SEEK:
+ 
+             EnterCriticalSection(&reader->cs);
++            if (FAILED(reader->terminal_error))
++            {
++                LeaveCriticalSection(&reader->cs);
++                break;
++            }
+             reader->flags &= ~SOURCE_READER_ASYNC_SEEK_QUEUED;
+             ++reader->seek_serial;
+             reader->flags |= SOURCE_READER_SEEKING;
+@@ -3560,7 +3614,13 @@
+         SleepConditionVariableCS(&reader->state_event, &reader->cs, INFINITE);
+     }
+ 
+-    if (reader->async_callback)
++    if (FAILED(reader->terminal_error))
++    {
++        hr = reader->terminal_error;
++        if (stream_flags) *stream_flags = MF_SOURCE_READERF_ERROR;
++        if (sample) *sample = NULL;
++    }
++    else if (reader->async_callback)
+         hr = source_reader_read_sample_async(reader, index, flags, actual_index, stream_flags, timestamp, sample);
+     else
+         hr = source_reader_read_sample(reader, index, flags, actual_index, stream_flags, timestamp, sample);

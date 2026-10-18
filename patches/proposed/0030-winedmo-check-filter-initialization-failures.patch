@@ -1,0 +1,52 @@
+Subject: [PATCH] winedmo: stop stream initialization on filter allocation failure
+
+The null bitstream filter allocation can fail, leaving a NULL context which
+was immediately dereferenced. Codec-parameter copies can also fail while
+allocating extradata. Check those returns before using or publishing the
+filter; reuse the existing partial-initialization cleanup. Do not change
+filter selection, successful initialization or the external failure status.
+
+Independent of the timeline policy in 0029; may follow 0028 alone (hunk
+offsets differ). Source-contract tested only; actual allocation fault
+injection remains a runtime validation requirement.
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -743,7 +743,7 @@
+             else
+             {
+                 if (av_bsf_alloc( filter, &stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+-                avcodec_parameters_copy( stream->filter->par_in, par );
++                if (avcodec_parameters_copy( stream->filter->par_in, par ) < 0) return STATUS_UNSUCCESSFUL;
+                 if (av_bsf_init( stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+                 continue;
+             }
+@@ -758,7 +758,7 @@
+             else
+             {
+                 if (av_bsf_alloc( filter, &stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+-                avcodec_parameters_copy( stream->filter->par_in, par );
++                if (avcodec_parameters_copy( stream->filter->par_in, par ) < 0) return STATUS_UNSUCCESSFUL;
+                 if (av_bsf_init( stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+                 continue;
+             }
+@@ -767,14 +767,14 @@
+         {
+             /* WAVEFORMATEX does not contain endianness info, so this needs to be converted here. */
+             if (av_bsf_alloc( &ff_pcm_byte_order_reverse_bsf.p, &stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+-            avcodec_parameters_copy( stream->filter->par_in, par );
++            if (avcodec_parameters_copy( stream->filter->par_in, par ) < 0) return STATUS_UNSUCCESSFUL;
+             if (av_bsf_init( stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+             continue;
+         }
+ 
+-        av_bsf_get_null_filter( &stream->filter );
+-        avcodec_parameters_copy( stream->filter->par_in, demuxer->ctx->streams[i]->codecpar );
+-        avcodec_parameters_copy( stream->filter->par_out, demuxer->ctx->streams[i]->codecpar );
++        if (av_bsf_get_null_filter( &stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
++        if (avcodec_parameters_copy( stream->filter->par_in, par ) < 0) return STATUS_UNSUCCESSFUL;
++        if (avcodec_parameters_copy( stream->filter->par_out, par ) < 0) return STATUS_UNSUCCESSFUL;
+     }
+ 
+     return STATUS_SUCCESS;

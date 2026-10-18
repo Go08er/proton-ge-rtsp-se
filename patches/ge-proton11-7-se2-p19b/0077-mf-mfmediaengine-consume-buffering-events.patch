@@ -1,0 +1,269 @@
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -135,6 +135,7 @@
+ {
+     SOURCE_FLAG_END_OF_PRESENTATION = 0x1,
+     SOURCE_FLAG_TERMINAL_ERROR_FORWARDED = 0x2,
++    SOURCE_FLAG_BUFFERING = 0x4,
+ };
+ 
+ struct media_source
+@@ -923,6 +924,7 @@
+ }
+ 
+ static void session_release_media_source(struct media_source *source);
++static void session_set_consumed_clock(IUnknown *object, IMFPresentationClock *clock);
+ 
+ static void session_clear_presentation(struct media_session *session)
+ {
+@@ -938,6 +940,9 @@
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(source, source2, &session->presentation.sources, struct media_source, entry)
+     {
++        session_set_consumed_clock(source->object, NULL);
++        if (source->flags & SOURCE_FLAG_BUFFERING)
++            IMFMediaEventQueue_QueueEventParamUnk(session->event_queue, MEBufferingStopped, &GUID_NULL, S_OK, source->object);
+         list_remove(&source->entry);
+         session_release_media_source(source);
+     }
+@@ -1345,6 +1350,23 @@
+     session_command_complete_with_event(session, MESessionClosed, status, NULL);
+ }
+ 
++static BOOL session_is_output_nodes_state(struct media_session *session, enum object_state state);
++static BOOL session_is_buffering(struct media_session *session)
++{
++    struct media_source *source;
++    LIST_FOR_EACH_ENTRY(source, &session->presentation.sources, struct media_source, entry)
++        if (source->flags & SOURCE_FLAG_BUFFERING) return TRUE;
++    return FALSE;
++}
++static HRESULT session_pause_sources(struct media_session *session)
++{
++    struct media_source *source;
++    HRESULT hr;
++    session->command_state = COMMAND_STATE_PAUSING_SOURCES;
++    LIST_FOR_EACH_ENTRY(source, &session->presentation.sources, struct media_source, entry)
++        if (FAILED(hr = IMFMediaSource_Pause(source->source))) return hr;
++    return S_OK;
++}
+ static void session_pause(struct media_session *session)
+ {
+     HRESULT hr;
+@@ -1355,7 +1377,8 @@
+ 
+             /* Transition in two steps - pause the clock, wait for sinks, then pause sources. */
+             session->command_state = COMMAND_STATE_PAUSING_SINKS;
+-            hr = IMFPresentationClock_Pause(session->clock);
++            hr = session_is_buffering(session) ? (session_is_output_nodes_state(session, OBJ_STATE_PAUSED)
++                    ? session_pause_sources(session) : S_OK) : IMFPresentationClock_Pause(session->clock);
+ 
+             if (FAILED(hr))
+                 session_set_paused(session, hr);
+@@ -3544,14 +3567,7 @@
+             if (!session_is_output_nodes_state(session, OBJ_STATE_PAUSED))
+                 break;
+ 
+-            session->command_state = COMMAND_STATE_PAUSING_SOURCES;
+-
+-            LIST_FOR_EACH_ENTRY(source, &session->presentation.sources, struct media_source, entry)
+-            {
+-                if (FAILED(hr = IMFMediaSource_Pause(source->source)))
+-                    break;
+-            }
+-
++            hr = session_pause_sources(session);
+             if (FAILED(hr))
+                 session_set_paused(session, hr);
+ 
+@@ -4730,19 +4746,41 @@
+ 
+         case MEBufferingStarted:
+         case MEBufferingStopped:
+-
++        {
++            struct media_source *source;
++            BOOL started = event_type == MEBufferingStarted, was_buffering;
+             EnterCriticalSection(&session->cs);
+-            if (session_get_media_source(session, (IMFMediaSource *)event_source))
+-            {
+-                if (event_type == MEBufferingStarted)
+-                    IMFPresentationClock_Pause(session->clock);
+-                else if (session->clock_started)
+-                    IMFPresentationClock_Start(session->clock, PRESENTATION_CURRENT_POSITION);
+-
+-                IMFMediaEventQueue_QueueEvent(session->event_queue, event);
+-            }
++            if ((source = session_get_media_source(session, (IMFMediaSource *)event_source)))
++            {
++                was_buffering = session_is_buffering(session);
++                if (started)
++                {
++                    if ((source->flags & SOURCE_FLAG_BUFFERING) || source->state != OBJ_STATE_STARTED
++                            || session->state != SESSION_STATE_STARTED
++                            || (session->command_state != COMMAND_STATE_COMPLETE && session->command_state != COMMAND_STATE_SUBMITTED))
++                        goto buffering_done;
++                    if (!was_buffering && FAILED(hr = IMFPresentationClock_Pause(session->clock)))
++                    {
++                        IMFMediaEventQueue_QueueEventParamUnk(session->event_queue, MEError, &GUID_NULL, hr, source->object);
++                        goto buffering_done;
++                    }
++                    source->flags |= SOURCE_FLAG_BUFFERING;
++                }
++                else
++                {
++                    if (!(source->flags & SOURCE_FLAG_BUFFERING)) goto buffering_done;
++                    source->flags &= ~SOURCE_FLAG_BUFFERING;
++                    if (!session_is_buffering(session) && session->clock_started && session->state == SESSION_STATE_STARTED
++                            && (session->command_state == COMMAND_STATE_COMPLETE || session->command_state == COMMAND_STATE_SUBMITTED))
++                        if (FAILED(hr = IMFPresentationClock_Start(session->clock, PRESENTATION_CURRENT_POSITION)))
++                            IMFMediaEventQueue_QueueEventParamUnk(session->event_queue, MEError, &GUID_NULL, hr, source->object);
++                }
++                IMFMediaEventQueue_QueueEventParamUnk(session->event_queue, event_type, &GUID_NULL, S_OK, source->object);
++            }
++buffering_done:
+             LeaveCriticalSection(&session->cs);
+             break;
++        }
+ 
+         case MEReconnectStart:
+         case MEReconnectEnd:
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -173,6 +173,7 @@
+     double playback_rate;
+     double default_playback_rate;
+     BOOL playback_requested;
++    BOOL buffering;
+     double volume;
+     double duration;
+     double current_seek;
+@@ -1051,6 +1052,7 @@
+ 
+ static BOOL media_engine_handle_ended(struct media_engine *engine)
+ {
++    engine->buffering = FALSE;
+     if (engine->flags & FLAGS_ENGINE_IS_ENDED)
+         return FALSE;
+ 
+@@ -1098,10 +1100,37 @@
+     {
+         case MEBufferingStarted:
+         case MEBufferingStopped:
+-
+-            IMFMediaEngineNotify_EventNotify(engine->callback, event_type == MEBufferingStarted ?
++        {
++            PROPVARIANT source = {.vt = VT_EMPTY};
++            BOOL started = event_type == MEBufferingStarted;
++            UINT64 generation;
++            MFCLOCK_STATE state;
++            IMFMediaEvent_GetValue(event, &source);
++            EnterCriticalSection(&engine->cs);
++            if (source.vt != VT_UNKNOWN || source.punkVal != (IUnknown *)engine->presentation.source
++                    || engine->presentation.generation != engine->source_generation
++                    || (engine->flags & (FLAGS_ENGINE_SHUT_DOWN | FLAGS_ENGINE_SOURCE_PENDING))) goto buffering_done;
++            generation = engine->source_generation;
++            engine->buffering = started;
++            engine->last_video_tick_clock = MINLONGLONG; engine->last_video_tick_time = 0;
++            IMFMediaEngineNotify_EventNotify(engine->callback, started ?
+                     MF_MEDIA_ENGINE_EVENT_BUFFERINGSTARTED : MF_MEDIA_ENGINE_EVENT_BUFFERINGENDED, 0, 0);
++            /* Notifications can replace the source or change user intent. */
++            if (generation == engine->source_generation && engine->playback_requested
++                    && !(engine->flags & (FLAGS_ENGINE_SHUT_DOWN | FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PAUSED
++                    | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_SCRUBBING)))
++            {
++                if (started || (SUCCEEDED(IMFPresentationClock_GetState(engine->clock, 0, &state)) && state == MFCLOCK_STATE_RUNNING))
++                {
++                    media_engine_set_flag(engine, FLAGS_ENGINE_WAITING, started);
++                    IMFMediaEngineNotify_EventNotify(engine->callback, started ? MF_MEDIA_ENGINE_EVENT_WAITING : MF_MEDIA_ENGINE_EVENT_PLAYING, 0, 0);
++                }
++            }
++buffering_done:
++            LeaveCriticalSection(&engine->cs);
++            PropVariantClear(&source);
+             break;
++        }
+         case MESessionTopologyStatus:
+         {
+             UINT32 topo_status = 0;
+@@ -1151,10 +1180,10 @@
+                     restart_playback = TRUE;
+             }
+ 
+-            playing_event = !(engine->flags & (FLAGS_ENGINE_SCRUBBING | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_PAUSED));
++            playing_event = !engine->buffering && !(engine->flags & (FLAGS_ENGINE_SCRUBBING | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_PAUSED));
+             if (!(engine->flags & FLAGS_ENGINE_SCRUBBING))
+             {
+-                media_engine_set_flag(engine, FLAGS_ENGINE_WAITING, FALSE);
++                if (!engine->buffering) media_engine_set_flag(engine, FLAGS_ENGINE_WAITING, FALSE);
+                 if (!(engine->flags & FLAGS_ENGINE_PAUSE_PENDING))
+                     media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, FALSE);
+             }
+@@ -1208,6 +1237,7 @@
+             }
+             engine->error_code = error_code;
+             engine->extended_code = error;
++            engine->buffering = FALSE;
+             engine->playback_requested = FALSE;
+             engine->current_seek = NAN;
+             engine->next_seek = NAN;
+@@ -2156,6 +2186,7 @@
+     HRESULT hr = S_OK;
+ 
+     generation = ++engine->source_generation;
++    engine->buffering = FALSE;
+ 
+     engine->error_code = MF_MEDIA_ENGINE_ERR_NOERROR;
+     engine->extended_code = S_OK;
+@@ -2544,6 +2575,7 @@
+     double ret = 0.0;
+     static LONG live_call_count;
+     MFTIME clocktime;
++    MFCLOCK_STATE state;
+ 
+     EnterCriticalSection(&engine->cs);
+     if ((engine->flags & FLAGS_ENGINE_SEEKING) && isfinite(engine->current_seek))
+@@ -2558,6 +2590,9 @@
+     {
+         ret = (double)engine->presentation.start_position.hVal.QuadPart / 10000000;
+     }
++    else if ((engine->buffering || (SUCCEEDED(IMFPresentationClock_GetState(engine->clock, 0, &state))
++            && state == MFCLOCK_STATE_PAUSED)) && SUCCEEDED(IMFPresentationClock_GetTime(engine->clock, &clocktime)))
++        ret = mftime_to_seconds(clocktime);
+     else if (isfinite(engine->last_committed_seek) && !(engine->flags & FLAGS_ENGINE_SOURCE_PENDING)
+             && SUCCEEDED(IMFPresentationClock_GetTime(engine->clock, &clocktime)))
+     {
+@@ -4034,6 +4069,8 @@
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
+     static LONG live_tick_count;
+     MFTIME clocktime = MINLONGLONG;
++    MFCLOCK_STATE state;
++    BOOL running;
+     HRESULT hr;
+ 
+     TRACE("%p, %p.\n", iface, pts);
+@@ -4049,12 +4086,14 @@
+         *pts = MINLONGLONG;
+         if (SUCCEEDED(IMFPresentationClock_GetTime(engine->clock, &clocktime)))
+         {
++            running = !engine->buffering && SUCCEEDED(IMFPresentationClock_GetState(engine->clock, 0, &state))
++                    && state == MFCLOCK_STATE_RUNNING;
+             hr = video_frame_sink_get_pts_after(engine->presentation.frame_sink, clocktime,
+                     engine->video_preroll_time, pts);
+             if (hr == S_OK && engine->video_preroll_time != MINLONGLONG && *pts + 500000 >= engine->video_preroll_time)
+                 engine->video_preroll_time = MINLONGLONG;
+             else if (hr == S_FALSE && *pts != MINLONGLONG && *pts > clocktime + 300000000
+-                    && !(engine->flags & FLAGS_ENGINE_SEEKING))
++                    && running && !(engine->flags & FLAGS_ENGINE_SEEKING))
+             {
+                 WARN("Video sample %.6f is too far ahead of clock %.6f; resynchronizing.\n",
+                         mftime_to_seconds(*pts), mftime_to_seconds(clocktime));
+@@ -4062,7 +4101,7 @@
+                 *pts = MINLONGLONG;
+             }
+ 
+-            if (hr == S_OK && !(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_PAUSE_PENDING
++            if (hr == S_OK && running && !(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_PAUSE_PENDING
+                     | FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_WAITING)))
+             {
+                 DWORD now = GetTickCount();

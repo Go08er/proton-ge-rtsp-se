@@ -1,0 +1,50 @@
+Subject: [PATCH] winedmo: preserve the input timestamp origin for VC-1
+
+VC-1's startup alignment subtracts the first decoded timestamp. After a
+positioned flush this rebases a positive presentation epoch to zero, so the
+session's seek mark-in can discard all remaining video as preroll. Keep the
+existing alignment relative to the first input timestamp when it is positive.
+
+Leave zero, unknown and negative-preroll startup behavior, sparse timestamp
+cadence repair, other codecs and flush state unchanged. Use the existing
+FFmpeg saturating subtraction helper for the signed offset arithmetic; this
+does not establish a presentation contract for unrepresentable timestamps.
+
+The private public-MFT comparison decodes the same fifteen VC-1 packets at
+zero and at +25 seconds after Flush. Both versions produce all thirty native
+pixel-exact images; the old version repeats zero-origin timestamps, while
+this change preserves the complete +25-second sequence. The original long
+VC-1 MediaEngine forward/backward and three-cycle tail seek oracles also pass
+with this exact source prototype and the separate 0055 EOS component.
+This is not a claim of stall-free playback, all VC-1 profiles or VR parity.
+---
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -31,6 +31,7 @@
+ 
+ #include <stdbool.h>
+ #include <inttypes.h>
++#include <libavutil/common.h>
+ #include <libavutil/imgutils.h>
+ #include <libavutil/samplefmt.h>
+ #include <libswscale/swscale.h>
+@@ -560,10 +561,17 @@
+     if (t->avctx->codec_id == AV_CODEC_ID_VC1)
+     {
+         if (t->last_video_pts == INT64_MIN && t->video_pts_offset == INT64_MIN)
++        {
+             t->video_pts_offset = video_pts;
++            /* A decoder flush does not make a positioned presentation start at
++             * zero. Keep the existing startup alignment relative to the first
++             * input timestamp, including preroll before the requested seek. */
++            if (t->video_input_anchor_pts > 0)
++                t->video_pts_offset = av_sat_sub64( video_pts, t->video_input_anchor_pts );
++        }
+ 
+         if (t->video_pts_offset != INT64_MIN && video_pts >= t->video_pts_offset)
+-            video_pts -= t->video_pts_offset;
++            video_pts = av_sat_sub64( video_pts, t->video_pts_offset );
+     }
+ 
+     *pts = video_pts;

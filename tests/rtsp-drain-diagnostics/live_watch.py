@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compact local monitor for an A3.16 cooperative VRChat session."""
+"""Compact local monitor for cooperative VRChat media sessions."""
 
 from __future__ import annotations
 
@@ -16,6 +16,9 @@ from typing import BinaryIO, Callable
 FIELD_RE = re.compile(r"(?<!\S)([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)")
 WINE_ISSUE_RE = re.compile(r":(warn|err):(dmo|mfplat):", re.IGNORECASE)
 MTX_SESSION_RE = re.compile(r"\[session ([^\]]+)\]")
+APP_HEADER_RE = re.compile(
+    r"^(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})\s+\w+\s+-\s+(.*)$"
+)
 QUEUE_EVENTS = {
     "queue_enter",
     "queue_leave",
@@ -70,7 +73,7 @@ class Source:
 
 
 class Monitor:
-    """Turn three local logs into bounded, privacy-safe state changes."""
+    """Summarize local logs without echoing private message payloads."""
 
     def __init__(
         self,
@@ -94,10 +97,22 @@ class Monitor:
         self.mtx_issues = 0
         self.ffmpeg_notices = 0
         self.ffmpeg_errors = 0
+        self.notices: dict[str, int] = {}
+        self.app_time = "?"
+        self.app_halt_pending = False
 
     @staticmethod
     def _milestone(count: int) -> bool:
-        return count <= 3 or count == 10 or count % 50 == 0
+        # Every 50 warnings produced ~7,000 lines in one P3 session.
+        # Keep first observations and powers of ten; finish() retains totals.
+        return count <= 3 or str(count).rstrip("0") == "1"
+
+    def _notice(self, key: str, label: str, detail: str) -> None:
+        count = self.notices.get(key, 0) + 1
+        self.notices[key] = count
+        # These are individual control/continuity incidents, not routine QI
+        # chatter. Do not hide a later world's halt behind an earlier count.
+        self.emit(f"{label} #{count} {detail}")
 
     def file_event(
         self,
@@ -127,6 +142,9 @@ class Monitor:
         elif kind == "publisher":
             self.ffmpeg_notices = 0
             self.ffmpeg_errors = 0
+        elif kind == "vrchat":
+            self.app_time = "?"
+            self.app_halt_pending = False
 
     def feed(self, kind: str, line: str, *, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
@@ -136,6 +154,28 @@ class Monitor:
             self._feed_mediamtx(line)
         elif kind == "publisher":
             self._feed_publisher(line)
+        elif kind == "vrchat":
+            self._feed_vrchat(line)
+
+    def _feed_vrchat(self, line: str) -> None:
+        header = APP_HEADER_RE.match(line)
+        if header:
+            self.app_time = header[1].replace(" ", "T")
+            self.app_halt_pending = header[2] == (
+                "[UdonBehaviour] An exception occurred during Udon execution, "
+                "this UdonBehaviour will be halted."
+            )
+            if self.app_halt_pending:
+                self._notice("udon_halt", "APP UDON_HALTED", f"wall={self.app_time}")
+        elif self.app_halt_pending:
+            budget = re.match(
+                r"^Program execution time exceeded max VM time of "
+                r"(\d{1,5}(?:\.\d{1,3})?) seconds\.", line
+            )
+            if budget:
+                self._notice("vm_budget", "APP VM_BUDGET",
+                             f"wall={self.app_time} limit={budget[1]}s")
+                self.app_halt_pending = False
 
     def _source(self, fields: dict[str, str]) -> Source | None:
         source_id = fields.get("source_id")
@@ -160,6 +200,36 @@ class Monitor:
 
     def _feed_proton(self, line: str, now: float) -> None:
         if "trace:rtspdrain:" not in line:
+            stamp = re.match(r"^(\d{1,12}\.\d{1,6}):", line)
+            wine_time = stamp[1] if stamp else "?"
+            if ":err:sync:RtlpWaitForCriticalSection " in line:
+                wait = re.search(r"wait timed out in thread ([0-9a-fA-F]{1,8}), "
+                                 r"blocked by ([0-9a-fA-F]{1,8}),", line)
+                if wait:
+                    self._notice("lock_wait", "LOCK WAIT",
+                                 f"wine={wine_time} waiter={wait[1]} owner={wait[2]}")
+                    return
+            if ":warn:dmo:vlog " in line:
+                expiry = re.search(r"\bskipping (\d{1,12}) segments ahead, expired from playlists\b", line)
+                if expiry:
+                    self._notice("hls_expiry", "HLS EXPIRED",
+                                 f"wine={wine_time} skipped={expiry[1]}")
+                    return
+            if ":warn:dmo:demuxer_filter_packet Failed to send packet to filter," in line:
+                fields = parse_fields(line)
+                if "input_eofs" in fields and "empty_inputs" in fields:
+                    # 0038 enriches an existing warning. Emit numeric fields
+                    # only; never echo arbitrary text or infer a codec/source.
+                    def numeric(key: str) -> str:
+                        value = fields.get(key, "").rstrip(".")
+                        return value if re.fullmatch(r"-?\d{1,10}", value) else "?"
+                    count = self.wine_issues.get("filter", 0) + 1
+                    self.wine_issues["filter"] = count
+                    if self._milestone(count):
+                        self.emit(f"FILTER #{count} stream={numeric('stream')} eos={numeric('eos')} "
+                                  f"eof={numeric('input_eofs')} empty={numeric('empty_inputs')} "
+                                  f"avio={numeric('avio_error')} cancel={numeric('cancelled')}")
+                    return
             match = WINE_ISSUE_RE.search(line)
             if match:
                 key = f"{match.group(1).lower()}:{match.group(2).lower()}"
@@ -448,13 +518,14 @@ class Monitor:
         wine = ",".join(
             f"{key}={count}" for key, count in sorted(self.wine_issues.items())
         ) or "0"
+        notices = ",".join(f"{key}={count}" for key, count in sorted(self.notices.items())) or "0"
         self.emit(
             f"STOP backend={self.backend_attempts} "
             f"summaries={self.source_summaries} sar={self.sar_summaries} "
             f"mtx_reads={self.mtx_read_total} "
             f"ffmpeg_log={self.ffmpeg_notices} "
             f"ffmpeg_errors={self.ffmpeg_errors} "
-            f"wine_issues={wine}"
+            f"wine_issues={wine} notices={notices}"
         )
 
 
@@ -602,7 +673,7 @@ class FollowedLog:
 def parser() -> argparse.ArgumentParser:
     downloads = Path.home() / "Downloads"
     result = argparse.ArgumentParser(
-        description="Follow local A3.16 Proton, MediaMTX, and FFmpeg logs.",
+        description="Follow local Proton, MediaMTX, FFmpeg and optional VRChat application logs.",
     )
     result.add_argument(
         "--proton-log",
@@ -618,6 +689,10 @@ def parser() -> argparse.ArgumentParser:
         "--publisher-log",
         type=Path,
         default=downloads / "a316-ffmpeg.log",
+    )
+    result.add_argument(
+        "--vrchat-log", type=Path,
+        help="exact current output_log file, read-only; preserves a private copy and reports Udon halts",
     )
     result.add_argument(
         "--once",
@@ -658,6 +733,8 @@ def main(argv: list[str] | None = None) -> int:
         FollowedLog("publisher", args.publisher_log.expanduser(), capture_dir),
         FollowedLog("proton", args.proton_log.expanduser(), capture_dir),
     ]
+    if args.vrchat_log:
+        logs.append(FollowedLog("vrchat", args.vrchat_log.expanduser(), capture_dir))
     print(f"CAPTURE {capture_dir}", flush=True)
     print(
         "WATCH "

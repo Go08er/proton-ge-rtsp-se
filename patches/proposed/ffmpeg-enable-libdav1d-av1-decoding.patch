@@ -1,0 +1,26 @@
+Subject: [PATCH] build: enable the existing dav1d dependency for FFmpeg AV1
+
+WineDMO already advertises AV1, but the configured native FFmpeg AV1 decoder
+requires a hardware accelerator which WineDMO does not provide. GE already
+builds and distributes dav1d and lists it in FFMPEG_DEPENDS. Enable its FFmpeg
+decoder wrapper rather than adding another library or a Wine decoder picker.
+FFmpeg's existing registration order prefers libdav1d over native AV1.
+
+Apply to the GE superproject after SE1's crypto configure patch. This changes
+the whole-file Makefile.in postimage: integration requires a NEW candidate's
+build-patch provenance, never editing the existing SE1 pin/postimage.
+
+Source-only proposal; not compiled or playback-tested. Existing decoder
+thread policy, TLS policy and transport selection are unchanged.
+---
+diff --git a/Makefile.in b/Makefile.in
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -353,6 +353,7 @@ FFMPEG_CONFIGURE_ARGS := \
+ 	--disable-programs \
+ 	--disable-doc \
+ 	--disable-inline-asm \
++	--enable-libdav1d \
+ 	--enable-lzma \
+ 	--enable-bzlib \
+ 	--enable-gnutls \

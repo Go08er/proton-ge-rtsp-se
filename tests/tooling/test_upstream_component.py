@@ -2,7 +2,9 @@
 """Exact GE component patch verification, without compiling or networking."""
 
 from pathlib import Path
+import ast
 import os
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -67,6 +69,34 @@ class ComponentPatchTests(unittest.TestCase):
         script = (ROOT / "scripts/build-pinned-ge.sh").read_text()
         arguments = script.split("REEXEC_ARGS=(", 1)[1].split("\n  )", 1)[0]
         self.assertIn('--series "$PATCH_SERIES"', arguments)
+
+    def test_preparation_offset_backup_regression(self):
+        """Old invocation leaves the exact untracked file that blocked P14."""
+        script = (ROOT / 'scripts/prepare-pinned-ge-source.sh').read_text()
+        line = next(line for line in script.splitlines()
+                    if line.startswith('text = text.replace(patch_call,'))
+        invocation = ast.parse(line).body[0].value.args[1].value
+        self.assertTrue(invocation.endswith(' <'))
+        patch = '--- a/item.c\n+++ b/item.c\n@@ -1,3 +1,3 @@\n one\n-before\n+after\n three\n'
+        before = 'prefix\none\nbefore\nthree\n'
+        after = 'prefix\none\nafter\nthree\n'
+        for name, command, backup in [
+            ('old', ['patch', '-Np1', '--batch'], True),
+            ('fixed', shlex.split(invocation[:-2]), False),
+        ]:
+            with self.subTest(name=name):
+                directory = self.base / name
+                directory.mkdir()
+                target = directory / 'item.c'
+                target.write_text(before)
+                result = subprocess.run(command, input=patch, text=True, cwd=directory,
+                                        capture_output=True, env={**os.environ, 'LC_ALL': 'C'})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('offset 1 line', result.stdout)
+                self.assertEqual(target.read_text(), after)
+                self.assertEqual((directory / 'item.c.orig').exists(), backup)
+                if backup:
+                    self.assertEqual((directory / 'item.c.orig').read_text(), before)
 
 
 if __name__ == "__main__":

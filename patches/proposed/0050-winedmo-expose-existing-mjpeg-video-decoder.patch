@@ -1,0 +1,55 @@
+From: RTSP-on-GE contributors
+Subject: [PATCH] winedmo: Expose ordinary MJPEG through the existing video decoder
+
+The pinned FFmpeg already decodes MJPEG and its RIFF table maps MJPG to
+AV_CODEC_ID_MJPEG. Admit canonical MFVideoFormat_MJPG in the existing
+WMV-backed video MFT and DMO, as used for Theora, AV1, VP8/9 and HEVC.
+Canonicalize demuxed MJPEG before container-specific tags can bypass the
+registered subtype. Preserve every existing input/output entry and its order.
+
+This is ordinary demux-framed MJPEG admission, not Motion JPEG-B, GIF/APNG,
+fragment assembly, hardware decoding, a parser, HDR or a new output path.
+Existing decode, conversion, timestamps, flush and output validation remain
+unchanged. Source tests do not replace candidate public-MF playback tests.
+
+diff --git a/dlls/winedmo/unix_media_type.c b/dlls/winedmo/unix_media_type.c
+--- a/dlls/winedmo/unix_media_type.c
++++ b/dlls/winedmo/unix_media_type.c
+@@ -373,6 +373,7 @@
+         else if (params->codec_id == AV_CODEC_ID_VP9) format->guidFormat.Data1 = MFVideoFormat_VP90.Data1;
+         else if (params->codec_id == AV_CODEC_ID_AV1) format->guidFormat.Data1 = MFVideoFormat_AV1.Data1;
+         else if (params->codec_id == AV_CODEC_ID_HEVC) format->guidFormat.Data1 = MFVideoFormat_HEVC.Data1;
++        else if (params->codec_id == AV_CODEC_ID_MJPEG) format->guidFormat.Data1 = MFVideoFormat_MJPG.Data1;
+         else if (params->codec_tag) format->guidFormat.Data1 = params->codec_tag;
+         else format->guidFormat.Data1 = video_format_tag_from_codec_id( params->codec_id );
+     }
+diff --git a/dlls/winedmo/video_decoder.c b/dlls/winedmo/video_decoder.c
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -2535,6 +2535,7 @@
+     &MFVideoFormat_VP90,
+     &MFVideoFormat_VP80,
+     &MFVideoFormat_HEVC,
++    &MFVideoFormat_MJPG,
+ };
+ static const GUID *const wmv_decoder_output_types[] =
+ {
+diff --git a/dlls/wmvdecod/wmvdecod.c b/dlls/wmvdecod/wmvdecod.c
+--- a/dlls/wmvdecod/wmvdecod.c
++++ b/dlls/wmvdecod/wmvdecod.c
+@@ -71,6 +71,7 @@
+         {MFMediaType_Video, MFVideoFormat_VP90},
+         {MFMediaType_Video, MFVideoFormat_VP80},
+         {MFMediaType_Video, MFVideoFormat_HEVC},
++        {MFMediaType_Video, MFVideoFormat_MJPG},
+     };
+     MFT_REGISTER_TYPE_INFO wmv_decoder_mft_outputs[] =
+     {
+@@ -115,6 +116,7 @@
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_VP90},
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_VP80},
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_HEVC},
++        {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_MJPG},
+     };
+     HRESULT hr;
+ 

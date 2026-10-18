@@ -266,11 +266,11 @@ class IntegratedSourceTests(unittest.TestCase):
             )
         }
 
-    def body(self, text, name):
+    def body(self, text, name, normalize=True):
         match = re.search(r"^static [^\n]*\b" + re.escape(name)
                           + r"\([^;]*?\n\{.*?^}", text, re.M | re.S)
         self.assertIsNotNone(match, "missing function " + name)
-        return " ".join(match.group().split())
+        return " ".join(match.group().split()) if normalize else match.group()
 
     def ordered(self, text, *terms):
         positions = []
@@ -312,8 +312,12 @@ class IntegratedSourceTests(unittest.TestCase):
 
         session = self.body(sources["session"], "session_events_callback_Invoke")
         session_error = session.split("case MEError:", 1)[1].split("default:", 1)[0]
+        filter_errors = 'return MF_E_INVALID_STREAM_DATA;' in sources['source']
+        extra_session = ' || hr == MF_E_INVALID_STREAM_DATA || hr == E_OUTOFMEMORY' if filter_errors else ''
+        extra_reject = ' && error != MF_E_INVALID_STREAM_DATA && error != E_OUTOFMEMORY' if filter_errors else ''
+        extra_decode = ' || error == MF_E_INVALID_STREAM_DATA || error == E_OUTOFMEMORY' if filter_errors else ''
         allowed = ("else if (hr == MF_E_OPERATION_CANCELLED || hr == MF_E_NET_TIMEOUT "
-                   "|| hr == MF_E_NET_READ || hr == MF_E_INVALID_POSITION)")
+                   "|| hr == MF_E_NET_READ || hr == MF_E_INVALID_POSITION" + extra_session + ")")
         self.ordered(session_error,
                      "session_get_media_source(session, (IMFMediaSource *)event_source)",
                      allowed,
@@ -326,13 +330,13 @@ class IntegratedSourceTests(unittest.TestCase):
         self.assertNotIn("COMMAND_STATE_RESTARTING_SOURCES", session_error)
 
         engine = self.body(sources["engine"], "media_engine_session_events_Invoke")
-        error = engine.split("case MEError:", 1)[1].split("case MEEndOfPresentation:", 1)[0]
+        error = engine.split("case MEError:", 1)[1].split(" case ", 1)[0]
         self.require(error, "(error != MF_E_OPERATION_CANCELLED && error != MF_E_NET_TIMEOUT "
-                     "&& error != MF_E_NET_READ && error != MF_E_INVALID_POSITION)")
+                     "&& error != MF_E_NET_READ && error != MF_E_INVALID_POSITION" + extra_reject + ")")
         self.require(error, "source.vt != VT_UNKNOWN || !source.punkVal")
         self.require(error, "if (error == MF_E_OPERATION_CANCELLED) "
                       "error_code = MF_MEDIA_ENGINE_ERR_ABORTED; "
-                      "else if (error == MF_E_INVALID_POSITION) "
+                      "else if (error == MF_E_INVALID_POSITION" + extra_decode + ") "
                       "error_code = MF_MEDIA_ENGINE_ERR_DECODE; "
                       "else error_code = MF_MEDIA_ENGINE_ERR_NETWORK;")
         self.ordered(error,
@@ -341,8 +345,12 @@ class IntegratedSourceTests(unittest.TestCase):
                      "engine->error_code = error_code;",
                      "engine->extended_code = error;",
                      "MF_MEDIA_ENGINE_EVENT_ERROR")
-        for cleared in ("playback_requested = FALSE", "current_seek = NAN",
-                        "next_seek = NAN", "deferred_seek = NAN"):
+        cleared_fields = ["playback_requested = FALSE", "current_seek = NAN", "next_seek = NAN"]
+        if "FLAGS_ENGINE_DEFERRED_SEEK" in sources["engine"]:
+            cleared_fields.append("deferred_seek = NAN")
+        else:
+            self.assertNotIn("deferred_seek", sources["engine"])
+        for cleared in cleared_fields:
             self.require(error, "engine->" + cleared)
         for forbidden in ("MF_MEDIA_ENGINE_EVENT_ENDED", "MF_MEDIA_ENGINE_EVENT_SEEKED",
                           "media_engine_set_current_time(", "media_engine_start_playback("):
@@ -361,14 +369,14 @@ class IntegratedSourceTests(unittest.TestCase):
             ("source", "*error_queued = media_source_queue_demux_error(source, error);",
              "media_source_set_demux_error(source, error);"),
             ("source", "if (!media_source_set_demux_error(source, error))", "if (FALSE)"),
-            ("session", "|| hr == MF_E_NET_READ || hr == MF_E_INVALID_POSITION)",
-             "|| hr == MF_E_NET_READ)"),
+            ("session", "|| hr == MF_E_NET_READ || hr == MF_E_INVALID_POSITION",
+             "|| hr == MF_E_NET_READ"),
             ("session", "(session_source = session_get_media_source(session, (IMFMediaSource *)event_source))",
              "(session_source = NULL)"),
             ("session", "if (!(session_source->flags & SOURCE_FLAG_TERMINAL_ERROR_FORWARDED))",
              "if (TRUE)"),
-            ("engine", "&& error != MF_E_NET_READ && error != MF_E_INVALID_POSITION)",
-             "&& error != MF_E_NET_READ)"),
+            ("engine", "&& error != MF_E_NET_READ && error != MF_E_INVALID_POSITION",
+             "&& error != MF_E_NET_READ"),
             ("engine", "error_code = MF_MEDIA_ENGINE_ERR_DECODE;",
              "error_code = MF_MEDIA_ENGINE_ERR_NETWORK;"),
             ("engine", "engine->presentation.generation != engine->source_generation", "FALSE"),
@@ -376,7 +384,17 @@ class IntegratedSourceTests(unittest.TestCase):
         ):
             with self.subTest(file=name, regression=old):
                 mutated = self.sources.copy()
-                mutated[name] = mutated[name].replace(old, new, 1)
+                if name == "engine":
+                    # Buffering callbacks share these identity guards. Remove
+                    # the terminal-error guard, not an earlier unrelated one.
+                    callback = self.body(mutated[name], "media_engine_session_events_Invoke", normalize=False)
+                    error = re.split(r"\n\s*(?:case\b|default:)",
+                                     callback.split("case MEError:", 1)[1], maxsplit=1)[0]
+                    self.assertIn(old, error, "terminal mutation target absent: " + old)
+                    self.assertEqual(mutated[name].count(error), 1)
+                    mutated[name] = mutated[name].replace(error, error.replace(old, new, 1), 1)
+                else:
+                    mutated[name] = mutated[name].replace(old, new, 1)
                 self.assertTrue(mutated[name] != self.sources[name],
                                 "mutation target absent: " + old)
                 with self.assertRaises(AssertionError):

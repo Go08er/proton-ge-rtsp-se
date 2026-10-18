@@ -1,0 +1,74 @@
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -196,6 +196,7 @@
+     unsigned int completed_seek_serial;
+     DWORD queue;
+     enum media_source_state source_state;
++    BOOL initial_start_pending;
+     HRESULT terminal_error;
+     struct media_stream *streams;
+     struct list responses;
+@@ -819,12 +820,14 @@
+     switch (event_type)
+     {
+         case MESourceStarted:
++            reader->initial_start_pending = FALSE;
+             reader->source_state = SOURCE_STATE_STARTED;
+             reader->flags &= ~SOURCE_READER_SEEKING;
+             reader->next_stream_eos_index = 0;
+             reader->presentation_ended = FALSE;
+             break;
+         case MESourceStopped:
++            reader->initial_start_pending = FALSE;
+             reader->source_state = SOURCE_STATE_STOPPED;
+             reader->flags &= ~SOURCE_READER_SEEKING;
+             break;
+@@ -1502,6 +1505,7 @@
+     if (SUCCEEDED(status) || FAILED(reader->terminal_error))
+         return;
+     reader->terminal_error = status;
++    reader->initial_start_pending = FALSE;
+     reader->flags &= ~(SOURCE_READER_SEEKING | SOURCE_READER_ASYNC_SEEK_QUEUED);
+     for (i = 0; i < reader->stream_count; ++i)
+     {
+@@ -1982,7 +1986,7 @@
+             reader->streams[i].flags &= ~STREAM_FLAG_SELECTED;
+     }
+ 
+-    if (reader->source_state == SOURCE_STATE_STARTED)
++    if (reader->source_state == SOURCE_STATE_STARTED || reader->initial_start_pending)
+     {
+         for (i = 0; i < reader->stream_count; ++i)
+         {
+@@ -1993,10 +1997,18 @@
+         }
+     }
+ 
++    /* Start acceptance precedes MESourceStarted. Concurrent async reads
++     * must not manufacture another initial seek that retires demand the
++     * source already accepted. Real selection changes retain their Start. */
++    if (reader->initial_start_pending && !selection_changed)
++        return S_OK;
++
+     position.hVal.QuadPart = 0;
+     if (reader->source_state != SOURCE_STATE_STARTED || selection_changed)
+     {
+         position.vt = reader->source_state == SOURCE_STATE_STARTED ? VT_EMPTY : VT_I8;
++        if (reader->source_state != SOURCE_STATE_STARTED)
++            reader->initial_start_pending = TRUE;
+         /* Update cached stream selection if descriptor was accepted. */
+         if (SUCCEEDED(hr = IMFMediaSource_Start(reader->source, reader->descriptor, &GUID_NULL, &position)))
+         {
+@@ -2006,8 +2018,12 @@
+             {
+                 if (reader->streams[i].flags & STREAM_FLAG_SELECTED)
+                     reader->streams[i].flags |= STREAM_FLAG_PRESENTED;
++                else
++                    reader->streams[i].flags &= ~STREAM_FLAG_PRESENTED;
+             }
+         }
++        else
++            reader->initial_start_pending = FALSE;
+     }
+ 
+     return hr;

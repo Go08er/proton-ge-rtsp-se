@@ -1,0 +1,28 @@
+Subject: [PATCH] mf: initialize SAR marker linkage before copying its context
+
+stream_place_marker() allocates a zeroed queued_object, then copies a caller's
+optional context before inserting the object into the renderer queue. If
+PropVariantCopy fails, release_pending_object() calls list_remove() on the
+still-NULL links and crashes instead of returning the copy error.
+
+Initialize the entry as an empty self-linked list before that fallible copy.
+The existing cleanup can then unlink it safely; successful insertion and
+marker delivery remain unchanged. This is independent of the end-marker
+demand reset in 0043. Media Session's normal NULL-context EOF markers do not
+exercise this allocation/copy-error path.
+
+The extracted actual-source regression injects a copy failure and observes
+SIGSEGV with both P6 and 0043 alone, then the original error return with this
+patch. No claim is made that this caused the co-test seek freeze.
+---
+diff --git a/dlls/mf/sar.c b/dlls/mf/sar.c
+--- a/dlls/mf/sar.c
++++ b/dlls/mf/sar.c
+@@ -1702,6 +1702,7 @@ static HRESULT stream_place_marker(struct audio_renderer *renderer, MFSTREAMSINK_MARKER_TYPE marker_type,
+     if (!(marker = calloc(1, sizeof(*marker))))
+         return E_OUTOFMEMORY;
+ 
++    list_init(&marker->entry);
+     marker->type = OBJECT_TYPE_MARKER;
+     marker->u.marker.type = marker_type;
+     PropVariantInit(&marker->u.marker.context);

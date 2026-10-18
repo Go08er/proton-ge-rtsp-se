@@ -1,0 +1,291 @@
+Subject: [P20 review] winedmo retain native decoder coordinates and parser drain
+
+Residual against GE-Proton11-9 after ge-video-rework.
+Source-reviewed only: not compiler or runtime qualification.
+Prior P19b2 patch ownership (some behavior is now upstream):
+  ge-master-20260913-se2-p8/0047-winedmo-expose-ac3-and-eac3-audio-decoding.patch
+  ge-proton11-6/0008-winedmo-preserve-audio-timeline-across-flush.patch
+  ge-proton11-7-se2-p19b/0070-winedmo-preserve-decoder-demux-coordinate.patch
+  proposed/0037-winedmo-discard-resampler-delay-on-flush.patch
+  proposed/0048-winedmo-expose-existing-dts-alac-and-g711-decoders.patch
+  proposed/0053-winedmo-map-exact-h264-es-subtype.patch
+  proposed/0054-winedmo-drain-parser-tail-before-decoder-eos.patch
+  proposed/0056-winedmo-preserve-vc1-input-timestamp-origin.patch
+  proposed/0062-winedmo-use-zero-based-parser-byte-position.patch
+
+---
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -32,6 +32,7 @@
+ #include <stdbool.h>
+ #include <inttypes.h>
+ #include <libavutil/cpu.h>
++#include <libavutil/common.h>
+ #include <libavutil/imgutils.h>
+ #include <libavutil/samplefmt.h>
+ #include <libswscale/swscale.h>
+@@ -63,6 +64,9 @@
+     bool preserve_audio_timestamps;
+     bool is_raw_video;
+     bool draining;       /* NULL packet sent — flushing decoder */
++    bool drain_requested;
++    bool drain_packet_pending; /* parsed_packet owns the unsent final access unit */
++    NTSTATUS drain_status;     /* fatal drain failure, cleared by flush */
+     bool frame_pending;  /* frame holds undispatched output */
+ 
+     /* Audio output conversion */
+@@ -74,7 +78,6 @@
+     INT64               audio_base_pts;  /* absolute pts of first byte in audio_buf */
+     INT64               last_input_pts;  /* pts of the most recently pushed input packet (100ns units), INT64_MIN if unknown */
+     INT64               audio_pts_offset;
+-    INT64               audio_output_pts_adjust;
+     INT64               cumulative_samples; /* PCM samples emitted since last pts anchor; used to synthesise pts for codecs
+                                              * (e.g. MS-ADPCM) that only stamp the first decoded frame in a packet */
+     enum AVSampleFormat out_sample_fmt;
+@@ -133,6 +136,8 @@
+     case WAVE_FORMAT_IEEE_FLOAT:    return AV_CODEC_ID_PCM_F32LE;
+     case WAVE_FORMAT_ALAW:          return AV_CODEC_ID_PCM_ALAW;
+     case WAVE_FORMAT_MULAW:         return AV_CODEC_ID_PCM_MULAW;
++    case WAVE_FORMAT_DTS:           return AV_CODEC_ID_DTS;
++    case WAVE_FORMAT_ALAC:          return AV_CODEC_ID_ALAC;
+     case WAVE_FORMAT_MPEG:          return AV_CODEC_ID_MP2;
+     case WAVE_FORMAT_MPEGLAYER3:    return AV_CODEC_ID_MP3; /* 0x0055 */
+     case 0x00FF:                    return AV_CODEC_ID_AAC; /* WAVE_FORMAT_AAC */
+@@ -159,6 +164,7 @@
+          * lower WORD (0xD10B) is not a valid WAVE tag, so check the full GUID. */
+         if (IsEqualGUID( &ext->SubFormat, &MFAudioFormat_Vorbis )) return AV_CODEC_ID_VORBIS;
+         if (IsEqualGUID( &ext->SubFormat, &MFAudioFormat_Dolby_AC3 )) return AV_CODEC_ID_AC3;
++        if (IsEqualGUID( &ext->SubFormat, &MFAudioFormat_Dolby_DDPlus )) return AV_CODEC_ID_EAC3;
+         tag = (WORD)ext->SubFormat.Data1;
+     }
+ 
+@@ -171,6 +177,8 @@
+     DWORD fourcc = mfvf->guidFormat.Data1;
+     enum AVCodecID id = av_codec_get_id( tables, fourcc );
+ 
++    /* This already-advertised MF subtype is a full GUID, not a FourCC. */
++    if (IsEqualGUID( &mfvf->guidFormat, &MFVideoFormat_H264_ES )) return AV_CODEC_ID_H264;
+     if (id != AV_CODEC_ID_NONE) return id;
+ 
+     switch (fourcc)
+@@ -561,10 +569,17 @@
+     if (t->avctx->codec_id == AV_CODEC_ID_VC1)
+     {
+         if (t->last_video_pts == INT64_MIN && t->video_pts_offset == INT64_MIN)
++        {
+             t->video_pts_offset = video_pts;
++            /* A decoder flush does not make a positioned presentation start at
++             * zero. Keep the existing startup alignment relative to the first
++             * input timestamp, including preroll before the requested seek. */
++            if (t->video_input_anchor_pts > 0)
++                t->video_pts_offset = av_sat_sub64( video_pts, t->video_input_anchor_pts );
++        }
+ 
+         if (t->video_pts_offset != INT64_MIN && video_pts >= t->video_pts_offset)
+-            video_pts -= t->video_pts_offset;
++            video_pts = av_sat_sub64( video_pts, t->video_pts_offset );
+     }
+ 
+     *pts = video_pts;
+@@ -764,7 +779,6 @@
+ 
+     if (!(t = calloc( 1, sizeof(*t) ))) return STATUS_NO_MEMORY;
+     t->last_input_pts = INT64_MIN;
+-    t->audio_output_pts_adjust = INT64_MIN;
+     t->last_video_pts = INT64_MIN;
+     t->last_video_duration = INT64_MIN;
+     t->last_video_input_duration = INT64_MIN;
+@@ -789,7 +803,7 @@
+             extradata      = (const BYTE *)(wfx + 1);
+             extradata_size = wfx->cbSize;
+             /* For WAVEFORMATEXTENSIBLE, extra codec data starts past the fixed ext part */
+-            if (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE && wfx->cbSize > 22)
++            if (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE && wfx->cbSize >= 22)
+             {
+                 extradata      += 22;
+                 extradata_size -= 22;
+@@ -1052,7 +1066,7 @@
+         return STATUS_SUCCESS;
+     }
+ 
+-    if (t->draining) return STATUS_DEVICE_BUSY;
++    if (t->drain_requested || t->draining) return STATUS_DEVICE_BUSY;
+ 
+     if (!t->is_audio)
+     {
+@@ -1167,7 +1181,6 @@
+     if (t->is_audio && (params->flags & WINEDMO_SAMPLE_FLAG_DISCONTINUITY))
+     {
+         t->audio_pts_offset = 0;
+-        t->audio_output_pts_adjust = INT64_MIN;
+         t->audio_started = false;
+     }
+ 
+@@ -1183,7 +1196,7 @@
+             int consumed;
+ 
+             consumed = av_parser_parse2( t->parser, t->avctx, &parsed_data, &parsed_size,
+-                                         data, size, t->packet->pts, t->packet->dts, AV_NOPTS_VALUE );
++                                         data, size, t->packet->pts, t->packet->dts, 0 );
+             if (consumed < 0)
+                 return STATUS_UNSUCCESSFUL;
+ 
+@@ -1280,6 +1293,36 @@
+     if (is_wmv_video_codec( t->avctx->codec_id ))
+         TRACE( "sent %s packet size %d pts %"PRId64"\n",
+                avcodec_get_name( t->avctx->codec_id ), t->packet->size, (INT64)t->packet->pts );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS advance_transform_drain( struct unix_transform *t )
++{
++    int ret;
++
++    if (t->drain_status) return t->drain_status;
++    if (!t->drain_requested || t->draining) return STATUS_SUCCESS;
++
++    if (t->drain_packet_pending)
++    {
++        if ((ret = avcodec_send_packet( t->avctx, t->parsed_packet )) < 0)
++        {
++            if (ret == AVERROR(EAGAIN)) return STATUS_SUCCESS;
++            WARN( "avcodec_send_packet during drain: %d\n", ret );
++            return (t->drain_status = STATUS_UNSUCCESSFUL);
++        }
++        t->drain_packet_pending = false;
++        t->mpeg_es_size = 0;
++        av_packet_unref( t->parsed_packet );
++    }
++
++    if ((ret = avcodec_send_packet( t->avctx, NULL )) < 0 && ret != AVERROR_EOF)
++    {
++        if (ret == AVERROR(EAGAIN)) return STATUS_SUCCESS;
++        WARN( "avcodec_send_packet EOS: %d\n", ret );
++        return (t->drain_status = STATUS_UNSUCCESSFUL);
++    }
++    t->draining = true;
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1364,6 +1407,15 @@
+     }
+ 
+     /* ---- Receive next frame if none pending ---- */
++
++    /* A drain request is accepted even when the decoder needs output consumed
++     * before it can accept the parser tail or NULL packet. Make one send step
++     * here, then use the normal receive path for backpressure progress. */
++    if ((ret = advance_transform_drain( t )))
++    {
++        params->size = 0;
++        return ret;
++    }
+ 
+     if (!t->frame_pending)
+     {
+@@ -1553,16 +1605,6 @@
+          * (legacy PROVIDES_SAMPLES query) get STATUS_BUFFER_TOO_SMALL with the full
+          * size; all other callers receive up to capacity bytes with INCOMPLETE set when
+          * more data remains. */
+-        /* PCM conversion and AAC decoding must preserve the presentation
+-         * timeline, including after a seek, independently of packet batching. */
+-        if (!t->preserve_audio_timestamps && !t->audio_started && base_pts != INT64_MIN)
+-            t->audio_output_pts_adjust = base_pts;
+-        if (base_pts != INT64_MIN && t->audio_output_pts_adjust != INT64_MIN)
+-        {
+-            base_pts -= t->audio_output_pts_adjust;
+-            params->pts = base_pts;
+-        }
+-
+         params->flags |= WINEDMO_SAMPLE_FLAG_SYNC_POINT;
+         if (!t->audio_started)
+             params->flags |= WINEDMO_SAMPLE_FLAG_DISCONTINUITY;
+@@ -1649,25 +1691,37 @@
+         return STATUS_SUCCESS;
+     }
+ 
+-    if (!t->draining)
+-    {
+-        if (t->mpeg_es_assemble && t->mpeg_es_size)
++    if (!t->drain_requested && !t->draining)
++    {
++        uint8_t *data = NULL;
++        int size = 0;
++
++        t->drain_requested = true;
++        if (t->parser)
++        {
++            if (av_parser_parse2( t->parser, t->avctx, &data, &size, NULL, 0,
++                                 AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0 ) < 0)
++                return (t->drain_status = STATUS_UNSUCCESSFUL);
++        }
++        else if (t->mpeg_es_assemble && t->mpeg_es_size)
++        {
++            data = t->mpeg_es_buf;
++            size = t->mpeg_es_size;
++        }
++        if (size)
+         {
+             av_packet_unref( t->parsed_packet );
+-            if ((ret = av_new_packet( t->parsed_packet, t->mpeg_es_size )) < 0)
+-                return STATUS_NO_MEMORY;
+-            memcpy( t->parsed_packet->data, t->mpeg_es_buf, t->mpeg_es_size );
+-            if ((ret = avcodec_send_packet( t->avctx, t->parsed_packet )) < 0 && ret != AVERROR(EAGAIN))
+-            {
+-                WARN( "avcodec_send_packet: %d\n", ret );
+-                return STATUS_UNSUCCESSFUL;
+-            }
+-            t->mpeg_es_size = 0;
+-        }
+-        avcodec_send_packet( t->avctx, NULL );
+-        t->draining = true;
+-    }
+-    return STATUS_SUCCESS;
++            if ((ret = av_new_packet( t->parsed_packet, size )) < 0)
++                return (t->drain_status = STATUS_NO_MEMORY);
++            memcpy( t->parsed_packet->data, data, size );
++            t->parsed_packet->pts = t->parser && t->parser->pts != AV_NOPTS_VALUE ? t->parser->pts : t->packet->pts;
++            t->parsed_packet->dts = t->parser && t->parser->dts != AV_NOPTS_VALUE ? t->parser->dts : t->packet->dts;
++            t->parsed_packet->duration = t->packet->duration;
++            t->parsed_packet->flags = t->packet->flags;
++            t->drain_packet_pending = true;
++        }
++    }
++    return advance_transform_drain( t );
+ }
+ 
+ NTSTATUS transform_flush( void *arg )
+@@ -1688,6 +1742,9 @@
+     if (t->parsed_packet) av_packet_unref( t->parsed_packet );
+     t->frame_pending      = false;
+     t->draining           = false;
++    t->drain_requested    = false;
++    t->drain_packet_pending = false;
++    t->drain_status       = STATUS_SUCCESS;
+     t->audio_buf_filled   = 0;
+     t->audio_buf_pos      = 0;
+     t->video_buf_filled   = 0;
+@@ -1695,8 +1752,9 @@
+     t->video_trace_count  = 0;
+     t->audio_base_pts     = 0;
+     t->last_input_pts     = INT64_MIN;
+-    t->audio_pts_offset   = 0;
+-    t->audio_output_pts_adjust = INT64_MIN;
++    /* Keep the negative-input timestamp adjustment across a decoder flush.
++     * Output follows the new input times, without establishing a new origin;
++     * explicit input-discontinuity handling remains separate. */
+     t->audio_started      = false;
+     t->last_video_pts     = INT64_MIN;
+     t->last_video_duration = INT64_MIN;
+@@ -1706,7 +1764,9 @@
+     t->video_input_anchor_pts = INT64_MIN;
+     t->video_pts_offset   = INT64_MIN;
+     t->cumulative_samples = 0;
+-    /* Don't free swr/sws — parameters haven't changed */
++    /* Discard delayed audio as well as decoded/output samples. The resampler
++     * is recreated on demand; the swscale parameter cache can be retained. */
++    swr_free( &t->swr );
+     return STATUS_SUCCESS;
+ }
+ 

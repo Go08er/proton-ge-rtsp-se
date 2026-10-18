@@ -22,8 +22,10 @@ Usage: verify-preparation.sh [--config FILE] [--series FILE]
 Run the static preparation, safety, and model gates. The default remains the
 immutable A3.12 control; pass the candidate config explicitly when qualifying
 a candidate. Historical pins can select their archived patch series explicitly.
-Set PREPARED_SOURCE explicitly to also check the selected GE11-6 Wine source
+Set PREPARED_SOURCE explicitly to also check the selected candidate's Wine source
 contracts; this does not substitute for complete preparation provenance.
+For P8, PREPARATION_TEST_CC can name an available native C compiler command
+for extracted master lifecycle controls (otherwise an available cc is used).
 EOF
 }
 
@@ -160,6 +162,7 @@ pinned_ge_load_config
   || fail "selected security-refresh build does not use pin schema 5"
 [[ "$PINNED_GE_HAS_RETAINED_RESUME" == 0 ]] \
   || fail "fresh selected pin carries misleading old-base resume provenance"
+selected_module_series=()
 case "$PIN_ID" in
   ge-master-snapshot-20260723-a312)
     SELECTED_PROFILE=a312
@@ -249,7 +252,7 @@ case "$PIN_ID" in
         && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 ]] \
       || fail "immutable A3.19 GE-Proton11-6 identity changed"
     ;;
-  ge-proton11-6-a320|ge-proton11-6-a321|ge-proton11-6-a322|ge-proton11-6-a322-r2|ge-proton11-6-a323|ge-proton11-6-se1)
+  ge-proton11-6-a320|ge-proton11-6-a321|ge-proton11-6-a322|ge-proton11-6-a322-r2|ge-proton11-6-a323|ge-proton11-6-se1|ge-proton11-6-se2-p1|ge-proton11-6-se2-p2|ge-proton11-6-se2-p3|ge-proton11-6-se2-p4|ge-proton11-6-se2-p5|ge-proton11-6-se2-p6|ge-proton11-6-se2-p7)
     SELECTED_PROFILE=${PIN_ID##*-}
     candidate_number=${SELECTED_PROFILE#a3}
     if [[ "$PIN_ID" == ge-proton11-6-a322-r2 ]]; then
@@ -263,6 +266,71 @@ case "$PIN_ID" in
       expected_build_name=proton-ge-11-6-rtsp-se1
       [[ "$PIN_PROTON_LAUNCHER_POLICY" == upstream ]] \
         || fail "SE1 must use the unmodified upstream launcher"
+    elif [[ "$PIN_ID" == ge-proton11-6-se2-p1 || "$PIN_ID" == ge-proton11-6-se2-p2 || "$PIN_ID" == ge-proton11-6-se2-p3 || "$PIN_ID" == ge-proton11-6-se2-p4 || "$PIN_ID" == ge-proton11-6-se2-p5 || "$PIN_ID" == ge-proton11-6-se2-p6 || "$PIN_ID" == ge-proton11-6-se2-p7 ]]; then
+      # These subsets retain the foundation gates and exact ordered additions.
+      SELECTED_PROFILE=a323
+      expected_build_name="proton-ge-11-6-rtsp-se2-${PIN_ID##*-}"
+      selected_module_series=(
+        proposed/0027-winedmo-expose-vp8-and-hevc-decoders.patch
+        proposed/0028-winedmo-bound-published-stream-access.patch
+        proposed/0030-winedmo-check-filter-initialization-failures.patch
+      )
+      if [[ "$PIN_ID" == ge-proton11-6-se2-p2 || "$PIN_ID" == ge-proton11-6-se2-p3 || "$PIN_ID" == ge-proton11-6-se2-p4 || "$PIN_ID" == ge-proton11-6-se2-p5 || "$PIN_ID" == ge-proton11-6-se2-p6 || "$PIN_ID" == ge-proton11-6-se2-p7 ]]; then
+        selected_module_series+=(
+          proposed/0037-winedmo-discard-resampler-delay-on-flush.patch
+          proposed/0038-winedmo-describe-filter-eof-failures.patch
+        )
+      fi
+      if [[ "$PIN_ID" == ge-proton11-6-se2-p3 || "$PIN_ID" == ge-proton11-6-se2-p4 || "$PIN_ID" == ge-proton11-6-se2-p5 || "$PIN_ID" == ge-proton11-6-se2-p6 || "$PIN_ID" == ge-proton11-6-se2-p7 ]]; then
+        selected_module_series+=(proposed/0039-mf-report-terminal-direct-filter-errors.patch)
+      fi
+      if [[ "$PIN_ID" == ge-proton11-6-se2-p4 || "$PIN_ID" == ge-proton11-6-se2-p5 || "$PIN_ID" == ge-proton11-6-se2-p6 || "$PIN_ID" == ge-proton11-6-se2-p7 ]]; then
+        selected_module_series+=(proposed/0040-mfmediaengine-remove-uninitialized-topology-cleanup.patch)
+      fi
+      if [[ "$PIN_ID" == ge-proton11-6-se2-p5 || "$PIN_ID" == ge-proton11-6-se2-p6 || "$PIN_ID" == ge-proton11-6-se2-p7 ]]; then
+        selected_module_series+=(
+          proposed/0029-winedmo-latch-asf-startup-timestamp-decision.patch
+          proposed/0031-winedmo-open-secure-rtsp-tcp-aliases.patch
+          proposed/0032-winedmo-classify-http-media-after-probing.patch
+          proposed/0033-winedmo-bound-and-extend-audio-channel-counts.patch
+          proposed/0034-mfmediaengine-honor-ready-source-autoplay.patch
+          proposed/0036-mfmediaengine-guard-audio-only-segment-end.patch
+          proposed/0041-winedmo-allow-supported-hls-audio-containers.patch
+        )
+        [[ "${PIN_FFMPEG_RTSPS_PATCH_SHA256:-}" == 4620be1a6b9fae9b1c386ee17b8ef7e2f6f30a20ca32c7fd9534ef0822ec9f25 \
+            && "${PIN_FFMPEG_RTSPS_RTSP_BLOB:-}" == f2927f4a4bf14239c83a63e923e077e4dd68ad47 ]] \
+          || fail "SE2-P5 secure RTSP Wine module requires its exact FFmpeg companion"
+        pinned_ge_rtsps_transport_patch >/dev/null
+      elif [[ -n "${PIN_FFMPEG_RTSPS_PATCH_SHA256:-}${PIN_FFMPEG_RTSPS_RTSP_BLOB:-}" ]]; then
+        fail "historical SE2 subsets do not include the secure RTSP companion"
+      fi
+      if [[ "$PIN_ID" == ge-proton11-6-se2-p6 || "$PIN_ID" == ge-proton11-6-se2-p7 ]]; then
+        selected_module_series+=(proposed/0042-winedmo-expose-existing-flac-audio-decoder.patch)
+        [[ "${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}" == b3669b91b08502e943bd564f3a99bef50d2d54440f8f4cc189e2b0d3b2b14ecb \
+            && "${PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB:-}" == 03dba285f93c762073e6a923be80ae3cca016226 ]] \
+          || fail "SE2-P6 requires its exact HTTP seek companion"
+        pinned_ge_http_seek_patch >/dev/null
+      elif [[ -n "${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}${PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB:-}" ]]; then
+        fail "historical SE2 subsets do not include the HTTP seek companion"
+      fi
+      if [[ "$PIN_ID" == ge-proton11-6-se2-p7 ]]; then
+        selected_module_series+=(
+          proposed/0043-mf-rearm-audio-sample-demand-after-flush.patch
+          proposed/0044-mf-initialize-sar-marker-entry-before-copy.patch
+          proposed/0045-mf-reset-seek-eos-and-discriminate-sink-markers.patch
+        )
+      fi
+      [[ "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+          && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+          && "$PIN_REGISTERED_SUBMODULE_COUNT" == 42 \
+          && "$PIN_GITLINK_COUNT" == 42 \
+          && "$PIN_UNMAPPED_OPTIONAL_GITLINK_COUNT" == 0 \
+          && "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}" \
+            == fc0e7fccb6862c463fc92487cc8d79c7ccc242cb84c4811712f42c8a863a2c8c \
+          && "${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" \
+            == b0363a2bc898363dbe368e966248cad3738d2acc ]] \
+        || fail "SE2-P1 full-GE component or separate AV1 module identity changed"
+      pinned_ge_dav1d_build_patch >/dev/null
     fi
     [[ "$PIN_BUILD_NAME" \
         == "$expected_build_name" \
@@ -279,22 +347,227 @@ case "$PIN_ID" in
         && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 ]] \
       || fail "$SELECTED_PROFILE GE-Proton11-6 candidate identity changed"
     ;;
+  ge-master-20260913-se2-p8|ge-master-20260913-se2-p9|ge-master-20260913-se2-p10|ge-master-20260913-se2-p11|ge-master-20260913-se2-p12|ge-master-20260913-se2-p13|ge-proton11-7-se2-p14|ge-proton11-7-se2-p15|ge-proton11-7-se2-p16|ge-proton11-7-se2-p17|ge-proton11-7-se2-p18|ge-proton11-7-se2-p19a|ge-proton11-7-se2-p19b|ge-proton11-7-se2-p19b2)
+    # Reuse the A3.23 foundation gates; bind each base independently while
+    # sharing the unchanged module contracts and full-GE component policy.
+    SELECTED_PROFILE=a323
+    [[ "$PIN_ID" != ge-proton11-7-se2-p19b && "$PIN_ID" != ge-proton11-7-se2-p19b2 ]] || SELECTED_PROFILE=p19b
+    expected_se2_submodules=42
+    expected_se2_dav1d_postimage=d928598c149e70b3af85f4d83d0012f28f6104b6
+    if [[ "$PIN_ID" == ge-proton11-7-se2-p14 || "$PIN_ID" == ge-proton11-7-se2-p15 || "$PIN_ID" == ge-proton11-7-se2-p16 || "$PIN_ID" == ge-proton11-7-se2-p17 || "$PIN_ID" == ge-proton11-7-se2-p18 || "$PIN_ID" == ge-proton11-7-se2-p19a || "$PIN_ID" == ge-proton11-7-se2-p19b || "$PIN_ID" == ge-proton11-7-se2-p19b2 ]]; then
+      expected_se2_submodules=43
+      expected_se2_dav1d_postimage=8da60c649bcbf3c2c86c042c95551883e5dab64f
+      [[ "$PIN_BUILD_NAME" == "proton-ge-11-7-rtsp-se2-${PIN_ID##*-}" \
+          && "$PIN_KIND" == release-tag \
+          && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-7 \
+          && "$PIN_SOURCE_COMMIT" == c191f35dcebbeccfacd3b4c6f6eea026e588c1c2 \
+          && "$PIN_SOURCE_TREE" == 9ce007c8526d8c04d0face13dacff1612ff23c8b \
+          && "$PIN_WINE_COMMIT" == 46b29104e3741fe23bf5e2547196a253aab88c89 \
+          && "$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB" == c7aab44f326494a1c67f67bdda65b2245fc94b6d \
+          && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 ]] \
+        || fail "SE2-P14 GE-Proton11-7 identity or crypto postimage changed"
+    else
+      [[ "$PIN_BUILD_NAME" == "proton-ge-master-0b8c4d30-rtsp-se2-${PIN_ID##*-}" \
+          && "$PIN_KIND" == development-snapshot \
+          && "$PIN_SOURCE_REF" == 0b8c4d30d76abb74cc5cc4efdbadb410db00455f \
+          && "$PIN_SOURCE_COMMIT" == 0b8c4d30d76abb74cc5cc4efdbadb410db00455f \
+          && "$PIN_SOURCE_TREE" == ea31809f040dae7144160fbf08727d4a0979503e \
+          && "$PIN_WINE_COMMIT" == 00e639898e01f8dd6fbee3851bd4c1e412c5b875 \
+          && "$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB" == 50af7a37bc7f97c3d8ba6cb560f529f7ec148199 \
+          && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 ]] \
+        || fail "SE2-P8 frozen GE master identity or crypto postimage changed"
+    fi
+    [[ "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PIN_REGISTERED_SUBMODULE_COUNT" == "$expected_se2_submodules" \
+        && "$PIN_GITLINK_COUNT" == "$expected_se2_submodules" \
+        && "$PIN_UNMAPPED_OPTIONAL_GITLINK_COUNT" == 0 \
+        && "$PIN_STEAMRT_IMAGE" == registry.gitlab.steamos.cloud/proton/steamrt4/sdk/x86_64:4.0.20260714.251823-0 \
+        && "$PIN_STEAMRT_IMAGE_ID" == 01f74089b0ffb6fc127eadca189776ab56461515ba575ff1bfbd66a39d3f753b ]] \
+      || fail "SE2-P8 full-GE components, launcher or retained SDK identity changed"
+    [[ "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}" == fc0e7fccb6862c463fc92487cc8d79c7ccc242cb84c4811712f42c8a863a2c8c \
+        && "${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" == "$expected_se2_dav1d_postimage" \
+        && "${PIN_FFMPEG_RTSPS_PATCH_SHA256:-}" == 4620be1a6b9fae9b1c386ee17b8ef7e2f6f30a20ca32c7fd9534ef0822ec9f25 \
+        && "${PIN_FFMPEG_RTSPS_RTSP_BLOB:-}" == f2927f4a4bf14239c83a63e923e077e4dd68ad47 \
+        && "${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}" == b3669b91b08502e943bd564f3a99bef50d2d54440f8f4cc189e2b0d3b2b14ecb \
+        && "${PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB:-}" == 03dba285f93c762073e6a923be80ae3cca016226 ]] \
+      || fail "SE2-P8 requires its exact AV1, secure RTSP and HTTP seek companions"
+    pinned_ge_dav1d_build_patch >/dev/null
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    selected_module_series=(
+      proposed/0027-winedmo-expose-vp8-and-hevc-decoders.patch
+      proposed/0028-winedmo-bound-published-stream-access.patch
+      proposed/0030-winedmo-check-filter-initialization-failures.patch
+      proposed/0037-winedmo-discard-resampler-delay-on-flush.patch
+      proposed/0038-winedmo-describe-filter-eof-failures.patch
+      proposed/0039-mf-report-terminal-direct-filter-errors.patch
+      proposed/0040-mfmediaengine-remove-uninitialized-topology-cleanup.patch
+      proposed/0029-winedmo-latch-asf-startup-timestamp-decision.patch
+      proposed/0031-winedmo-open-secure-rtsp-tcp-aliases.patch
+      ge-master-20260913-se2-p8/0032-winedmo-classify-http-media-after-probing.patch
+      proposed/0033-winedmo-bound-and-extend-audio-channel-counts.patch
+      proposed/0034-mfmediaengine-honor-ready-source-autoplay.patch
+      proposed/0036-mfmediaengine-guard-audio-only-segment-end.patch
+      proposed/0041-winedmo-allow-supported-hls-audio-containers.patch
+      proposed/0042-winedmo-expose-existing-flac-audio-decoder.patch
+      proposed/0043-mf-rearm-audio-sample-demand-after-flush.patch
+      proposed/0044-mf-initialize-sar-marker-entry-before-copy.patch
+      proposed/0045-mf-reset-seek-eos-and-discriminate-sink-markers.patch
+      ge-master-20260913-se2-p8/0046-mf-tests-preserve-held-marker-context.patch
+      ge-master-20260913-se2-p8/0047-winedmo-expose-ac3-and-eac3-audio-decoding.patch
+    )
+    if [[ "$PIN_ID" != ge-master-20260913-se2-p8 ]]; then
+      selected_module_series+=(proposed/0048-winedmo-expose-existing-dts-alac-and-g711-decoders.patch)
+      selected_module_series+=(proposed/0049-winedmo-expose-existing-mpeg-layer-audio-decoder.patch)
+      if [[ "$PIN_ID" != ge-master-20260913-se2-p9 ]]; then
+        selected_module_series+=(ge-master-20260913-se2-p10/0050-winedmo-expose-existing-mjpeg-video-decoder.patch)
+      else
+        selected_module_series+=(proposed/0050-winedmo-expose-existing-mjpeg-video-decoder.patch)
+      fi
+    fi
+    if [[ "$PIN_ID" == ge-master-20260913-se2-p11 ]]; then
+      selected_module_series+=(proposed/0051-winedmo-expose-existing-mpeg-video-decoders.patch)
+      selected_module_series+=(proposed/0052-winedmo-register-existing-mpeg4-video-aliases.patch)
+      selected_module_series+=(proposed/0053-winedmo-map-exact-h264-es-subtype.patch)
+    elif [[ "$PIN_ID" == ge-master-20260913-se2-p12 || "$PIN_ID" == ge-master-20260913-se2-p13 || "$PIN_ID" == ge-proton11-7-se2-p14 || "$PIN_ID" == ge-proton11-7-se2-p15 || "$PIN_ID" == ge-proton11-7-se2-p16 || "$PIN_ID" == ge-proton11-7-se2-p17 || "$PIN_ID" == ge-proton11-7-se2-p18 || "$PIN_ID" == ge-proton11-7-se2-p19a ]]; then
+      selected_module_series+=(ge-master-20260913-se2-p12/0051-winedmo-expose-existing-mpeg-video-decoders.patch)
+      selected_module_series+=(ge-master-20260913-se2-p12/0052-winedmo-register-existing-mpeg4-video-aliases.patch)
+      selected_module_series+=(proposed/0053-winedmo-map-exact-h264-es-subtype.patch)
+      selected_module_series+=(proposed/0054-winedmo-drain-parser-tail-before-decoder-eos.patch)
+      if [[ "$PIN_ID" == ge-master-20260913-se2-p13 || "$PIN_ID" == ge-proton11-7-se2-p14 || "$PIN_ID" == ge-proton11-7-se2-p15 || "$PIN_ID" == ge-proton11-7-se2-p16 || "$PIN_ID" == ge-proton11-7-se2-p17 || "$PIN_ID" == ge-proton11-7-se2-p18 || "$PIN_ID" == ge-proton11-7-se2-p19a ]]; then
+        selected_module_series+=(proposed/0055-mfmediaengine-wait-for-renderer-drain-before-ended.patch)
+        selected_module_series+=(proposed/0056-winedmo-preserve-vc1-input-timestamp-origin.patch)
+        if [[ "$PIN_ID" == ge-proton11-7-se2-p15 ]]; then
+          selected_module_series+=(
+            proposed/0057-mfmediaengine-request-video-samples-on-clock.patch
+            proposed/0058-mfmediaengine-share-immediate-seek-policy.patch
+            proposed/0059-winedmo-probe-site-specific-hls-paths.patch
+            proposed/0060-media-trace-bounded-attribution-counters.patch
+          )
+        elif [[ "$PIN_ID" == ge-proton11-7-se2-p16 || "$PIN_ID" == ge-proton11-7-se2-p17 || "$PIN_ID" == ge-proton11-7-se2-p18 || "$PIN_ID" == ge-proton11-7-se2-p19a ]]; then
+          selected_module_series+=(
+            proposed/0057-mfmediaengine-request-video-samples-on-clock.patch
+            proposed/0058-mfmediaengine-share-immediate-seek-policy.patch
+            proposed/0060-media-trace-bounded-attribution-counters.patch
+            proposed/0061-winedmo-preserve-demuxed-video-timestamps.patch
+          )
+          if [[ "$PIN_ID" == ge-proton11-7-se2-p17 || "$PIN_ID" == ge-proton11-7-se2-p18 || "$PIN_ID" == ge-proton11-7-se2-p19a ]]; then
+            selected_module_series[-1]=proposed/0061-winedmo-preserve-demuxed-video-timestamps-v2.patch
+          fi
+          if [[ "$PIN_ID" == ge-proton11-7-se2-p18 || "$PIN_ID" == ge-proton11-7-se2-p19a ]]; then
+            selected_module_series+=(proposed/0062-winedmo-use-zero-based-parser-byte-position.patch)
+          fi
+          if [[ "$PIN_ID" == ge-proton11-7-se2-p19a ]]; then
+            selected_module_series+=(
+              ge-proton11-7-se2-p19a/0063-sr5-terminal-reader-errors.patch
+              ge-proton11-7-se2-p19a/0064-sr3-propagate-output-layout.patch
+              ge-proton11-7-se2-p19a/0065-sr1-preserve-source-timestamps.patch
+              ge-proton11-7-se2-p19a/0066-sr4-forward-reconnect-events.patch
+              ge-proton11-7-se2-p19a/0067-sr6-complete-prestart-flush.patch
+              ge-proton11-7-se2-p19a/0068-sr2-preserve-leading-mp4-audio.patch
+              ge-proton11-7-se2-p19a/0069-session-retain-stopped-sink-demand.patch
+            )
+          fi
+          [[ "${PIN_FFMPEG_MPEGVIDEO_PATCH_SHA256:-}" == df53226a6d21f40b3337b5a6b38daada83ae216a76d2323e503c382dd5f620f1 \
+              && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 10724217d239068e71a57ce806936c91518fc501 ]] \
+            || fail "P16 requires its exact MPEGVIDEO parser companion"
+          pinned_ge_mpegvideo_build_patch >/dev/null
+        fi
+      fi
+    fi
+    ;;
+  ge-proton11-9-se2-p20|ge-proton11-9-se2-p21|ge-proton11-9-se2-p22|ge-proton11-9-se2-p23|ge-proton11-9-se2-p24|ge-proton11-9-se2)
+    # Fresh, source-reviewed GE11-9 residual composition. Bind every pin field
+    # and companion postimage without inheriting an older candidate profile.
+    SELECTED_PROFILE="${PIN_ID##*-}"
+    selected_pin_sha256=05f43b644f619e07b0d55de8a8d1169422c0dbd147f048837dda47dcc099e522
+    selected_residual_digest=58945b0803e0fa65e1e7807ac72c517e98f917b651bfed74c7b7b10de965937d
+    if [[ "$SELECTED_PROFILE" == p21 ]]; then
+      selected_pin_sha256=7d7dcd9901bfdbfec2a4a848033396f49f6f197d5874eb569c9d0c8ef5b09151
+      selected_residual_digest=41b325bb83b1c9c9637b1573ffc34f8012855b16dd2a03cf7d13a3d1a6e1e66f
+    elif [[ "$SELECTED_PROFILE" == p22 ]]; then
+      selected_pin_sha256=75990d9bd53b136a352ac7000ae8f963f014f0f3991fe074016336fcbeff0edb
+      selected_residual_digest=697eddec068dceb8276ed4677f9852b0eeebe6d261f630078a16b80e20d13ce8
+    elif [[ "$SELECTED_PROFILE" == p23 ]]; then
+      selected_pin_sha256=902b296f3eaf0c425febad727018f3b271a7eca3004458a1cdd4910fbaa1c1ca
+      selected_residual_digest=0944b6a012793b03e9937baf30e79d890e425d7e6280f7fb7bcbd7649df6a8ff
+    elif [[ "$SELECTED_PROFILE" == p24 ]]; then
+      selected_pin_sha256=ddb7183ee86ab34a73fd2b1c1d07e5efa6f428f9e6e7e27330497659daf18b7c
+      selected_residual_digest=dd9c1ea4563140dde394d7ad628ff5c37b89014e3d2a81edd84ada4d7ae2ee90
+    elif [[ "$SELECTED_PROFILE" == se2 ]]; then
+      # SE2 release: P24 content (series references the P24 patch files), release identity.
+      selected_pin_sha256=0ef5401d156ee4a4b2cf5aa9b1eff7468f1297000f5096f931c7c56359b37e67
+      selected_residual_digest=fa18c907344c727af11e03751f1cae19b538680f8d6c3274fda58afb48c19bb2
+    fi
+    selected_build_name="proton-ge-11-9-rtsp-se2-$SELECTED_PROFILE"
+    [[ "$SELECTED_PROFILE" != se2 ]] || selected_build_name=proton-ge-11-9-rtsp-se2
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" \
+          == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == "$selected_build_name" \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-9 \
+        && "$PIN_SOURCE_COMMIT" == 01bfbf67b35418fdd705f2be09e0bfb43eece24b \
+        && "$PIN_SOURCE_TREE" == 465a332291b33655c8bfacf94ab8ac0f2779551e \
+        && "$PIN_WINE_COMMIT" == 981e2f0b9007fd70a6e0ed6119cb18f4164e26f9 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-9 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    # The AAC parser build module belongs to P24 alone; P20-P23 stay immutable
+    # without it, and P24 must carry exactly the reviewed patch and postimage.
+    if [[ "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 ]]; then
+      [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+          && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == db09146eb92a83607657e98c2c00958c0740ecc8 \
+          && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 16a91ff3b5bc37d419846ed4eefd435cef58914c ]] \
+        || fail "P24 requires its exact AAC parser build module after the P23 MPEGVIDEO module"
+      pinned_ge_aac_parser_build_patch >/dev/null
+    else
+      [[ -z "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" ]] \
+        || fail "$PIN_ID is immutable and must not carry the AAC parser build module"
+    fi
+    ;;
   *)
     fail "verify-preparation does not recognize selected pin $PIN_ID"
     ;;
 esac
+if [[ "$SELECTED_PROFILE" == p19b ]]; then
+  [[ "${PIN_FFMPEG_MPEGVIDEO_PATCH_SHA256:-}" == df53226a6d21f40b3337b5a6b38daada83ae216a76d2323e503c382dd5f620f1 \
+      && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 10724217d239068e71a57ce806936c91518fc501 \
+      && "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" == 1248a7b99c46334561a49327ff2fab1e73509879c8f6fa20cf78140dace71d1f \
+      && "${PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB:-}" == d7e57933651be43fd9ce994533685b9363a35794 \
+      && "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" == 1ea7513c3149c955b26bc708a373bf1b902e255cadb667a9a6f9279763790418 \
+      && "${PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB:-}" == 1d2ce08e3e8aa4fad866e82007e57e8c564afe7c ]] \
+    || fail "P19b requires its reviewed parser, failed-seek filesize and early HLS seek companions"
+  pinned_ge_mpegvideo_build_patch >/dev/null
+  pinned_ge_http_filesize_patch >/dev/null
+  pinned_ge_hls_early_seek_patch >/dev/null
+fi
 [[ "$PIN_PACKAGE_RELEASE" == 0 ]] \
   || fail "selected game-test series must remain PACKAGE_RELEASE=0"
-[[ "$PIN_DEFAULT_JOBS" == 16 && "$PIN_DEFAULT_MAKE_JOBS" == 8 \
+expected_default_jobs=16
+expected_default_make_jobs=8
+if [[ "$PIN_ID" == ge-proton11-7-se2-p16 || "$PIN_ID" == ge-proton11-7-se2-p17 || "$PIN_ID" == ge-proton11-7-se2-p18 || "$PIN_ID" == ge-proton11-7-se2-p19a || "$PIN_ID" == ge-proton11-7-se2-p19b || "$PIN_ID" == ge-proton11-7-se2-p19b2 || "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 ]]; then
+  expected_default_jobs=8
+  expected_default_make_jobs=4
+fi
+[[ "$PIN_DEFAULT_JOBS" == "$expected_default_jobs" && "$PIN_DEFAULT_MAKE_JOBS" == "$expected_default_make_jobs" \
     && "$PIN_DEFAULT_NINJA_JOBS" == 2 ]] \
-  || fail "full-system scheduler defaults are not global=16, Make=8, Ninja=2"
+  || fail "scheduler defaults differ from this candidate's reviewed CPU budget"
 [[ "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
     && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 ]] \
   || fail "selected shared component pins differ from the reviewed GE delta"
 default_schedule="$(pinned_ge_resolve_job_schedule \
   "$PIN_DEFAULT_JOBS" "" "")"
-[[ "$default_schedule" == $'16\t8\t2\t16' ]] \
-  || fail "default scheduler decomposition is not 8x2 within global budget 16"
+expected_schedule="$(printf '%s\t%s\t2\t%s' "$expected_default_jobs" "$expected_default_make_jobs" "$expected_default_jobs")"
+[[ "$default_schedule" == "$expected_schedule" ]] \
+  || fail "default scheduler decomposition differs from the selected CPU budget"
 lower_schedule="$(pinned_ge_resolve_job_schedule 4 "" "")"
 [[ "$lower_schedule" == $'4\t4\t1\t4' ]] \
   || fail "lower global budget did not derive a conservative schedule"
@@ -421,7 +694,8 @@ if [[ -e "$prepared_source/wine/.git" \
 else
   printf 'NOTE: complete pinned prepared tree is unavailable; live media provenance check skipped.\n'
 fi
-printf 'Pinned scheduler uses global=16, Make=8, Ninja=2 and rejects product overflow.\n'
+printf 'Pinned scheduler uses global=%s, Make=%s, Ninja=%s and rejects product overflow.\n' \
+  "$PIN_DEFAULT_JOBS" "$PIN_DEFAULT_MAKE_JOBS" "$PIN_DEFAULT_NINJA_JOBS"
 series_entries="$(pinned_ge_series_entries \
   "$ROOT_DIR/patches" "$PATCH_SERIES")"
 [[ -n "$series_entries" ]] || fail "pinned Alpha patch series is empty"
@@ -443,7 +717,28 @@ expected_base_series=(
   experimental/0017-winedmo-propagate-terminal-network-read-errors.patch
   experimental/0018-winewayland-advertise-wine-vr-device-extensions.patch
 )
-if [[ "$SELECTED_PROFILE" == a319 || "$SELECTED_PROFILE" == a320 || "$SELECTED_PROFILE" == a321 || "$SELECTED_PROFILE" == a322 || "$SELECTED_PROFILE" == a323 ]]; then
+if [[ "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 ]]; then
+  # Digest covers every ordered residual path AND every patch byte; no count
+  # or historical patch basename can stand in for this composition identity.
+  [[ "$(pinned_ge_series_digest "$ROOT_DIR/patches" "$PATCH_SERIES")" \
+      == "$selected_residual_digest" ]] \
+    || fail "$PIN_ID requires its exact reviewed GE-Proton11-9 residual composition"
+  expected_base_series=()
+elif [[ "$SELECTED_PROFILE" == p19b ]]; then
+  # Bind every ordered path AND patch byte to the reviewed clean composition.
+  # This replaces only P19b's legacy diagnostic-series list, not other profiles.
+  expected_p19b_count=69
+  expected_p19b_digest=9b50b6f64e71c26969c8cace8a4e283034deb5a3504c39aa47fadec170855228
+  if [[ "$PIN_ID" == ge-proton11-7-se2-p19b2 ]]; then
+    expected_p19b_count=70
+    expected_p19b_digest=c3e368014b33e0697d0d091306c863dd6d90fdbf017d72f425d4c470cc4c7ae3
+  fi
+  [[ "${#series_paths[@]}" == "$expected_p19b_count" \
+      && "$(pinned_ge_series_digest "$ROOT_DIR/patches" "$PATCH_SERIES")" \
+        == "$expected_p19b_digest" ]] \
+    || fail "$PIN_ID requires its exact reviewed $expected_p19b_count-patch diagnostic-free composition"
+  expected_base_series=()
+elif [[ "$SELECTED_PROFILE" == a319 || "$SELECTED_PROFILE" == a320 || "$SELECTED_PROFILE" == a321 || "$SELECTED_PROFILE" == a322 || "$SELECTED_PROFILE" == a323 ]]; then
   expected_base_series=("${expected_base_series[@]/experimental\//ge-proton11-6/}")
   expected_base_series+=(ge-proton11-6/0020-quiet-ge-media-diagnostics.patch)
   if [[ "$SELECTED_PROFILE" == a320 || "$SELECTED_PROFILE" == a321 || "$SELECTED_PROFILE" == a322 || "$SELECTED_PROFILE" == a323 ]]; then
@@ -459,7 +754,7 @@ if [[ "$SELECTED_PROFILE" == a319 || "$SELECTED_PROFILE" == a320 || "$SELECTED_P
     if [[ "$SELECTED_PROFILE" == a323 ]]; then
       expected_base_series+=(ge-proton11-6-a323/0026-mf-replenish-output-buffers-after-preroll.patch)
     fi
-    expected_series_count=$((${#expected_base_series[@]} + 1))
+    expected_series_count=$((${#expected_base_series[@]} + 1 + ${#selected_module_series[@]}))
     [[ "${#series_paths[@]}" == "$expected_series_count" ]] \
       || fail "$PIN_ID requires the reviewed $expected_series_count-patch GE-Proton11-6 series"
     if [[ "$SELECTED_PROFILE" == a321 || "$SELECTED_PROFILE" == a322 || "$SELECTED_PROFILE" == a323 ]]; then
@@ -472,9 +767,13 @@ if [[ "$SELECTED_PROFILE" == a319 || "$SELECTED_PROFILE" == a320 || "$SELECTED_P
       || fail "A3.19 requires the seventeen-patch GE-Proton11-6 series"
   fi
   expected_base_series+=(ge-proton11-6/0019-winedmo-trace-bounded-rtsp-drain-state.patch)
+  expected_base_series+=("${selected_module_series[@]}")
 else
   [[ "${#series_paths[@]}" == 15 || "${#series_paths[@]}" == 16 ]] \
     || fail "historical pin requires its 15/16-patch series; select --series patches/series-ge-proton11-3"
+fi
+if [[ "$PIN_ID" == ge-master-20260913-se2-p13 || "$PIN_ID" == ge-proton11-7-se2-p14 || "$PIN_ID" == ge-proton11-7-se2-p15 || "$PIN_ID" == ge-proton11-7-se2-p16 || "$PIN_ID" == ge-proton11-7-se2-p17 || "$PIN_ID" == ge-proton11-7-se2-p18 || "$PIN_ID" == ge-proton11-7-se2-p19a ]]; then
+  expected_base_series[12]=ge-master-20260913-se2-p13/0015-mf-order-immediate-replacement-start.patch
 fi
 for index in "${!expected_base_series[@]}"; do
   [[ "${series_paths[$index]}" == "${expected_base_series[$index]}" ]] \
@@ -565,7 +864,7 @@ rg -Fq 'pinned_ge_require_ffmpeg_config_surface' \
   "$ROOT_DIR/scripts/verify-pinned-ge-artifact.sh" \
   || fail "artifact verifier does not invoke the exact FFmpeg surface gate"
 crypto_build_record="$(pinned_ge_ffmpeg_crypto_build_patch_record \
-  "$ROOT_DIR/patches/ffmpeg-build" "$ROOT_DIR/patches/ffmpeg-build/series")"
+  "$ROOT_DIR/patches/ffmpeg-build" "$(pinned_ge_ffmpeg_crypto_build_series)")"
 [[ "$(wc -l <<<"$crypto_build_record")" == 1 ]] \
   || fail "FFmpeg crypto-build series must remain exactly one pinned patch"
 for tls_backend_fact in \
@@ -683,12 +982,21 @@ if printf 'https://vrchat.com/home/launch?worldId=fixture\n' \
     | rg --pcre2 -q -i "$PROJECT_HOME_PATTERN"; then
   fail "project privacy gate mistakes an HTTPS path for a local home path"
 fi
-if privacy_matches="$(git -C "$ROOT_DIR" grep -I -n -i -P \
-    "$PROJECT_HOME_PATTERN" -- . \
+if privacy_candidates="$(git -C "$ROOT_DIR" grep -I -n -i -E \
+    '/home/|/Users/' -- . \
     ':!scripts/verify-preparation.sh' \
     ':!scripts/verify-pinned-ge-artifact.sh')"; then
-  printf '%s\n' "$privacy_matches" >&2
-  fail "personal absolute path found in project-facing text"
+  # Some Nix Git builds omit PCRE. Keep the same tracked-text/privacy scope,
+  # using the already-required ripgrep PCRE engine for the precise predicate.
+  if privacy_matches="$(printf '%s\n' "$privacy_candidates" \
+      | rg --pcre2 -i "$PROJECT_HOME_PATTERN")"; then
+    printf '%s\n' "$privacy_matches" >&2
+    fail "personal absolute path found in project-facing text"
+  else
+    privacy_status=$?
+    [[ "$privacy_status" == 1 ]] \
+      || fail "could not filter tracked public text for personal paths"
+  fi
 else
   privacy_status=$?
   [[ "$privacy_status" == 1 ]] \
@@ -700,10 +1008,30 @@ python3 "$ROOT_DIR/tests/sar-flush-control/test_model.py" >/dev/null
 python3 "$ROOT_DIR/tests/clock-start-control/test_model.py" >/dev/null
 python3 "$ROOT_DIR/tests/pcm-probe-control/test_model.py" >/dev/null
 python3 "$ROOT_DIR/tests/tooling/test_launcher_policy.py" >/dev/null
+python3 "$ROOT_DIR/tests/tooling/test_preparation_profile.py" >/dev/null
+python3 "$ROOT_DIR/tests/tooling/test_p19a_profile.py" >/dev/null
+python3 "$ROOT_DIR/tests/tooling/test_p19b_profile.py" >/dev/null
+python3 "$ROOT_DIR/tests/tooling/test_p19b2_profile.py" >/dev/null
+python3 "$ROOT_DIR/tests/tooling/test_p21_profile.py" >/dev/null
+python3 "$ROOT_DIR/tests/tooling/test_p22_profile.py" >/dev/null
+python3 "$ROOT_DIR/tests/tooling/test_crypto_series_selection.py" >/dev/null
+python3 "$ROOT_DIR/tests/tooling/test_container_cpu_budget.py" >/dev/null
+python3 "$ROOT_DIR/tests/tooling/test_ge119_hls_classification.py" >/dev/null
+python3 "$ROOT_DIR/tests/network-terminal-error/test_seek_policy.py" >/dev/null
+python3 "$ROOT_DIR/tests/tooling/test_wine_added_files.py" >/dev/null
+python3 "$ROOT_DIR/tests/tooling/test_wine_fresh_setup.py" >/dev/null
+python3 "$ROOT_DIR/tests/wine-header-compile/test_fresh_setup.py" >/dev/null
 python3 "$ROOT_DIR/tests/avpro-audio-state/test_model.py" >/dev/null
 python3 "$ROOT_DIR/tests/media-engine-pause-scrub/test_model.py" >/dev/null
 python3 "$ROOT_DIR/tests/source-replacement-lifecycle/test_model.py" --series "$PATCH_SERIES" >/dev/null
-if [[ "$SELECTED_PROFILE" == a319 || "$SELECTED_PROFILE" == a320 || "$SELECTED_PROFILE" == a321 || "$SELECTED_PROFILE" == a322 || "$SELECTED_PROFILE" == a323 ]]; then
+if [[ ( "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 ) && -n "${PREPARED_SOURCE:-}" ]]; then
+  # The consolidated series retains the source contracts, not the old patch
+  # filenames. Audit their actual postimages; no runtime oracle is changed.
+  bash "$ROOT_DIR/scripts/audit-patched-wine.sh" \
+    --wine-tree "$prepared_source/wine" --series "$PATCH_SERIES" \
+    --require-alpha-series --require-a312-series >/dev/null
+fi
+if [[ "$SELECTED_PROFILE" == a319 || "$SELECTED_PROFILE" == a320 || "$SELECTED_PROFILE" == a321 || "$SELECTED_PROFILE" == a322 || "$SELECTED_PROFILE" == a323 || "$SELECTED_PROFILE" == p19b ]]; then
   integration_source_args=()
   if [[ -n "${PREPARED_SOURCE:-}" ]]; then
     [[ -f "$prepared_source/wine/dlls/mf/session.c" \
@@ -715,7 +1043,7 @@ if [[ "$SELECTED_PROFILE" == a319 || "$SELECTED_PROFILE" == a320 || "$SELECTED_P
   fi
   python3 "$ROOT_DIR/tests/ge-proton11-6/test_integration.py" \
     "${integration_source_args[@]}" >/dev/null
-  if [[ "$SELECTED_PROFILE" == a320 || "$SELECTED_PROFILE" == a321 || "$SELECTED_PROFILE" == a322 || "$SELECTED_PROFILE" == a323 ]]; then
+  if [[ "$SELECTED_PROFILE" == a320 || "$SELECTED_PROFILE" == a321 || "$SELECTED_PROFILE" == a322 || "$SELECTED_PROFILE" == a323 || "$SELECTED_PROFILE" == p19b ]]; then
     for regression in test_seek_restart.py test_frame_tick.py test_recovery_seek.py; do
       python3 "$ROOT_DIR/tests/vod-control/$regression" \
         "${integration_source_args[@]}" >/dev/null
@@ -723,9 +1051,27 @@ if [[ "$SELECTED_PROFILE" == a319 || "$SELECTED_PROFILE" == a320 || "$SELECTED_P
     python3 "$ROOT_DIR/tests/network-terminal-error/test_seek_failure.py" \
       "${integration_source_args[@]}" >/dev/null
   fi
-  if [[ "$SELECTED_PROFILE" == a323 ]]; then
+  if [[ "$SELECTED_PROFILE" == a323 || "$SELECTED_PROFILE" == p19b ]]; then
     python3 "$ROOT_DIR/tests/vod-control/test_preroll_buffers.py" \
       "${integration_source_args[@]}" >/dev/null
+  fi
+  if [[ ( "$PIN_ID" == ge-master-20260913-se2-p8 || "$PIN_ID" == ge-master-20260913-se2-p9 || "$PIN_ID" == ge-master-20260913-se2-p10 || "$PIN_ID" == ge-master-20260913-se2-p11 || "$PIN_ID" == ge-master-20260913-se2-p12 || "$PIN_ID" == ge-master-20260913-se2-p13 || "$PIN_ID" == ge-proton11-7-se2-p14 || "$PIN_ID" == ge-proton11-7-se2-p15 || "$PIN_ID" == ge-proton11-7-se2-p16 || "$PIN_ID" == ge-proton11-7-se2-p17 || "$PIN_ID" == ge-proton11-7-se2-p18 || "$PIN_ID" == ge-proton11-7-se2-p19a || "$SELECTED_PROFILE" == p19b ) && -n "${PREPARED_SOURCE:-}" ]]; then
+    python3 "$ROOT_DIR/tests/progressive-http-vod/test_http_policy_audit.py" \
+      "${integration_source_args[@]}" >/dev/null
+    master_test_cc="${PREPARATION_TEST_CC:-$(command -v cc || true)}"
+    if [[ -n "$master_test_cc" ]]; then
+      master_control_args=()
+      if [[ "$SELECTED_PROFILE" == p19b ]]; then
+        master_control_args=(--sar-demand-patch "$ROOT_DIR/patches/ge-proton11-7-se2-p19b/0043-mf-rearm-audio-sample-demand-after-flush.patch")
+      fi
+      python3 "$ROOT_DIR/tests/session-seek-eos/test_master_controls.py" \
+        "${integration_source_args[@]}" --cc "$master_test_cc" "${master_control_args[@]}" >/dev/null
+    else
+      printf 'NOTE: native compiler unavailable; P8 master lifecycle controls skipped (set PREPARATION_TEST_CC).\n'
+    fi
+    # Dolby and held-marker tests start from pre-patch controls, not this
+    # already integrated tree. Their separate qualification receipts remain
+    # required; passing a patched tree would destroy those negative controls.
   fi
 fi
 PYTHONDONTWRITEBYTECODE=1 \
@@ -739,5 +1085,32 @@ bash "$ROOT_DIR/tests/tooling/submodule-reference.sh"
 bash "$ROOT_DIR/tests/tooling/prefetch-build-contrib.sh"
 python3 "$ROOT_DIR/tests/tooling/test_upstream_component.py"
 python3 "$ROOT_DIR/tests/tooling/test_media_provenance.py"
+python3 "$ROOT_DIR/tests/tooling/test_master_media_cleanup.py"
+python3 "$ROOT_DIR/tests/tooling/test_master_mono_preparation.py"
+python3 "$ROOT_DIR/tests/tooling/test_nvml_build_input.py"
+python3 "$ROOT_DIR/tests/tooling/test_low_latency_manifest.py"
+python3 "$ROOT_DIR/tests/tooling/test_artifact_privacy.py"
+if [[ ${#selected_module_series[@]} -gt 0 ]]; then
+  # These regressions deliberately start with the unchanged SE1 control,
+  # not the selected (already patched) candidate. Source availability remains
+  # optional, as for the existing preparation source-contract tests.
+  module_reference_source="$ROOT_DIR/worktrees/ge-proton11-6-se1-rtsp"
+  if [[ -e "$module_reference_source/.git" \
+      && -f "$module_reference_source/Makefile.in" ]]; then
+    python3 "$ROOT_DIR/tests/tooling/test_full_ge_components.py" \
+      --source "$module_reference_source"
+    python3 "$ROOT_DIR/tests/tooling/test_dav1d_build_module.py" \
+      --source "$module_reference_source"
+    module_make="$(command -v make || true)"
+    if [[ -n "$module_make" && "$("$module_make" --version)" == *"GNU Make"* ]]; then
+      python3 "$ROOT_DIR/tests/tooling/test_nvidia_build_rules.py" \
+        --source "$module_reference_source" --make "$module_make"
+    else
+      printf 'NOTE: GNU Make is unavailable; NVIDIA job-bound macro fixture skipped.\n'
+    fi
+  else
+    printf 'NOTE: unchanged SE1 source is unavailable; full-GE/AV1/NVIDIA reference regressions skipped.\n'
+  fi
+fi
 
 printf 'Preparation checks passed without building Proton.\n'

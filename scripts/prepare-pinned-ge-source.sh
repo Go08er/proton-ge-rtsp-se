@@ -5,6 +5,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=pinned-ge-common.sh
 source "$ROOT_DIR/scripts/pinned-ge-common.sh"
+# shellcheck source=pinned-ge-source-inputs.sh
+source "$ROOT_DIR/scripts/pinned-ge-source-inputs.sh"
 
 SOURCE_DIR=""
 STATE_DIR=""
@@ -75,6 +77,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 pinned_ge_load_config
+FFMPEG_CRYPTO_BUILD_PATCH_SERIES="$(pinned_ge_ffmpeg_crypto_build_series)"
 [[ -n "$SOURCE_DIR" ]] || SOURCE_DIR="$(pinned_ge_default_source)"
 [[ -n "$STATE_DIR" ]] || STATE_DIR="$(pinned_ge_default_state_dir)"
 SOURCE_DIR="$(realpath -m -- "$SOURCE_DIR")"
@@ -90,8 +93,16 @@ done
 pinned_ge_require_source_identity "$SOURCE_DIR"
 pinned_ge_require_original_build_rules "$SOURCE_DIR"
 pinned_ge_require_registered_submodules "$SOURCE_DIR"
-[[ -z "$(pinned_ge_git -C "$SOURCE_DIR" status --porcelain --untracked-files=all)" ]] \
-  || pinned_ge_fail "pinned GE source must be pristine before patch preparation"
+CONTRIB_MANIFEST=""
+if pinned_ge_has_mono_source "$SOURCE_DIR"; then
+  # Newer GE prepares Wine-Mono before applying Wine patches. Its archive must
+  # already be present: accept only the existing manifest's verified inputs.
+  CONTRIB_MANIFEST="$(pinned_ge_build_contrib_manifest_path)"
+  pinned_ge_require_pristine_with_contrib "$SOURCE_DIR" "$CONTRIB_MANIFEST"
+else
+  [[ -z "$(pinned_ge_git -C "$SOURCE_DIR" status --porcelain --untracked-files=all)" ]] \
+    || pinned_ge_fail "pinned GE source must be pristine before patch preparation"
+fi
 
 series_digest="$(pinned_ge_series_digest "$PATCH_ROOT" "$PATCH_SERIES")"
 ffmpeg_security_series_digest=""
@@ -151,7 +162,9 @@ text = text.replace("#!/bin/bash\n", "#!/usr/bin/env bash\nset -euo pipefail\n",
 patch_call = "patch -Np1 <"
 if text.count(patch_call) != 2:
     raise SystemExit("expected exactly two GE patch command forms")
-text = text.replace(patch_call, "patch -Np1 --batch <")
+# Offset application must not leave untracked .orig files in GE components.
+# Keep the strict postimage/untracked-file build checks; only suppress backups.
+text = text.replace(patch_call, "patch -Np1 --batch --no-backup-if-mismatch <")
 
 protonfixes_call = '    apply_all_in_dir "../patches/protonfixes/"\n'
 if text.count(protonfixes_call) != 1:
@@ -270,6 +283,34 @@ if [[ "$PIN_SCHEMA_VERSION" == 5 ]]; then
     printf 'application\tpassed\n'
   } >"$FFMPEG_CRYPTO_BUILD_AUDIT"
   chmod 0644 "$FFMPEG_CRYPTO_BUILD_AUDIT"
+  # Keep the crypto patch and its intermediate postimage immutable. The optional
+  # decoder module has a separately pinned patch and whole-file final postimage.
+  if [[ -n "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}" ]]; then
+    dav1d_patch="$(pinned_ge_dav1d_build_patch)"
+    pinned_ge_git -C "$SOURCE_DIR" apply --check --whitespace=error-all -- "$dav1d_patch"
+    pinned_ge_git -C "$SOURCE_DIR" apply --whitespace=error-all -- "$dav1d_patch"
+    [[ "$(pinned_ge_git -C "$SOURCE_DIR" hash-object --no-filters -- Makefile.in)" \
+        == "$PIN_FFMPEG_DAV1D_MAKEFILE_BLOB" ]] \
+      || pinned_ge_fail "dav1d-enabled Makefile differs from its pin"
+  fi
+  if [[ -n "${PIN_FFMPEG_MPEGVIDEO_PATCH_SHA256:-}" ]]; then
+    mpegvideo_patch="$(pinned_ge_mpegvideo_build_patch)"
+    pinned_ge_git -C "$SOURCE_DIR" apply --check --whitespace=error-all -- "$mpegvideo_patch"
+    pinned_ge_git -C "$SOURCE_DIR" apply --whitespace=error-all -- "$mpegvideo_patch"
+    # Compare with this module's own postimage: a later module (AAC parser)
+    # may make a different blob the final one. Identical for pins without it.
+    [[ "$(pinned_ge_git -C "$SOURCE_DIR" hash-object --no-filters -- Makefile.in)" \
+        == "$PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB" ]] \
+      || pinned_ge_fail "MPEGVIDEO-enabled Makefile differs from its pin"
+  fi
+  if [[ -n "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" ]]; then
+    aac_parser_patch="$(pinned_ge_aac_parser_build_patch)"
+    pinned_ge_git -C "$SOURCE_DIR" apply --check --whitespace=error-all -- "$aac_parser_patch"
+    pinned_ge_git -C "$SOURCE_DIR" apply --whitespace=error-all -- "$aac_parser_patch"
+    [[ "$(pinned_ge_git -C "$SOURCE_DIR" hash-object --no-filters -- Makefile.in)" \
+        == "$(pinned_ge_ffmpeg_final_makefile_blob)" ]] \
+      || pinned_ge_fail "AAC-parser-enabled Makefile differs from its pin"
+  fi
 fi
 
 [[ -f "$GE_DIFF_CHECK_BASELINE" && ! -L "$GE_DIFF_CHECK_BASELINE" ]] \
@@ -366,7 +407,13 @@ rg -Fq 'ninja -j"$$(NINJA_JOBS)" -C "$$($(2)_$(3)_OBJ)" install' \
   "$BUILD_RULES" \
   || pinned_ge_fail "Meson/Ninja job normalization is absent"
 
-root_state_digest="$(pinned_ge_repo_state_digest "$SOURCE_DIR")"
+pinned_ge_nvidia_build_rules "$SOURCE_DIR" normalize
+
+root_state_digest="$(pinned_ge_repo_state_digest "$SOURCE_DIR" "$CONTRIB_MANIFEST")"
+wine_mono_source_digest=""
+if pinned_ge_has_mono_source "$SOURCE_DIR"; then
+  wine_mono_source_digest="$(pinned_ge_mono_source_digest "$SOURCE_DIR")"
+fi
 wine_state_digest="$(pinned_ge_repo_state_digest "$SOURCE_DIR/wine")"
 ffmpeg_state_digest=""
 if [[ "$PIN_SCHEMA_VERSION" == 5 ]]; then
@@ -445,6 +492,7 @@ source_realpath="$(cd "$SOURCE_DIR" && pwd -P)"
       "$PIN_FFMPEG_SECURITY_MAGICYUV_BLOB"
     printf 'ffmpeg_security_tls_version_blob\t%s\n' \
       "$PIN_FFMPEG_SECURITY_TLS_VERSION_BLOB"
+    pinned_ge_ffmpeg_playback_records
     printf 'ffmpeg_crypto_build_origin\t%s\n' \
       "$PIN_FFMPEG_CRYPTO_BUILD_ORIGIN"
     printf 'ffmpeg_crypto_build_patch_sha256\t%s\n' \
@@ -482,6 +530,9 @@ source_realpath="$(cd "$SOURCE_DIR" && pwd -P)"
   printf 'upstream_rules_meson_sha256\t%s\n' "$PIN_RULES_MESON_SHA256"
   printf 'normalized_rules_meson_sha256\t%s\n' "$normalized_rules_sha256"
   printf 'root_repo_state_sha256\t%s\n' "$root_state_digest"
+  if [[ -n "$wine_mono_source_digest" ]]; then
+    printf 'wine_mono_source_sha256\t%s\n' "$wine_mono_source_digest"
+  fi
   printf 'wine_repo_state_sha256\t%s\n' "$wine_state_digest"
   if [[ "$PIN_SCHEMA_VERSION" == 5 ]]; then
     printf 'ffmpeg_repo_state_sha256\t%s\n' "$ffmpeg_state_digest"

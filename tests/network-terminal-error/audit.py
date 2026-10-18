@@ -6,6 +6,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+from seek_policy import check_seek_ownership, ordered
+
 
 def fail(message: str) -> None:
     raise SystemExit(f"network terminal-error audit failed: {message}")
@@ -31,12 +33,12 @@ def forbid(body: str, needle: str, message: str) -> None:
 
 
 def require_order(body: str, *needles: str) -> None:
-    missing = [needle for needle in needles if needle not in body]
-    if missing:
-        fail(f"required ordering term is absent: {missing[0]}")
-    positions = [body.index(needle) for needle in needles]
-    if positions != sorted(positions):
-        fail(f"required order changed: {' -> '.join(needles)}")
+    # The source mutex is reacquired both before and after the native seek.
+    # Consume occurrences in order instead of repeatedly matching the first.
+    try:
+        ordered(body, *needles)
+    except ValueError as exc:
+        fail(str(exc))
 
 
 def read(root: Path, relative: str) -> str:
@@ -55,6 +57,10 @@ def main() -> None:
     source = read(root, "dlls/winedmo/media_source.c")
     session = read(root, "dlls/mf/session.c")
     engine = read(root, "dlls/mfmediaengine/main.c")
+    try:
+        seek_policy = check_seek_ownership(source, unix)
+    except ValueError as exc:
+        fail(f"seek ownership: {exc}")
 
     packet = region(
         unix,
@@ -126,11 +132,13 @@ def main() -> None:
 
     # A genuine drained demuxer must retain END_OF_FILE ownership. Only the
     # later generic failure branch is eligible for direct-network mapping.
+    filter_errors = "return ret == AVERROR(ENOMEM) ? STATUS_NO_MEMORY : STATUS_DATA_ERROR;" in packet
     require_order(
         packet,
         "input_error = ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN);",
         "if (ret == AVERROR_EOF) return STATUS_END_OF_FILE;",
-        "if (!demuxer->direct_url || !input_error) return STATUS_END_OF_FILE;",
+        ("if (!demuxer->direct_url) return STATUS_END_OF_FILE;" if filter_errors else
+         "if (!demuxer->direct_url || !input_error) return STATUS_END_OF_FILE;"),
         "return STATUS_CONNECTION_DISCONNECTED;",
     )
     require(
@@ -178,7 +186,8 @@ def main() -> None:
         "if (ret == AVERROR_EOF && demuxer->direct_url && demuxer->require_avio_seek)",
         "if (demuxer->direct_url && demuxer->require_avio_seek)",
         "return STATUS_CONNECTION_DISCONNECTED;",
-        "done:\n    demuxer->cancelled_read_pending_recovery = FALSE;",
+        ("done:\n    demuxer->cancelled_read_pending_recovery = FALSE;"
+         if seek_policy in ("interrupt-reuse", "interrupt-fresh") else "done:\n"),
     )
     require_order(
         free_context,
@@ -311,7 +320,23 @@ def main() -> None:
 
     # MediaEngine independently rejects stale-source events, clears all
     # pending transport state, and emits ERROR. It must not synthesize ENDED.
-    error_case = region(engine_events, "case MEError:", "case MEEndOfPresentation:")
+    # Isolate this switch arm, not an unrelated historical EOP handler that
+    # may be absent when Ended is owned exclusively by MESessionEnded.
+    error_case = region(engine_events, "case MEError:", "\n        case ")
+    if filter_errors:
+        # A packet-side change alone is not sufficient: the producer must stop
+        # and both Windows layers must accept the same specific error set.
+        mapping = region(source, "static HRESULT media_source_error_from_demux_status(",
+                         "\nstatic ")
+        for status, error in (("STATUS_DATA_ERROR", "MF_E_INVALID_STREAM_DATA"),
+                              ("STATUS_NO_MEMORY", "E_OUTOFMEMORY")):
+            require(mapping, f"if (status == {status})\n        return {error};",
+                    f"missing terminal mapping for {status}")
+            require(terminal_claim, f"status == {status}", f"producer can retry {status}")
+            require(session_error, f"hr == {error}", f"session drops {error}")
+            require(error_case, f"error != {error}", f"engine drops {error}")
+            require(error_case, f"error == {error}", f"engine misclassifies {error}")
+        require(error_case, "MF_MEDIA_ENGINE_ERR_DECODE", "decode error mapping is absent")
     require(
         error_case,
         "engine->presentation.generation != engine->source_generation",
@@ -328,15 +353,18 @@ def main() -> None:
         "engine->playback_requested = FALSE;",
         "engine->current_seek = NAN;",
         "engine->next_seek = NAN;",
-        "engine->deferred_seek = NAN;",
         "FLAGS_ENGINE_SEEKING",
-        "FLAGS_ENGINE_DEFERRED_SEEK",
         "FLAGS_ENGINE_PLAY_PENDING",
         "FLAGS_ENGINE_PAUSE_PENDING",
         "FLAGS_ENGINE_WAITING",
         "FLAGS_ENGINE_SCRUBBING",
     ):
         require(error_case, state, f"error path does not clear {state}")
+    if "FLAGS_ENGINE_DEFERRED_SEEK" in engine:
+        require(error_case, "engine->deferred_seek = NAN;", "deferred target is not cleared")
+        require(error_case, "FLAGS_ENGINE_DEFERRED_SEEK", "deferred flag is not cleared")
+    else:
+        forbid(engine, "deferred_seek", "partial removal of deferred seek state")
     require(
         error_case,
         "MF_MEDIA_ENGINE_EVENT_ERROR",

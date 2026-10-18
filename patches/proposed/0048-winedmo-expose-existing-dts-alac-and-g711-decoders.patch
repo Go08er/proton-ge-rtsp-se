@@ -1,0 +1,116 @@
+From: RTSP-on-GE contributors
+Subject: [PATCH] winedmo: Expose existing DTS, ALAC and G.711 audio decoders
+
+Admit the exact MF DTS/ALAC and standard G.711 subtypes in the existing
+Wine Audio MFT. Canonicalize FFmpeg's RIFF DTS tag (0x2001) and MOV ALAC
+fourcc to the MF tags, and reverse those tags without changing existing
+RIFF fallback mappings. No new codec, parser, dependency or transport.
+
+DTS and G.711 do not require out-of-band codec data. ALAC retains the
+complete QuickTime atom delivered by FFmpeg and requires its 36-byte
+minimum, matching the pinned decoder. Semantic cookie validation stays in
+FFmpeg; no 24-byte-cookie conversion or parser is introduced. Other
+codec-data requirements and all output/layout/clock/queue paths are unchanged.
+
+diff --git a/dlls/msauddecmft/msauddecmft.c b/dlls/msauddecmft/msauddecmft.c
+--- a/dlls/msauddecmft/msauddecmft.c
++++ b/dlls/msauddecmft/msauddecmft.c
+@@ -35,6 +35,8 @@
+ 
+ DEFINE_MEDIATYPE_GUID(MFAudioFormat_RAW_AAC,WAVE_FORMAT_RAW_AAC1);
+ DEFINE_MEDIATYPE_GUID(MFAudioFormat_ADPCM,WAVE_FORMAT_ADPCM);
++DEFINE_MEDIATYPE_GUID(MFAudioFormat_ALAW,WAVE_FORMAT_ALAW);
++DEFINE_MEDIATYPE_GUID(MFAudioFormat_MULAW,WAVE_FORMAT_MULAW);
+ static const GUID CLSID_WineAudioDecoder = {0x480b1517,0xc8e9,0x4eaf,{0xb0,0x06,0xe6,0x30,0x07,0x18,0xd8,0x5d}};
+ 
+ static HRESULT WINAPI audio_decoder_factory_CreateInstance(IClassFactory *iface, IUnknown *outer,
+@@ -130,6 +132,10 @@
+         {MFMediaType_Audio, MFAudioFormat_FLAC},
+         {MFMediaType_Audio, MFAudioFormat_Dolby_AC3},
+         {MFMediaType_Audio, MFAudioFormat_Dolby_DDPlus},
++        {MFMediaType_Audio, MFAudioFormat_DTS},
++        {MFMediaType_Audio, MFAudioFormat_ALAC},
++        {MFMediaType_Audio, MFAudioFormat_ALAW},
++        {MFMediaType_Audio, MFAudioFormat_MULAW},
+     };
+     MFT_REGISTER_TYPE_INFO audio_decoder_mft_outputs[] =
+     {
+diff --git a/dlls/winedmo/audio_decoder.c b/dlls/winedmo/audio_decoder.c
+--- a/dlls/winedmo/audio_decoder.c
++++ b/dlls/winedmo/audio_decoder.c
+@@ -32,6 +32,10 @@
+ #include "wine/debug.h"
+ #include "wine/winedmo.h"
+ 
++#include "initguid.h"
++DEFINE_MEDIATYPE_GUID(MFAudioFormat_ALAW,WAVE_FORMAT_ALAW);
++DEFINE_MEDIATYPE_GUID(MFAudioFormat_MULAW,WAVE_FORMAT_MULAW);
++
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+ 
+@@ -413,11 +417,17 @@
+         return MF_E_INVALIDMEDIATYPE;
+ 
+     if (wfx.Format.nChannels >= ARRAY_SIZE(default_channel_mask) || !wfx.Format.nSamplesPerSec
+-            /* Dolby sync frames carry their configuration in-band. Other
+-             * inputs retain the existing two-byte codec-data requirement. */
++            /* Dolby/DTS sync frames and G.711 need no out-of-band config.
++             * ALAC needs the 36-byte QuickTime atom consumed by FFmpeg;
++             * keep all other inputs' existing two-byte requirement. */
++            || (IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_ALAC)
++                && wfx.Format.cbSize < 36 + CBSIZE(WAVEFORMATEXTENSIBLE))
+             || (wfx.Format.cbSize < 2 + CBSIZE(WAVEFORMATEXTENSIBLE)
+                 && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_Dolby_AC3)
+-                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_Dolby_DDPlus)))
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_Dolby_DDPlus)
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_DTS)
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_ALAW)
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_MULAW)))
+         return MF_E_INVALIDMEDIATYPE;
+     if (flags & MFT_SET_TYPE_TEST_ONLY)
+         return S_OK;
+@@ -850,6 +860,18 @@
+     {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
+                 .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
+      .SubFormat = {0xa7fb87af,0x2d02,0x42fb,{0xa4,0xd4,0x05,0xcd,0x93,0x84,0x3b,0xdd}}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {WAVE_FORMAT_DTS,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {WAVE_FORMAT_ALAC,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {WAVE_FORMAT_ALAW,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {WAVE_FORMAT_MULAW,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}}},
+ };
+ 
+ HRESULT audio_decoder_create(REFIID riid, void **ret)
+diff --git a/dlls/winedmo/unix_media_type.c b/dlls/winedmo/unix_media_type.c
+--- a/dlls/winedmo/unix_media_type.c
++++ b/dlls/winedmo/unix_media_type.c
+@@ -187,6 +187,9 @@
+ 
+     format_tag = wave_format_tag_from_codec_id( params->codec_id );
+     if (params->codec_id == AV_CODEC_ID_OPUS) format_tag = WAVE_FORMAT_OPUS;
++    /* RIFF DTS uses 0x2001; MOV ALAC uses a fourcc. Publish MF's canonical tags. */
++    else if (params->codec_id == AV_CODEC_ID_DTS) format_tag = WAVE_FORMAT_DTS;
++    else if (params->codec_id == AV_CODEC_ID_ALAC) format_tag = WAVE_FORMAT_ALAC;
+     else if (params->codec_id == AV_CODEC_ID_AC3 || params->codec_id == AV_CODEC_ID_EAC3)
+         format_tag = WAVE_FORMAT_EXTENSIBLE;
+     /* Big-endian PCM in native Windows is given the usual WAVE_FORMAT_PCM tag. */
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -131,6 +131,8 @@
+     case WAVE_FORMAT_IEEE_FLOAT:    return AV_CODEC_ID_PCM_F32LE;
+     case WAVE_FORMAT_ALAW:          return AV_CODEC_ID_PCM_ALAW;
+     case WAVE_FORMAT_MULAW:         return AV_CODEC_ID_PCM_MULAW;
++    case WAVE_FORMAT_DTS:           return AV_CODEC_ID_DTS;
++    case WAVE_FORMAT_ALAC:          return AV_CODEC_ID_ALAC;
+     case WAVE_FORMAT_MPEG:          return AV_CODEC_ID_MP2;
+     case WAVE_FORMAT_MPEGLAYER3:    return AV_CODEC_ID_MP3; /* 0x0055 */
+     case 0x00FF:                    return AV_CODEC_ID_AAC; /* WAVE_FORMAT_AAC */

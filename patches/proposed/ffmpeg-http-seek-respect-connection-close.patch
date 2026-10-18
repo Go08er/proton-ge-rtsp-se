@@ -1,0 +1,31 @@
+From: RTSP-on-GE contributors
+Subject: [PATCH] avformat/http: only reuse seek connections when persistence is enabled
+
+With multiple_requests disabled we send Connection: close. An HTTP/1.1
+server can honor that request without repeating the header in its response;
+willclose then remains false. The soft-seek path can drain the response and
+send its next Range request on a socket the server has closed. In particular,
+remaining == 0 lets this happen without a read that would detect the close.
+
+Require the same persistence option used when constructing the request.
+Nonpersistent seeks use the existing fresh-connection path; negotiated
+keepalive and explicit server-close handling are unchanged. No retry or
+decoder recovery policy is added.
+
+Reproduced against the unchanged P5 FFmpeg libraries with tail-to-backward
+HTTP seeks and the retained HEVC fixture through Wine's seek/filter code.
+Both explicit server-close and negotiated-keepalive controls pass on P5.
+
+diff --git a/libavformat/http.c b/libavformat/http.c
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -2138,7 +2138,8 @@ static int64_t http_seek_internal(URLContext *h, int64_t off, int whence, int force)
+ 
+     /* try to reuse existing connection for small seeks */
+     uint64_t remaining = s->range_end - old_off - old_buf_size;
+-    if (s->hd && !s->willclose && s->range_end && remaining <= ffurl_get_short_seek(h)) {
++    if (s->multiple_requests && s->hd && !s->willclose && s->range_end &&
++        remaining <= ffurl_get_short_seek(h)) {
+         /* drain remaining data left on the wire from previous request */
+         av_log(h, AV_LOG_DEBUG, "Soft-seeking to offset %"PRIu64" by draining "
+                "%"PRIu64" remaining byte(s)\n", s->off, remaining);

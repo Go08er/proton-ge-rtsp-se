@@ -1,0 +1,35 @@
+Subject: [PATCH] build: enable the AAC (ADTS) parser
+
+The existing --disable-everything configuration enables AAC decoding and the
+MPEG-TS/HLS demuxers, but not the aac parser. FFmpeg's MPEG-TS demuxer asks
+for full parsing of every PES stream, ff_read_packet() then finds no parser
+for AAC and silently degrades the stream to AVSTREAM_PARSE_NONE. Each PES
+packet, which may hold several ADTS frames, then receives the duration of a
+single codec frame (1024 samples, 21.3 ms at 48 kHz) instead of its real span.
+WineDMO credits that under-reported duration to its buffering accounting, so
+HLS audio under-credits its queued read-ahead and false-starves.
+
+Enable the upstream ADTS parser. It splits each PES into single frames with
+correct timestamps and durations. Do not change WineDMO, its buffering
+accounting or any timestamp to conceal the fault. This also changes packet
+granularity for AAC streams from every demuxer that requests parsing and needs
+runtime qualification; it is not a validated fix merely because the patch
+applies.
+
+Apply to the GE superproject after the crypto and MPEGVIDEO build patches
+(its context includes the MPEGVIDEO flag). Requires fresh pin provenance and a
+new whole-file Makefile.in postimage. No existing candidate pin or prepared
+tree may be updated in place. Project-authored build integration, not an
+upstream GE patch.
+---
+diff --git a/Makefile.in b/Makefile.in
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -365,6 +365,7 @@
+ 	--enable-bsfs \
+ 	--disable-decoder=vvc \
+ 	--enable-parser=mpegvideo \
++	--enable-parser=aac \
+ 
+ FFMPEG_i386-unix_CONFIGURE_ARGS := \
+ 	--cross-prefix=i686-linux-gnu- \

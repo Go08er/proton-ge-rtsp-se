@@ -1,0 +1,30 @@
+Subject: [PATCH] winedmo: discard delayed resampler samples on transform flush
+
+A resampler holds audio history even when its format parameters are unchanged.
+Flushing decoder and output queues while retaining that history lets samples
+from before a seek appear in the next audio segment. Release the resampler on
+explicit flush; convert_audio_frame already creates it lazily on the next frame.
+
+Keep the negotiated output format and the established timestamp mapping from
+0008. Leave the swscale parameter cache intact. This is a discard boundary,
+not EOS or a format transition: those need separate tail-draining work, not
+this reset. No change to continuous conversion or transform_drain.
+
+The extracted SE1 methods reproduce old nonzero PCM after a flush into silence
+with SE1's actual libswresample. This is not a Wine/VRChat playback result.
+Independent proposal after SE1; do not change an already pinned candidate.
+---
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -1611,7 +1611,9 @@
+     t->video_input_anchor_pts = INT64_MIN;
+     t->video_pts_offset   = INT64_MIN;
+     t->cumulative_samples = 0;
+-    /* Don't free swr/sws — parameters haven't changed */
++    /* Discard delayed audio as well as decoded/output samples. The resampler
++     * is recreated on demand; the swscale parameter cache can be retained. */
++    swr_free( &t->swr );
+     return STATUS_SUCCESS;
+ }
+ 

@@ -1,0 +1,98 @@
+Subject: [PATCH] mf: reset seek EOS state and distinguish old sink markers
+
+A running seek stops sources without taking session_set_stopped(), leaving
+their prior end-of-presentation and stream EOS flags set. The next EOF then
+skips transform draining and end notification. Clear these flags only after
+every source and source-stream node has stopped, before starting the next
+positioned presentation. Preserve terminal-error flags and existing commands.
+
+Source event ordering is not a sink event barrier: flushing a still-running
+sink can publish an old end marker after the reset. Round-trip a session-local
+generation through the existing end-marker context and accept only successful
+markers from the current generation. Advance it on EOS reset and topology
+clear, not pause/resume. No sample format, retry, timeout or clock-policy change.
+---
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -295,6 +295,7 @@ struct media_session
+     enum command_state command_state;
+     DWORD caps;
+     BOOL clock_started;
++    ULONGLONG end_marker_generation;
+     CRITICAL_SECTION cs;
+ };
+ 
+@@ -934,6 +935,7 @@ static void session_clear_presentation(struct media_session *session)
+     IMFTopology_Clear(session->presentation.current_topology);
+     session->presentation.topo_status = MF_TOPOSTATUS_INVALID;
+     session->presentation.flags = 0;
++    ++session->end_marker_generation;
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(source, source2, &session->presentation.sources, struct media_source, entry)
+     {
+@@ -1381,6 +1383,7 @@ static void session_clear_end_of_presentation(struct media_session *session)
+     struct media_source *source;
+     struct topo_node *node;
+ 
++    ++session->end_marker_generation;
+     LIST_FOR_EACH_ENTRY(source, &session->presentation.sources, struct media_source, entry)
+     {
+         source->flags &= ~SOURCE_FLAG_END_OF_PRESENTATION;
+@@ -3425,6 +3428,7 @@ static void session_set_source_object_state(struct media_session *session, IUnknown *object,
+             if (!session_is_source_nodes_state(session, OBJ_STATE_STOPPED))
+                 break;
+ 
++            session_clear_end_of_presentation(session);
+             session->presentation.flags &= ~SESSION_FLAG_PRESENTATION_ENDING;
+             session->state = SESSION_STATE_STOPPED;
+             session->command_state = COMMAND_STATE_STARTING_SOURCES;
+@@ -4206,7 +4210,10 @@ static void session_deliver_sample_to_node(struct media_session *session, struct topo_node *topo_node, unsigned int input,
+         IMFSample *sample)
+ {
++    PROPVARIANT marker_context = {.vt = VT_UI8};
+     HRESULT hr;
+ 
++    marker_context.uhVal.QuadPart = session->end_marker_generation;
++
+     if (session->quality_manager)
+         IMFQualityManager_NotifyProcessInput(session->quality_manager, topo_node->node, input, sample);
+ 
+@@ -4229,7 +4236,7 @@ static void session_deliver_sample_to_node(struct media_session *session, struct topo_node *topo_node, unsigned int input,
+                 }
+             }
+             else if (FAILED(hr = IMFStreamSink_PlaceMarker(topo_node->object.sink_stream, MFSTREAMSINK_MARKER_ENDOFSEGMENT,
+-                    NULL, NULL)))
++                    NULL, &marker_context)))
+             {
+                 WARN("Failed to place sink marker, hr %#lx.\n", hr);
+             }
+@@ -4557,10 +4564,15 @@ static void session_synthesize_end_of_presentation_from_sinks(struct media_session *session)
+-static void session_sink_stream_marker(struct media_session *session, IMFStreamSink *stream_sink)
++static void session_sink_stream_marker(struct media_session *session, IMFStreamSink *stream_sink,
++        const PROPVARIANT *context, HRESULT status)
+ {
+     struct topo_node *node;
+     HRESULT hr;
+ 
++    if (FAILED(status) || context->vt != VT_UI8
++            || context->uhVal.QuadPart != session->end_marker_generation)
++        return;
++
+     if (!(node = session_get_node_object(session, (IUnknown *)stream_sink, MF_TOPOLOGY_OUTPUT_NODE))
+             || node->flags & TOPO_NODE_END_OF_STREAM)
+     {
+         return;
+     }
+@@ -4753,8 +4765,10 @@ static HRESULT WINAPI session_events_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+             break;
+         case MEStreamSinkMarker:
+ 
++            if (FAILED(IMFMediaEvent_GetStatus(event, &hr)))
++                break;
+             EnterCriticalSection(&session->cs);
+-            session_sink_stream_marker(session, (IMFStreamSink *)event_source);
++            session_sink_stream_marker(session, (IMFStreamSink *)event_source, &value, hr);
+             LeaveCriticalSection(&session->cs);
+ 
+             break;

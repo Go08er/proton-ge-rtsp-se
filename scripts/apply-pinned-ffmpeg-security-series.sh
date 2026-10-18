@@ -128,6 +128,55 @@ while IFS=$'\t' read -r index entry fix patch_sha numstat_sha; do
     >>"$audit_tmp"
 done <<<"$records"
 
+# The four security backports remain unchanged. The optional transport
+# companion is separately pinned and recorded, never counted as another CVE.
+if [[ -n "${PIN_FFMPEG_RTSPS_PATCH_SHA256:-}" ]]; then
+  transport_patch="$(pinned_ge_rtsps_transport_patch)"
+  pinned_ge_git -C "$SOURCE_DIR/ffmpeg" apply --check --whitespace=error-all -- "$transport_patch"
+  pinned_ge_git -C "$SOURCE_DIR/ffmpeg" apply --whitespace=error-all -- "$transport_patch"
+  [[ "$(pinned_ge_git -C "$SOURCE_DIR/ffmpeg" hash-object --no-filters -- libavformat/rtsp.c)" \
+      == "$PIN_FFMPEG_RTSPS_RTSP_BLOB" ]] \
+    || pinned_ge_fail "secure RTSP companion postimage differs from the pin"
+  expected_touched_paths="$(printf '%s\nlibavformat/rtsp.c\n' "$expected_touched_paths" | LC_ALL=C sort -u)"
+  printf 'rtsps_patch_sha256\t%s\nrtsps_rtsp_blob\t%s\n' \
+    "$PIN_FFMPEG_RTSPS_PATCH_SHA256" "$PIN_FFMPEG_RTSPS_RTSP_BLOB" >>"$audit_tmp"
+fi
+
+if [[ -n "${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}" ]]; then
+  http_seek_patch="$(pinned_ge_http_seek_patch)"
+  pinned_ge_git -C "$SOURCE_DIR/ffmpeg" apply --check --whitespace=error-all -- "$http_seek_patch"
+  pinned_ge_git -C "$SOURCE_DIR/ffmpeg" apply --whitespace=error-all -- "$http_seek_patch"
+  [[ "$(pinned_ge_git -C "$SOURCE_DIR/ffmpeg" hash-object --no-filters -- libavformat/http.c)" \
+      == "$PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB" ]] \
+    || pinned_ge_fail "HTTP seek companion postimage differs from the pin"
+  expected_touched_paths="$(printf '%s\nlibavformat/http.c\n' "$expected_touched_paths" | LC_ALL=C sort -u)"
+  printf 'http_seek_patch_sha256\t%s\nhttp_seek_http_blob\t%s\n' \
+    "$PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256" "$PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB" >>"$audit_tmp"
+fi
+
+if [[ -n "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" ]]; then
+  http_filesize_patch="$(pinned_ge_http_filesize_patch)"
+  pinned_ge_git -C "$SOURCE_DIR/ffmpeg" apply --check --whitespace=error-all -- "$http_filesize_patch"
+  pinned_ge_git -C "$SOURCE_DIR/ffmpeg" apply --whitespace=error-all -- "$http_filesize_patch"
+  [[ "$(pinned_ge_git -C "$SOURCE_DIR/ffmpeg" hash-object --no-filters -- libavformat/http.c)" \
+      == "$PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB" ]] \
+    || pinned_ge_fail "HTTP filesize companion postimage differs from the pin"
+  printf 'http_filesize_patch_sha256\t%s\nhttp_filesize_http_blob\t%s\n' \
+    "$PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256" "$PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB" >>"$audit_tmp"
+fi
+
+if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" ]]; then
+  hls_early_seek_patch="$(pinned_ge_hls_early_seek_patch)"
+  pinned_ge_git -C "$SOURCE_DIR/ffmpeg" apply --check --whitespace=error-all -- "$hls_early_seek_patch"
+  pinned_ge_git -C "$SOURCE_DIR/ffmpeg" apply --whitespace=error-all -- "$hls_early_seek_patch"
+  [[ "$(pinned_ge_git -C "$SOURCE_DIR/ffmpeg" hash-object --no-filters -- libavformat/hls.c)" \
+      == "$PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB" ]] \
+    || pinned_ge_fail "HLS early-seek companion postimage differs from the pin"
+  expected_touched_paths="$(printf '%s\nlibavformat/hls.c\n' "$expected_touched_paths" | LC_ALL=C sort -u)"
+  printf 'hls_early_seek_patch_sha256\t%s\nhls_early_seek_hls_blob\t%s\n' \
+    "$PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256" "$PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB" >>"$audit_tmp"
+fi
+
 pinned_ge_git -C "$SOURCE_DIR/ffmpeg" diff --check
 [[ -z "$(pinned_ge_git -C "$SOURCE_DIR/ffmpeg" \
     diff --name-only --cached --)" ]] \

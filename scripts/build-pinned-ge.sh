@@ -6,6 +6,8 @@ umask 022
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=pinned-ge-common.sh
 source "$ROOT_DIR/scripts/pinned-ge-common.sh"
+# shellcheck source=pinned-ge-source-inputs.sh
+source "$ROOT_DIR/scripts/pinned-ge-source-inputs.sh"
 
 SOURCE_DIR=""
 BUILD_DIR=""
@@ -20,6 +22,7 @@ STREAM_LOG="${PINNED_GE_STREAM_LOG:-1}"
 NICE_LEVEL="${PINNED_GE_NICE:-19}"
 SCHEDULE_PRODUCT=""
 RESUME=0
+FRESH_SETUP_RECEIPT=""
 
 usage() {
   cat <<'EOF'
@@ -38,9 +41,14 @@ Options:
   --make-jobs N     orchestrator GNU Make jobs (default comes from selected config)
   --ninja-jobs N    jobs per component (default comes from selected config)
   --resume           reuse a separately fingerprinted existing configure result
+  --fresh-setup-receipt FILE  successful fresh Wine generation/consumer gate (required)
   --config FILE     pinned config (default: active exact snapshot)
   --series FILE     project patch series (use the archived series for historical pins)
   -h, --help        show this help
+
+An explicitly approved CPU-cap increase may be supplied as
+PINNED_GE_AUTHORIZED_JOB_CAP=N. It leaves pin defaults unchanged, is recorded
+in the invocation, and must also be supplied when verifying that artifact.
 EOF
 }
 
@@ -85,6 +93,11 @@ while [[ $# -gt 0 ]]; do
       RESUME=1
       shift
       ;;
+    --fresh-setup-receipt)
+      [[ $# -ge 2 && -n "$2" ]] || { usage >&2; exit 2; }
+      FRESH_SETUP_RECEIPT="$2"
+      shift 2
+      ;;
     --config)
       [[ $# -ge 2 && -n "$2" ]] || { usage >&2; exit 2; }
       PINNED_GE_CONFIG="$2"
@@ -109,7 +122,7 @@ done
 
 pinned_ge_load_config
 if [[ -z "$CACHE_HOME" ]]; then
-  CACHE_HOME="${HOME:?HOME must be set}/Documents/proton-rtsp/.podman-home"
+  CACHE_HOME="$ROOT_DIR/work/podman-home-a314"
 fi
 [[ -n "$SOURCE_DIR" ]] || SOURCE_DIR="$(pinned_ge_default_source)"
 [[ -n "$BUILD_DIR" ]] || BUILD_DIR="$(pinned_ge_default_build_dir)"
@@ -135,8 +148,8 @@ CONTRIB_MANIFEST="$(pinned_ge_build_contrib_manifest_path)"
 pinned_ge_validate_job_schedule "$JOBS" "$MAKE_JOBS" "$NINJA_JOBS" >/dev/null
 [[ "$PACKAGE_RELEASE" == 0 && "$PIN_PACKAGE_RELEASE" == 0 ]] \
   || pinned_ge_fail "this local game-test path requires PACKAGE_RELEASE=0"
-[[ "$PIN_WITHOUT_NVIDIA_LIBS" == 1 && "$PIN_WITHOUT_VKLAYERS" == 1 ]] \
-  || pinned_ge_fail "this snapshot requires both optional component groups disabled"
+# The pin selects optional GE groups. Exact selected gitlinks are required by
+# source/preparation verification; historical reduced-payload pins stay reduced.
 [[ "$STREAM_LOG" == 0 || "$STREAM_LOG" == 1 ]] \
   || pinned_ge_fail "PINNED_GE_STREAM_LOG must be 0 or 1"
 [[ "$NICE_LEVEL" =~ ^([0-9]|1[0-9])$ ]] \
@@ -172,12 +185,24 @@ require_prefetched_build_contrib() {
 # A missing prefetched input should cost seconds, not a build slot.
 require_prefetched_build_contrib "$CONTRIB_MANIFEST"
 
+# Standing fresh-generation gate: required for every pin, including resumes.
+# Component objects built from retained Makefiles cannot substitute for it.
+[[ -n "$FRESH_SETUP_RECEIPT" ]] \
+  || pinned_ge_fail "--fresh-setup-receipt FILE is required: run the fresh Wine configure/makedep and both-architecture consumer gate before building"
+python3 "$ROOT_DIR/scripts/verify-wine-fresh-setup.py" \
+  --receipt "$FRESH_SETUP_RECEIPT" --wine-tree "$SOURCE_DIR/wine" \
+  --pin-id "$PIN_ID" --steamrt-image-id "$PIN_STEAMRT_IMAGE_ID" \
+  --series-digest "$(pinned_ge_series_digest "$ROOT_DIR/patches" "$PATCH_SERIES")"
+FRESH_SETUP_RECEIPT="$(realpath -e -- "$FRESH_SETUP_RECEIPT")"
+FRESH_SETUP_RECEIPT_SHA256="$(pinned_ge_sha256 "$FRESH_SETUP_RECEIPT")"
+
 if [[ "${PINNED_GE_LOW_IMPACT_REEXEC:-0}" != 1 ]]; then
   export PINNED_GE_LOW_IMPACT_REEXEC=1
   REEXEC_ARGS=(
     --source "$SOURCE_DIR" --build-dir "$BUILD_DIR"
     --state-dir "$STATE_DIR" --cache-home "$CACHE_HOME"
     --series "$PATCH_SERIES"
+    --fresh-setup-receipt "$FRESH_SETUP_RECEIPT"
     --jobs "$JOBS" --make-jobs "$MAKE_JOBS"
     --ninja-jobs "$NINJA_JOBS" --config "$PINNED_GE_CONFIG_PATH"
   )
@@ -190,10 +215,14 @@ if [[ "${PINNED_GE_LOW_IMPACT_REEXEC:-0}" != 1 ]]; then
     "${REEXEC_ARGS[@]}"
 fi
 
+# GE's generated Mono tree is ignored by Git, unlike its pinned archive and
+# patches. Verify its preparation seal before taking a build slot.
+pinned_ge_require_mono_source_state "$SOURCE_DIR" "$STATE_DIR/prepared-source.tsv"
+
 BUILD_LOCK="${PINNED_GE_BUILD_LOCK:-${HOME:?HOME must be set}/Documents/.proton-build.lock}"
 mkdir -p "$(dirname "$BUILD_LOCK")"
 pinned_ge_require_regular_or_absent "workspace build lock" "$BUILD_LOCK"
-exec 9>"$BUILD_LOCK"
+exec 9>>"$BUILD_LOCK"
 flock -n 9 \
   || pinned_ge_fail "another cooperating Proton build holds $BUILD_LOCK"
 
@@ -209,7 +238,7 @@ PATCH_ROOT="$ROOT_DIR/patches"
 FFMPEG_SECURITY_PATCH_ROOT="$ROOT_DIR/patches/ffmpeg-security"
 FFMPEG_SECURITY_PATCH_SERIES="$ROOT_DIR/patches/ffmpeg-security/series"
 FFMPEG_CRYPTO_BUILD_PATCH_ROOT="$ROOT_DIR/patches/ffmpeg-build"
-FFMPEG_CRYPTO_BUILD_PATCH_SERIES="$ROOT_DIR/patches/ffmpeg-build/series"
+FFMPEG_CRYPTO_BUILD_PATCH_SERIES="$(pinned_ge_ffmpeg_crypto_build_series)"
 PROTON_LAUNCHER_PATCH="$ROOT_DIR/patches/proton/0001-launcher-add-scoped-xrizer-mode.patch"
 INVOCATION_FILE="$STATE_DIR/build-invocation.tsv"
 CONFIGURE_STATE="$STATE_DIR/configure-state.tsv"
@@ -279,6 +308,7 @@ if [[ "$PIN_SCHEMA_VERSION" == 5 ]]; then
     "$PIN_FFMPEG_SECURITY_MAGICYUV_BLOB"
   require_state ffmpeg_security_tls_version_blob \
     "$PIN_FFMPEG_SECURITY_TLS_VERSION_BLOB"
+  pinned_ge_require_ffmpeg_playback_state "$STATE_FILE"
   [[ -f "$FFMPEG_CRYPTO_BUILD_AUDIT" \
       && ! -L "$FFMPEG_CRYPTO_BUILD_AUDIT" ]] \
     || pinned_ge_fail "FFmpeg crypto-build audit is absent"
@@ -304,6 +334,8 @@ require_state normalized_rules_meson_sha256 "$PIN_RULES_MESON_NORMALIZED_SHA256"
 rg -Fq 'ninja -j"$$(NINJA_JOBS)" -C "$$($(2)_$(3)_OBJ)" install' \
   "$SOURCE_DIR/make/rules-meson.mk" \
   || pinned_ge_fail "bounded Meson/Ninja invocation is absent"
+
+pinned_ge_nvidia_build_rules "$SOURCE_DIR" check
 
 pinned_ge_require_complete_build_contrib "$SOURCE_DIR" "$CONTRIB_MANIFEST"
 require_state root_repo_state_sha256 \
@@ -340,6 +372,13 @@ for path in "${REGISTERED[@]}"; do
       if [[ -d "$SOURCE_DIR/patches/vkd3d-proton" ]]; then
         pinned_ge_require_upstream_component_patch_state \
           "$SOURCE_DIR/$path" "$SOURCE_DIR/patches/vkd3d-proton"
+        continue
+      fi
+      ;;
+    vklayers/low_latency_layer)
+      if [[ -d "$SOURCE_DIR/patches/low_latency_layer" ]]; then
+        pinned_ge_require_upstream_component_patch_state \
+          "$SOURCE_DIR/$path" "$SOURCE_DIR/patches/low_latency_layer"
         continue
       fi
       ;;
@@ -483,6 +522,7 @@ write_build_invocation() {
     printf 'package_release\t0\n'
     printf 'jobs\t%s\n' "$JOBS"
     printf 'global_jobs\t%s\n' "$JOBS"
+    printf 'authorized_job_cap\t%s\n' "$(pinned_ge_job_cap)"
     printf 'make_jobs\t%s\n' "$MAKE_JOBS"
     printf 'ninja_jobs\t%s\n' "$NINJA_JOBS"
     printf 'scheduler_product\t%s\n' "$SCHEDULE_PRODUCT"
@@ -538,6 +578,7 @@ write_build_invocation() {
         "$PIN_FFMPEG_SECURITY_MAGICYUV_BLOB"
       printf 'ffmpeg_security_tls_version_blob\t%s\n' \
         "$PIN_FFMPEG_SECURITY_TLS_VERSION_BLOB"
+      pinned_ge_ffmpeg_playback_records
       printf 'ffmpeg_crypto_build_origin\t%s\n' \
         "$PIN_FFMPEG_CRYPTO_BUILD_ORIGIN"
       printf 'ffmpeg_crypto_build_patch_sha256\t%s\n' \
@@ -556,11 +597,13 @@ write_build_invocation() {
     printf 'rtsp_hook_order\tafter-ge-video-rework-before-autoreconf\n'
     printf 'final_diff_check_baseline_match\tpassed\n'
     printf 'final_winegstreamer_external_references\t0\n'
-    printf 'without_nvidia_libs\t1\n'
-    printf 'without_vklayers\t1\n'
+    printf 'without_nvidia_libs\t%s\n' "$PIN_WITHOUT_NVIDIA_LIBS"
+    printf 'without_vklayers\t%s\n' "$PIN_WITHOUT_VKLAYERS"
     printf 'target\tredist\n'
     printf 'steamrt_image\t%s\n' "$PIN_STEAMRT_IMAGE"
     printf 'steamrt_image_id\t%s\n' "$PIN_STEAMRT_IMAGE_ID"
+    printf 'fresh_setup_receipt\t%s\n' "$FRESH_SETUP_RECEIPT"
+    printf 'fresh_setup_receipt_sha256\t%s\n' "$FRESH_SETUP_RECEIPT_SHA256"
     printf 'steam_install\tdisabled\n'
     printf 'publication\tdisabled\n'
   } >"$INVOCATION_FILE"
@@ -691,6 +734,28 @@ seed_protonfixes_build_contrib() {
     touch -- "$zenity_stamp" || return 1
     printf 'Recorded ProtonFixes zenity-rs offline build stamp.\n'
   fi
+}
+
+seed_nvml_build_contrib() {
+  [[ "$PIN_WITHOUT_NVIDIA_LIBS" == 0 ]] || return 0
+  local header="nvml_610.43.02.h"
+  local input="contrib/nvidia-libs/wine-nvml/$header"
+  local generator="$SOURCE_DIR/nvidia-libs/wine-nvml/src/make_nvml"
+  local component
+
+  [[ -f "$generator" && ! -L "$generator" ]] \
+    || pinned_ge_fail "NVML header generator is absent or unsafe" || return 1
+  rg -Fxq 'version="${1:-610.43.02}"' "$generator" \
+    || pinned_ge_fail \
+      "NVML generator version changed; declare its matching header in a new pin before building" \
+    || return 1
+  # GE generates the Unix and Windows wrappers in separate source copies.
+  # Exact SOURCE_ARGS exclusions below keep rsync --delete from removing the
+  # verified input before either post-source make_nvml invocation.
+  for component in nvml_so nvml_dll; do
+    stage_manifest_build_input "$input" \
+      "$BUILD_DIR/src-$component/src/$header" 0644 "NVML header" || return 1
+  done
 }
 
 piper_build_contrib_is_declared() {
@@ -1000,6 +1065,7 @@ run_build() {
   fi
 
   seed_protonfixes_build_contrib
+  seed_nvml_build_contrib
 
   [[ ! -L "$host_shell_makefile" ]] \
     || pinned_ge_fail "refusing symlinked host-shell make fragment"
@@ -1026,6 +1092,9 @@ run_build() {
   # second, host-only fragment removes that one command-line override from
   # MAKEOVERRIDES before recursive Make starts inside SteamRT, where /bin/bash
   # is valid. The container recipe also passes only the first makefile.
+  sdk_entrypoint="$("$PODMAN_BIN" image inspect "$PIN_STEAMRT_IMAGE_ID" \
+    --format '{{json .Config.Entrypoint}}')"
+  container_cpu_options="$(pinned_ge_container_cpu_options "$JOBS" "$sdk_entrypoint")"
   make_args=(
     -f "$BUILD_DIR/Makefile" -f "$host_shell_makefile"
     SHELL="$HOST_BASH" -j"$MAKE_JOBS"
@@ -1033,8 +1102,14 @@ run_build() {
     NINJA_JOBS="$NINJA_JOBS"
     WITHOUT_NVIDIA_LIBS="$PIN_WITHOUT_NVIDIA_LIBS"
     WITHOUT_VKLAYERS="$PIN_WITHOUT_VKLAYERS"
-    "DOCKER_OPTS=--pull=never --network=none -e NINJA_JOBS=$NINJA_JOBS -e CARGO_BUILD_JOBS=$NINJA_JOBS -e CMAKE_BUILD_PARALLEL_LEVEL=$NINJA_JOBS -e NIX_BUILD_CORES=$NINJA_JOBS"
+    "DOCKER_OPTS=--pull=never --network=none $container_cpu_options -e NINJA_JOBS=$NINJA_JOBS -e CARGO_BUILD_JOBS=$NINJA_JOBS -e CMAKE_BUILD_PARALLEL_LEVEL=$NINJA_JOBS -e NIX_BUILD_CORES=$NINJA_JOBS"
   )
+  if [[ "$PIN_WITHOUT_NVIDIA_LIBS" == 0 ]]; then
+    make_args+=(
+      "NVML_SO_SOURCE_ARGS=--exclude=/src/nvml_610.43.02.h"
+      "NVML_DLL_SOURCE_ARGS=--exclude=/src/nvml_610.43.02.h"
+    )
+  fi
   if [[ "$RESUME" == 1 ]]; then
     printf 'Reconciling component sources in a dedicated Make process.\n'
     make "${make_args[@]}" pinned-resume-all-source
@@ -1121,6 +1196,18 @@ write_artifact_provenance() {
         "$(pinned_ge_state_value "$STATE_FILE" \
           ffmpeg_crypto_build_audit_sha256)"
     fi
+    if [[ -n "${PIN_FFMPEG_RTSPS_PATCH_SHA256:-}" ]]; then
+      printf 'FFmpeg secure-RTSP companion SHA-256: %s\n' "$PIN_FFMPEG_RTSPS_PATCH_SHA256"
+    fi
+    if [[ -n "${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}" ]]; then
+      printf 'FFmpeg HTTP-seek companion SHA-256: %s\n' "$PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256"
+    fi
+    if [[ -n "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" ]]; then
+      printf 'FFmpeg HTTP-filesize companion SHA-256: %s\n' "$PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256"
+    fi
+    if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" ]]; then
+      printf 'FFmpeg HLS-early-seek companion SHA-256: %s\n' "$PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256"
+    fi
     if [[ "$PINNED_GE_HAS_PATCH_OVERLAP" == 1 ]]; then
       printf 'GE inherited patch-overlap policy: stock-effective-exact-skip\n'
       printf 'GE patch-overlap manifest SHA-256: %s\n' \
@@ -1137,9 +1224,20 @@ write_artifact_provenance() {
 
 normalize_redist_permissions() {
   local archive_tmp
+  local -a low_latency_args=()
 
   [[ -d "$TOOL_DIR" && ! -L "$TOOL_DIR" ]] \
     || pinned_ge_fail "redist tool directory is absent or unsafe: $TOOL_DIR"
+
+  if [[ "$PIN_WITHOUT_VKLAYERS" == 0 ]]; then
+    # Master fixes this in its source patch; retain the rewrite only for older
+    # pins. Verify the new upstream result instead of repairing it silently.
+    if [[ -d "$SOURCE_DIR/patches/low_latency_layer" ]]; then
+      low_latency_args+=(--check)
+    fi
+    python3 "$ROOT_DIR/scripts/normalize-ge-low-latency-manifest.py" \
+      --tool-dir "$TOOL_DIR" "${low_latency_args[@]}"
+  fi
 
   # Xalia's upstream ZIP currently carries 0666 on several managed payloads.
   # Preserve owner and executable bits, but never distribute group/other-write

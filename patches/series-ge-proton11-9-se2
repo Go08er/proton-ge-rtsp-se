@@ -1,0 +1,23 @@
+# GE-Proton11-9 SE2 release series: identical to the SE2-P24 series (P23 Wine series + FFmpeg AAC parser build module).
+# Apply strictly after GE ge-video-rework.
+# Precedent (SE1): this series references the candidate's existing patch files rather than copying them;
+# the seventeen Wine patches are those in patches/ge-proton11-9-se2-p24/, byte-for-byte.
+# The AAC parser change is outside this series: the pinned FFmpeg build module
+# patches/proposed/ffmpeg-enable-aac-parser.patch (--enable-parser=aac in Makefile.in), bound in the pin.
+ge-proton11-9-se2-p24/0001-winedmo-retain-bounded-network-and-origin-contract.patch
+ge-proton11-9-se2-p24/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch
+ge-proton11-9-se2-p24/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch
+ge-proton11-9-se2-p24/0004-winedmo-retain-codec-admission-and-format-validation.patch
+ge-proton11-9-se2-p24/0005-mfreadwrite-retain-reader-error-layout-and-origin-contract.patch
+ge-proton11-9-se2-p24/0006-mf-retain-session-lifecycle-and-demand-accounting.patch
+ge-proton11-9-se2-p24/0007-mf-retain-sar-flush-demand-and-marker-ownership.patch
+ge-proton11-9-se2-p24/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch
+ge-proton11-9-se2-p24/0009-mfmediaengine-retain-render-clock-frame-demand.patch
+ge-proton11-9-se2-p24/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch
+ge-proton11-9-se2-p24/0011-mfplat-retain-failed-async-result-status.patch
+ge-proton11-9-se2-p24/0012-winewayland-retain-vr-device-extensions.patch
+ge-proton11-9-se2-p24/0013-mf-tests-retain-held-marker-context.patch
+ge-proton11-9-se2-p24/0021-mf-stop-clock-after-terminal-start-error.patch
+ge-proton11-9-se2-p24/0022-winedmo-defer-read-ahead-data-errors.patch
+ge-proton11-9-se2-p24/0023-winedmo-interrupt-stalled-read-on-seek.patch
+ge-proton11-9-se2-p24/0024-winedmo-adopt-ge-http-reconnect.patch

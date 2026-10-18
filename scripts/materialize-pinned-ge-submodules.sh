@@ -19,8 +19,8 @@ Usage: materialize-pinned-ge-submodules.sh [OPTIONS]
 
 Verify the exact submodule pins for a pinned GE checkout. With --fetch, sync
 and initialize the build-required paths selected from that checkout's
-.gitmodules, recursively and with one fetch job. The disabled Nvidia-library
-and Vulkan-layer groups are deliberately excluded.
+.gitmodules, recursively and with one fetch job. Nvidia-library and Vulkan-layer
+groups are included only when the explicit pin enables them.
 
 Options:
   --source DIR             pinned GE checkout
@@ -99,6 +99,8 @@ pinned_ge_require_source_identity "$SOURCE_DIR"
 mapfile -t REGISTERED < <(pinned_ge_registered_submodules "$SOURCE_DIR")
 [[ "${#REGISTERED[@]}" == "$PIN_REGISTERED_SUBMODULE_COUNT" ]] \
   || pinned_ge_fail "registered submodule list changed after identity validation"
+declare -A REGISTERED_MAP=()
+for path in "${REGISTERED[@]}"; do REGISTERED_MAP["$path"]=1; done
 
 materialize_reference_children() {
   local destination_parent="$1"
@@ -121,9 +123,7 @@ materialize_reference_children() {
     name="${key#submodule.}"
     name="${name%.path}"
     if [[ "$root_level" == 1 ]]; then
-      case "$path" in
-        nvidia-libs/*|vklayers/*) continue ;;
-      esac
+      [[ -n "${REGISTERED_MAP[$path]+present}" ]] || continue
     fi
     case "$path" in
       ""|/*|..|../*|*/../*|*/..) pinned_ge_fail "unsafe submodule path: $path" ;;

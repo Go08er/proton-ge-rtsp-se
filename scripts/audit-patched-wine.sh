@@ -124,6 +124,11 @@ fi
 DIAGNOSTIC_SERIES=0
 RTSP_DRAIN_SERIES=0
 A320_SERIES=0
+IMMEDIATE_SEEK_SERIES=0
+HLS_PROBE_SERIES=0
+LIVE_BUFFER_SERIES=0
+EOS_DRAIN_SERIES=0
+NATIVE_AUDIO_TIMELINE_SERIES=0
 if [[ "$SERIES_SPECIFIC" == 1 ]]; then
   [[ -n "$PATCH_SERIES" ]] \
     || fail "--series is required for a series-specific audit"
@@ -131,6 +136,8 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
     || fail "could not resolve patch series: $PATCH_SERIES"
   [[ -f "$PATCH_SERIES" && ! -L "$PATCH_SERIES" ]] \
     || fail "patch series is not a regular file: $PATCH_SERIES"
+  python3 "$ROOT_DIR/scripts/audit-wine-added-files.py" \
+    --wine-tree "$WINE_TREE" --series "$PATCH_SERIES" --patch-root "$ROOT_DIR/patches"
   DIAGNOSTIC_SERIES="$(
     awk '
       /^[[:space:]]*($|#)/ { next }
@@ -165,6 +172,44 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
   )" || fail "patch series is malformed or declares rtspdrain more than once"
   [[ "$RTSP_DRAIN_SERIES" == 0 || "$RTSP_DRAIN_SERIES" == 1 ]] \
     || fail "could not classify the rtspdrain patch declaration"
+  if grep -Fxq -e 'proposed/0058-mfmediaengine-share-immediate-seek-policy.patch' \
+      -e 'ge-proton11-9-se2-p22/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-9-se2-p23/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-9-se2-p24/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-9-se2-p21/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-9-se2-p20/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' "$PATCH_SERIES"; then
+    IMMEDIATE_SEEK_SERIES=1
+  fi
+  if grep -Fxq 'proposed/0059-winedmo-probe-site-specific-hls-paths.patch' "$PATCH_SERIES"; then
+    HLS_PROBE_SERIES=1
+  fi
+  if grep -Fxq -e 'work/p19-block9-revised-20260927/live/release.patch' \
+      -e 'ge-proton11-7-se2-p19b/0078-winedmo-adapt-live-buffer-target.patch' \
+      -e 'ge-proton11-9-se2-p22/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-9-se2-p23/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-9-se2-p24/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-9-se2-p21/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-9-se2-p20/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' "$PATCH_SERIES"; then
+    LIVE_BUFFER_SERIES=1
+  fi
+  if grep -Fxq -e 'work/p19-autonomous-20260926/d-tail-fix/v1/D-tail-queued-eos.patch' \
+      -e 'ge-proton11-7-se2-p19b/0075-mfsrcsnk-drain-queued-tail-before-eos.patch' \
+      -e 'ge-proton11-9-se2-p22/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-9-se2-p23/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-9-se2-p24/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-9-se2-p21/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-9-se2-p20/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' "$PATCH_SERIES"; then
+    EOS_DRAIN_SERIES=1
+  fi
+  if grep -Fxq -e 'work/p19-decoder-decision-20260926/decoder/decoder-source.patch' \
+      -e 'ge-proton11-7-se2-p19b/0070-winedmo-preserve-decoder-demux-coordinate.patch' \
+      -e 'ge-proton11-9-se2-p22/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-9-se2-p23/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-9-se2-p24/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-9-se2-p21/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-9-se2-p20/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' "$PATCH_SERIES"; then
+    NATIVE_AUDIO_TIMELINE_SERIES=1
+  fi
 fi
 
 mapfile -t REJECTS < <(
@@ -245,7 +290,12 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
     python3 "$ROOT_DIR/tests/ge-proton11-6/audit.py" --wine-tree "$WINE_TREE" >/dev/null
     fact ge11_6_integration_contract passed
   fi
-  if rg -q '^ge-proton11-6-a320/0022-mfmediaengine-preserve-selected-frame-tick-result\.patch$' "$PATCH_SERIES"; then
+  if grep -Fxq -e 'ge-proton11-6-a320/0022-mfmediaengine-preserve-selected-frame-tick-result.patch' \
+      -e 'ge-proton11-9-se2-p22/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-9-se2-p23/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-9-se2-p24/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-9-se2-p21/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-9-se2-p20/0009-mfmediaengine-retain-render-clock-frame-demand.patch' "$PATCH_SERIES"; then
     A320_SERIES=1
     for test in seek_restart frame_tick recovery_seek; do
       python3 "$ROOT_DIR/tests/vod-control/test_${test}.py" --wine-tree "$WINE_TREE" >/dev/null
@@ -394,43 +444,8 @@ else
   fact flush_safe_packet_queue_handoff no
 fi
 
-if python3 - "$WINE_TREE/dlls/winedmo/media_source.c" 2>/dev/null <<'PY'
-from pathlib import Path
-import sys
-
-text = Path(sys.argv[1]).read_text()
-
-def region(start, end):
-    begin = text.index(start)
-    finish = text.index(end, begin)
-    return text[begin:finish]
-
-def require_order(body, *needles):
-    positions = [body.index(needle) for needle in needles]
-    if positions != sorted(positions):
-        raise ValueError("required cancellation/ownership order changed")
-
-require_order(
-    region("static HRESULT WINAPI media_source_Shutdown", "static const IMFMediaSourceVtbl"),
-    "winedmo_demuxer_set_cancelled(source->demuxer, TRUE)",
-    "WaitForSingleObject(source->demux_thread, INFINITE)",
-    "winedmo_demuxer_destroy(&source->demuxer)",
-)
-require_order(
-    region("static HRESULT media_source_create", "static HRESULT result_entry_create"),
-    "winedmo_demuxer_set_cancelled(object->demuxer, TRUE)",
-    "WaitForSingleObject(object->demux_thread, INFINITE)",
-    "winedmo_demuxer_destroy(&object->demuxer)",
-)
-require_order(
-    region("static HRESULT media_source_start", "static HRESULT media_source_pause"),
-    "winedmo_demuxer_set_cancelled(source->demuxer, TRUE)",
-    "EnterCriticalSection(&source->demuxer_cs)",
-    "winedmo_demuxer_set_cancelled(source->demuxer, FALSE)",
-    "winedmo_demuxer_seek(source->demuxer, position->hVal.QuadPart)",
-)
-PY
-then
+if python3 "$ROOT_DIR/tests/network-terminal-error/seek_policy.py" \
+    --wine-tree "$WINE_TREE" >/dev/null; then
   ALPHA_ORDERING=yes
 else
   ALPHA_ORDERING=no
@@ -446,7 +461,8 @@ if python3 - "$WINE_TREE/dlls/winedmo/media_source.c" \
     "$REQUIRE_A310_SERIES" \
     "$REQUIRE_A311_SERIES" \
     "$REQUIRE_A312_SERIES" \
-    "$RTSP_DRAIN_SERIES" "$A320_SERIES" <<'PY'
+    "$RTSP_DRAIN_SERIES" "$A320_SERIES" "$IMMEDIATE_SEEK_SERIES" "$HLS_PROBE_SERIES" \
+    "$LIVE_BUFFER_SERIES" "$EOS_DRAIN_SERIES" <<'PY'
 from pathlib import Path
 import sys
 
@@ -459,6 +475,10 @@ require_a39_series = any(value == "1" for value in sys.argv[6:10])
 require_a312_series = sys.argv[9] == "1"
 rtsp_drain_series = sys.argv[10] == "1"
 a320_series = sys.argv[11] == "1"
+immediate_seek = sys.argv[12] == "1"
+hls_probe = sys.argv[13] == "1"
+live_buffer = sys.argv[14] == "1"
+eos_drain = sys.argv[15] == "1"
 
 def region(text, start, end):
     begin = text.index(start)
@@ -525,16 +545,23 @@ seekable = region(engine, "static HRESULT WINAPI media_engine_GetSeekable",\
         "static BOOL WINAPI media_engine_IsEnded")
 set_time_ex = region(engine, "static HRESULT WINAPI media_engine_SetCurrentTimeEx",\
         "static HRESULT WINAPI media_engine_EnableTimeUpdateTimer")
-defer_seek = region(engine, "static HRESULT media_engine_defer_current_time(struct media_engine *engine, double seektime)\n{",\
-        "static HRESULT WINAPI media_engine_SetCurrentTime")
-schedule_seek = region(engine, "static HRESULT media_engine_schedule_deferred_seek(struct media_engine *engine, DWORD delay)\n{",\
-        "static ULONG WINAPI media_engine_deferred_seek_callback_AddRef")
-deferred_callback = region(engine, "static HRESULT WINAPI media_engine_deferred_seek_callback_Invoke",\
-        "static const IMFAsyncCallbackVtbl media_engine_deferred_seek_callback_vtbl")
-flush_deferred = region(engine, "static HRESULT media_engine_flush_deferred_seek(struct media_engine *engine)\n{",\
-        "static HRESULT media_engine_schedule_deferred_seek")
-set_current_helper = region(engine, "static HRESULT media_engine_set_current_time(struct media_engine *engine, double seektime)\n{",\
-        "static HRESULT media_engine_flush_deferred_seek")
+if immediate_seek:
+    set_current_helper = region(engine, "static HRESULT media_engine_set_current_time(struct media_engine *engine, double seektime)\n{",
+            "static HRESULT WINAPI media_engine_SetCurrentTime")
+    for obsolete in ("deferred_seek", "FLAGS_ENGINE_DEFERRED_SEEK", "FLAGS_ENGINE_SUPPRESS_INITIAL_SEEK", "FLAGS_ENGINE_SUPPRESS_SOURCE_SEEK"):
+        assert obsolete not in engine
+    assert "FLAGS_ENGINE_SOURCE_PENDING" in set_current_helper and "!engine->presentation.pd" in set_current_helper
+else:
+    defer_seek = region(engine, "static HRESULT media_engine_defer_current_time(struct media_engine *engine, double seektime)\n{",\
+            "static HRESULT WINAPI media_engine_SetCurrentTime")
+    schedule_seek = region(engine, "static HRESULT media_engine_schedule_deferred_seek(struct media_engine *engine, DWORD delay)\n{",\
+            "static ULONG WINAPI media_engine_deferred_seek_callback_AddRef")
+    deferred_callback = region(engine, "static HRESULT WINAPI media_engine_deferred_seek_callback_Invoke",\
+            "static const IMFAsyncCallbackVtbl media_engine_deferred_seek_callback_vtbl")
+    flush_deferred = region(engine, "static HRESULT media_engine_flush_deferred_seek(struct media_engine *engine)\n{",\
+            "static HRESULT media_engine_schedule_deferred_seek")
+    set_current_helper = region(engine, "static HRESULT media_engine_set_current_time(struct media_engine *engine, double seektime)\n{",\
+            "static HRESULT media_engine_flush_deferred_seek")
 inflight_seek = region(set_current_helper, "if (engine->flags & FLAGS_ENGINE_SEEKING)",\
         "position.vt = VT_I8")
 session_restart = region(session, "static void session_flush_sinks",\
@@ -569,7 +596,7 @@ assert "HRESULT_FROM_WIN32(ERROR_TIMEOUT)" in read_helper
 assert "wcsnicmp" in hls_wide
 assert "strncasecmp" in hls_unix
 assert hls_wide.count(".m3u8") == hls_unix.count(".m3u8") == 1
-assert hls_wide.count("/hls_playlist/") == hls_unix.count("/hls_playlist/") == 1
+assert hls_wide.count("/hls_playlist/") == hls_unix.count("/hls_playlist/") == (0 if hls_probe else 1)
 assert "queued_packets += stream->queued_packets" in queues
 assert "queued_bytes += stream->queued_bytes" in queues
 assert "queued_packets >= MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS" in queues
@@ -579,9 +606,25 @@ if rtsp_drain_series:
     assert "if (primed && any_byte_full)" in queues
     assert "media_source_drain_diag_queue(source, reason" in queues
     assert "return !!reason" in queues
+elif live_buffer:
+    # Live 1x retains packets; ordinary backpressure still applies elsewhere,
+    # and the aggregate emergency bounds remain unconditional.
+    expected = ("return !any_active || queued_packets >= MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS "
+                "|| queued_bytes >= MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES "
+                "|| ((!source->live_enabled || source->rate != 1.0f) && primed && any_full "
+                "&& (!source->read_ahead || !duration_known) "
+                "&& !InterlockedCompareExchange(&source->buffering, 0, 0)) "
+                "|| (source->read_ahead && duration_full);")
+    assert expected in " ".join(queues.split())
 else:
     assert "(primed && any_full)" in queues
-assert "empty = !stream->queued_packets" in queues
+if eos_drain:
+    assert "if (!stream->eos) any_active = TRUE;" in queues
+    assert "empty = !stream->eos && !stream->queued_packets;" in queues
+    assert "full = !stream->eos && (stream->queued_packets" in queues
+    assert "return !any_active ||" in queues
+else:
+    assert "empty = !stream->queued_packets" in queues
 assert "flush_token_queue(source->streams[i], source->streams[i]->active)" in start
 assert "prepend_token" in tokens and "dequeue_token" in tokens
 assert "MFAllocateWorkQueueEx(MF_MULTITHREADED_WORKQUEUE" in create
@@ -701,33 +744,41 @@ require_order(topology_after_clear, "media_engine_clear_presentation(engine)",
         "engine->presentation.source = source")
 assert "MFMEDIASOURCE_CAN_SEEK" in seekable
 assert "MFBYTESTREAM_IS_SEEKABLE" not in seekable
-assert "media_engine_defer_current_time(engine, seektime)" in set_time_ex
-assert "media_engine_set_current_time(engine, seektime)" not in set_time_ex
-assert "fabs(current - seektime) <= 3.0" in defer_seek
-assert "engine->flags & FLAGS_ENGINE_PAUSED" in defer_seek
-assert "media_engine_schedule_deferred_seek(engine, 250)" in defer_seek
-assert "MFScheduleWorkItem(&engine->deferred_seek_callback" in schedule_seek
-assert "engine->deferred_seek_work_scheduled" in schedule_seek
-assert "&engine->deferred_seek_work_key" in schedule_seek
-assert "media_engine_flush_deferred_seek(engine)" in schedule_seek
-require_order(deferred_callback, "engine->deferred_seek_work_scheduled = FALSE",
-        "GetTickCount() - engine->deferred_seek_time", "elapsed < 250",
-        "media_engine_schedule_deferred_seek(engine, 250 - elapsed)")
-session_events = region(engine, "static HRESULT WINAPI media_engine_session_events_Invoke",\
-        "static const IMFAsyncCallbackVtbl media_engine_session_events_vtbl")
-assert "BOOL deferred_seek_pending = engine->flags & FLAGS_ENGINE_DEFERRED_SEEK" in session_events
-assert "fabs(engine->deferred_seek - current_seek) <= 0.001" in session_events
-assert "fabs(engine->deferred_seek - current_seek) <= 3.0" not in session_events
-assert "next_seek_from_deferred" not in engine
-require_order(session_events, "if (deferred_seek_pending && isfinite(current_seek)",
-        "engine->deferred_seek = NAN", "deferred_seek_pending = FALSE",
-        "engine->current_seek = NAN",
-        "engine->next_seek = NAN", "if (isfinite(next_seek) &&",
-        "else if (!deferred_seek_pending")
-require_order(flush_deferred, "seektime = engine->deferred_seek",
-        "engine->deferred_seek = NAN",
-        "media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE)",
-        "return media_engine_set_current_time(engine, seektime)")
+if immediate_seek:
+    assert "media_engine_set_current_time(engine, seektime)" in set_time_ex
+    session_events = region(engine, "static HRESULT WINAPI media_engine_session_events_Invoke",
+            "static const IMFAsyncCallbackVtbl media_engine_session_events_vtbl")
+    require_order(session_events, "double next_seek = engine->next_seek", "engine->current_seek = NAN",
+            "engine->next_seek = NAN", "if (isfinite(next_seek) &&",
+            "media_engine_set_current_time(engine, next_seek)")
+else:
+    assert "media_engine_defer_current_time(engine, seektime)" in set_time_ex
+    assert "media_engine_set_current_time(engine, seektime)" not in set_time_ex
+    assert "fabs(current - seektime) <= 3.0" in defer_seek
+    assert "engine->flags & FLAGS_ENGINE_PAUSED" in defer_seek
+    assert "media_engine_schedule_deferred_seek(engine, 250)" in defer_seek
+    assert "MFScheduleWorkItem(&engine->deferred_seek_callback" in schedule_seek
+    assert "engine->deferred_seek_work_scheduled" in schedule_seek
+    assert "&engine->deferred_seek_work_key" in schedule_seek
+    assert "media_engine_flush_deferred_seek(engine)" in schedule_seek
+    require_order(deferred_callback, "engine->deferred_seek_work_scheduled = FALSE",
+            "GetTickCount() - engine->deferred_seek_time", "elapsed < 250",
+            "media_engine_schedule_deferred_seek(engine, 250 - elapsed)")
+    session_events = region(engine, "static HRESULT WINAPI media_engine_session_events_Invoke",\
+            "static const IMFAsyncCallbackVtbl media_engine_session_events_vtbl")
+    assert "BOOL deferred_seek_pending = engine->flags & FLAGS_ENGINE_DEFERRED_SEEK" in session_events
+    assert "fabs(engine->deferred_seek - current_seek) <= 0.001" in session_events
+    assert "fabs(engine->deferred_seek - current_seek) <= 3.0" not in session_events
+    assert "next_seek_from_deferred" not in engine
+    require_order(session_events, "if (deferred_seek_pending && isfinite(current_seek)",
+            "engine->deferred_seek = NAN", "deferred_seek_pending = FALSE",
+            "engine->current_seek = NAN",
+            "engine->next_seek = NAN", "if (isfinite(next_seek) &&",
+            "else if (!deferred_seek_pending")
+    require_order(flush_deferred, "seektime = engine->deferred_seek",
+            "engine->deferred_seek = NAN",
+            "media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE)",
+            "return media_engine_set_current_time(engine, seektime)")
 assert "duplicate_current" not in engine
 require_order(inflight_seek,
         "if (isfinite(engine->current_seek) && fabs(engine->current_seek - seektime) <= 0.001)",
@@ -739,8 +790,12 @@ require_order(session_restart, "if (node->u.sink.requests)",
         "IMFStreamSink_Flush")
 assert "session_sources_are_restarting" not in session
 if a320_series:
-    require_order(session_request[session_request.index("sink_node->u.sink.requests++"):],
+    # Check this guard's return, not an earlier stopped/EOS guard's return.
+    seek_guard = "if (session->command_state == COMMAND_STATE_RESTARTING_SOURCES"
+    require_order(session_request,
             "sink_node->u.sink.requests++",
+            seek_guard)
+    require_order(session_request[session_request.index(seek_guard):],
             "session->command_state == COMMAND_STATE_RESTARTING_SOURCES",
             "session->command_state == COMMAND_STATE_STARTING_SOURCES",
             "session->presentation.flags & SESSION_FLAG_RESTARTING",
@@ -752,16 +807,23 @@ require_order(session_source_state,
         "session_flush_sinks(session)", "session_start_clock(session)")
 shutdown_engine = region(engine, "static HRESULT WINAPI media_engine_Shutdown",\
         "static void set_rect")
-require_order(shutdown_engine, "deferred_seek_work_key = engine->deferred_seek_work_key",
-        "LeaveCriticalSection(&engine->cs)", "MFCancelWorkItem(deferred_seek_work_key)",
-        "IMFMediaSession_Shutdown(engine->session)")
-assert "engine->deferred_seek = NAN" in defer_seek
-set_time = region(engine, "static HRESULT WINAPI media_engine_SetCurrentTime",\
-        "static double WINAPI media_engine_GetStartTime")
-require_order(set_time, "engine->deferred_seek = NAN",
-        "media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE)",
-        "media_engine_set_current_time(engine, time)")
-assert "engine->deferred_seek_callback.lpVtbl = &media_engine_deferred_seek_callback_vtbl" in engine
+if immediate_seek:
+    require_order(shutdown_engine, "FLAGS_ENGINE_SHUT_DOWN, TRUE", "LeaveCriticalSection(&engine->cs)",
+            "IMFMediaSession_Shutdown(engine->session)")
+    set_time = region(engine, "static HRESULT WINAPI media_engine_SetCurrentTime(",
+            "static double WINAPI media_engine_GetStartTime")
+    assert "media_engine_set_current_time(engine, time)" in set_time
+else:
+    require_order(shutdown_engine, "deferred_seek_work_key = engine->deferred_seek_work_key",
+            "LeaveCriticalSection(&engine->cs)", "MFCancelWorkItem(deferred_seek_work_key)",
+            "IMFMediaSession_Shutdown(engine->session)")
+    assert "engine->deferred_seek = NAN" in defer_seek
+    set_time = region(engine, "static HRESULT WINAPI media_engine_SetCurrentTime",\
+            "static double WINAPI media_engine_GetStartTime")
+    require_order(set_time, "engine->deferred_seek = NAN",
+            "media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE)",
+            "media_engine_set_current_time(engine, time)")
+    assert "engine->deferred_seek_callback.lpVtbl = &media_engine_deferred_seek_callback_vtbl" in engine
 assert "av_rescale( params->timestamp, AV_TIME_BASE, 10000000 )" in demux
 assert "whence &= ~AVSEEK_FORCE" in unixlib
 assert "offset > INT64_MAX - (int64_t)base" in unixlib
@@ -788,7 +850,7 @@ else
   fact wow64_destroy_uses_destroy_params no
 fi
 
-if python3 - "$WINE_TREE/dlls/winedmo/unix_transform.c" <<'PY'
+if python3 - "$WINE_TREE/dlls/winedmo/unix_transform.c" "$NATIVE_AUDIO_TIMELINE_SERIES" <<'PY'
 from pathlib import Path
 import sys
 
@@ -803,9 +865,19 @@ output = region("NTSTATUS transform_get_output", "NTSTATUS transform_drain")
 push = region("NTSTATUS transform_push_input", "NTSTATUS transform_get_output")
 flush = region("NTSTATUS transform_flush", "NTSTATUS transform_get_output_format")
 
-assert "if (!t->audio_started && t->audio_output_pts_adjust == INT64_MIN" in output
-assert "t->audio_output_pts_adjust = INT64_MIN" in push
-assert "t->audio_output_pts_adjust = INT64_MIN" not in flush
+if sys.argv[2] == "1":
+    # Approved decoder-coordinate removal: no independent first-output origin.
+    assert "audio_output_pts_adjust" not in text
+    assert "params->pts = t->frame->pts;" in output
+    assert "else if (t->is_audio && t->last_input_pts != INT64_MIN)" in output
+    assert "params->pts = t->last_input_pts + t->cumulative_samples * 10000000LL / t->frame->sample_rate;" in output
+    assert "base_pts -= t->audio_pts_offset;" in output
+    assert "t->audio_base_pts = (base_pts != INT64_MIN) ? base_pts : 0;" in output
+    assert "t->audio_pts_offset = params->pts;" in push
+else:
+    assert "if (!t->audio_started && t->audio_output_pts_adjust == INT64_MIN" in output
+    assert "t->audio_output_pts_adjust = INT64_MIN" in push
+    assert "t->audio_output_pts_adjust = INT64_MIN" not in flush
 assert "t->audio_pts_offset   = 0" not in flush
 assert "t->audio_started      = false" in flush
 PY
@@ -944,15 +1016,27 @@ if [[ "$REQUIRE_ALPHA_SERIES" == 1 ]]; then
   require_alpha_pattern 'queued_packets >= MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS' \
     "packet queues lack an aggregate emergency high-water mark" \
     "$WINE_TREE/dlls/winedmo/media_source.c"
+  if [[ "$IMMEDIATE_SEEK_SERIES" == 1 ]]; then
+    require_alpha_pattern 'media_engine_set_current_time\(engine, seektime\)' \
+      "MediaEngine Ex seeks lack the shared immediate helper" \
+      "$WINE_TREE/dlls/mfmediaengine/main.c"
+  else
   require_alpha_pattern 'media_engine_schedule_deferred_seek' \
     "MediaEngine deferred seeks lack a guaranteed scheduler" \
     "$WINE_TREE/dlls/mfmediaengine/main.c"
+  fi
   require_alpha_pattern 'session_flush_sinks' \
     "post-seek sink demand is not re-primed" \
     "$WINE_TREE/dlls/mf/session.c"
+  if [[ "$IMMEDIATE_SEEK_SERIES" == 1 ]]; then
+    require_alpha_pattern 'engine->next_seek = seektime' \
+      "immediate seeks lack latest-target coalescing" \
+      "$WINE_TREE/dlls/mfmediaengine/main.c"
+  else
   require_alpha_pattern 'fabs\(engine->deferred_seek - current_seek\) <= 0[.]001' \
     "in-flight deferred duplicate seeks are not collapsed safely" \
     "$WINE_TREE/dlls/mfmediaengine/main.c"
+  fi
   require_alpha_pattern 'SIZE_MAX - header_size' \
     "simple demux-buffer allocation lacks an overflow guard" \
     "$WINE_TREE/dlls/winedmo/media_source.c"
@@ -978,11 +1062,13 @@ if [[ "$REQUIRE_ALPHA_SERIES" == 1 ]]; then
   require_alpha_pattern 'whence &= ~AVSEEK_FORCE' \
     "custom AVIO seek-origin hardening is absent" \
     "$WINE_TREE/dlls/winedmo/unixlib.c"
-  require_alpha_pattern 'struct demuxer_destroy_params params = \{0\}' \
+  # New Wine fixes the wrong parameter type upstream. Its context member is
+  # an output written by demuxer_destroy, so zero initialization is optional.
+  require_alpha_pattern 'struct demuxer_destroy_params params([[:space:]]*=[[:space:]]*\{0\})?;' \
     "WOW64 demux destroy parameters are not corrected" \
     "$WINE_TREE/dlls/winedmo/unixlib.c"
   [[ "$ALPHA_ORDERING" == yes ]] \
-    || fail "cancellation must precede joins/destruction and bracket seek locking"
+    || fail "teardown cancellation or selected seek-ownership ordering is incomplete"
   [[ "$MEDIA_REGRESSION_FIXES" == yes ]] \
     || fail "asynchronous HTTP open and VOD seek regression repairs are incomplete"
   [[ "$AUDIO_SEEK_TIMELINE" == yes ]] \
@@ -1085,6 +1171,22 @@ if [[ "$REQUIRE_A312_SERIES" == 1 ]]; then
   fact network_terminal_error_model passed
   fact network_terminal_error_source_audit passed
   fact a312_series_audit passed
+fi
+
+if grep -Fxq 'proposed/0060-media-trace-bounded-attribution-counters.patch' "$PATCH_SERIES"; then
+  attribution_checker=audit_attribution.py
+  if ! grep -Fxq 'proposed/0059-winedmo-probe-site-specific-hls-paths.patch' "$PATCH_SERIES"; then
+    attribution_checker=audit_attribution_p16.py
+  fi
+  python3 "$ROOT_DIR/tests/media-cadence/$attribution_checker" --wine-tree "$WINE_TREE" >/dev/null \
+    || fail "bounded media attribution source contract is incomplete"
+  fact media_attribution_source_audit passed
+fi
+
+if grep -Eq '^(proposed|ge-proton11-7-se2-p19b)/0061-winedmo-preserve-demuxed-video-timestamps(-v2)?\.patch$' "$PATCH_SERIES"; then
+  python3 "$ROOT_DIR/tests/mpeg-video-timestamps/test_source_metadata.py" --wine-tree "$WINE_TREE" --audit-only >/dev/null \
+    || fail "separate compressed video PTS/DTS source contract is incomplete"
+  fact compressed_video_metadata_audit passed
 fi
 
 fact structural_audit passed

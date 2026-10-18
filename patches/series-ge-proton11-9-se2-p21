@@ -1,0 +1,16 @@
+# GE-Proton11-9 SE2-P21 isolated seek-serialization proposal.
+# Apply strictly after GE ge-video-rework; full candidate not built.
+# Modules0003-0013 copied byte-for-byte from immutable P20.
+ge-proton11-9-se2-p21/0001-winedmo-retain-bounded-network-and-origin-contract.patch
+ge-proton11-9-se2-p21/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch
+ge-proton11-9-se2-p21/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch
+ge-proton11-9-se2-p21/0004-winedmo-retain-codec-admission-and-format-validation.patch
+ge-proton11-9-se2-p21/0005-mfreadwrite-retain-reader-error-layout-and-origin-contract.patch
+ge-proton11-9-se2-p21/0006-mf-retain-session-lifecycle-and-demand-accounting.patch
+ge-proton11-9-se2-p21/0007-mf-retain-sar-flush-demand-and-marker-ownership.patch
+ge-proton11-9-se2-p21/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch
+ge-proton11-9-se2-p21/0009-mfmediaengine-retain-render-clock-frame-demand.patch
+ge-proton11-9-se2-p21/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch
+ge-proton11-9-se2-p21/0011-mfplat-retain-failed-async-result-status.patch
+ge-proton11-9-se2-p21/0012-winewayland-retain-vr-device-extensions.patch
+ge-proton11-9-se2-p21/0013-mf-tests-retain-held-marker-context.patch

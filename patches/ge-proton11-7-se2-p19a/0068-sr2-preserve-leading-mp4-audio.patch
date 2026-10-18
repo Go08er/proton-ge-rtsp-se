@@ -1,0 +1,79 @@
+Subject: [PROPOSED P19 SR2] winedmo: seek before a delayed MOV stream without losing early audio
+
+MOV seeks all streams relative to the sample found in the selected anchor
+stream. With default video beginning at 0.733333 seconds, a zero seek lands
+on that first picture and silently skips the preceding audio. The shared
+stopped-to-started zero seek exposes this through both SourceReader and
+MediaEngine. On the retained fixture P18 loses 34816 decoded audio frames.
+
+Only for MOV/MP4, when the default stream has not yet begun, choose an earlier
+published audio/video stream with a known start as the anchor. Convert the
+requested time to that stream's timebase. Keep default anchoring for other
+demuxers and for normal seeks after the default stream's start. Do not skip
+the seek on restart/rewind, retry failed seeks, or change source timestamps,
+deadlines, normalization, queue policy, or source event ordering.
+
+This repairs discarded content, not the separate GE per-stream epoch policy
+or proof of A/V synchronization. Proposal only; not in the active series.
+
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -1416,13 +1416,45 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static int demuxer_seek_anchor( const struct demuxer *demuxer, int64_t timestamp )
++{
++    AVFormatContext *ctx = demuxer->ctx;
++    AVStream *stream, *other;
++    int original, best;
++    unsigned int i;
++
++    /* MOV aligns other streams to the default stream's found sample. Before
++     * a delayed video's first frame, that skips valid leading audio. Choose
++     * an earlier media epoch only in this case; keep normal seeks unchanged. */
++    if (!ctx->iformat || !strstr( ctx->iformat->name, "mp4" )) return -1;
++    if ((original = best = av_find_default_stream_index( ctx )) < 0) return -1;
++    stream = ctx->streams[best];
++    if (stream->start_time == AV_NOPTS_VALUE ||
++        av_compare_ts( stream->start_time, stream->time_base, timestamp, AV_TIME_BASE_Q ) <= 0)
++        return -1;
++
++    for (i = 0; i < demuxer->stream_count; ++i)
++    {
++        other = ctx->streams[i];
++        if ((other->codecpar->codec_type != AVMEDIA_TYPE_AUDIO && other->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) ||
++            other->start_time == AV_NOPTS_VALUE || other->discard == AVDISCARD_ALL ||
++            (other->disposition & AV_DISPOSITION_ATTACHED_PIC)) continue;
++        if (av_compare_ts( other->start_time, other->time_base, stream->start_time, stream->time_base ) < 0)
++        {
++            stream = other;
++            best = i;
++        }
++    }
++    return best == original ? -1 : best;
++}
++
+ NTSTATUS demuxer_seek( void *arg )
+ {
+     struct demuxer_seek_params *params = arg;
+     struct demuxer *demuxer = get_demuxer( params->demuxer );
+     int64_t timestamp = av_rescale( params->timestamp, AV_TIME_BASE, 10000000 );
+     NTSTATUS status;
+-    int i, ret;
++    int i, ret, anchor;
+ 
+     TRACE( "demuxer %p, timestamp 0x%s\n", demuxer, wine_dbgstr_longlong( params->timestamp ) );
+ 
+@@ -1452,8 +1484,10 @@
+         }
+     }
+ 
++    anchor = demuxer_seek_anchor( demuxer, timestamp );
++    if (anchor >= 0) timestamp = av_rescale_q( timestamp, AV_TIME_BASE_Q, demuxer->ctx->streams[anchor]->time_base );
+     if (demuxer->io_timeout) demuxer_set_deadline( demuxer, demuxer->io_timeout );
+-    ret = avformat_seek_file( demuxer->ctx, -1, INT64_MIN, timestamp, timestamp, AVSEEK_FLAG_BACKWARD );
++    ret = avformat_seek_file( demuxer->ctx, anchor, INT64_MIN, timestamp, timestamp, AVSEEK_FLAG_BACKWARD );
+     if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
+     if (ret == AVERROR_EOF && demuxer->direct_url && demuxer->require_avio_seek)
+         goto done;

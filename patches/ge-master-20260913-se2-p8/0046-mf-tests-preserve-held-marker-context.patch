@@ -1,0 +1,65 @@
+Subject: [PATCH] mf/tests: preserve the context of the held end marker
+
+GE's replay-at-EOP test holds an end marker but drops its context, then
+reports a synthetic marker with an empty value. A stream sink must return
+the supplied context with its marker event. The session uses that value to
+distinguish old presentation markers after a seek (project patch 0045).
+
+Copy the held context, return it with the delayed event, and clear it on
+replacement or sink destruction. Preserve the original NULL-context case
+and report a copy failure to the caller. This changes only the synthetic
+test sink, not playback or the session's marker validation.
+
+The extracted regression executes the actual test-sink methods and delayed
+event call: the unmodified GE fixture loses a UI8 context; the corrected
+fixture preserves it. Ownership and copy-error controls are also covered.
+---
+diff --git a/dlls/mf/tests/mf.c b/dlls/mf/tests/mf.c
+--- a/dlls/mf/tests/mf.c
++++ b/dlls/mf/tests/mf.c
+@@ -995,6 +995,7 @@ struct test_stream_sink
+ 
+     IMFMediaEventQueue *event_queue;
+     BOOL hold_markers;
++    PROPVARIANT held_marker_context;
+ };
+ 
+ static struct test_stream_sink *impl_from_IMFStreamSink(IMFStreamSink *iface)
+@@ -1044,6 +1045,7 @@ static ULONG WINAPI test_stream_sink_Release(IMFStreamSink *iface)
+ 
+     if (!refcount)
+     {
++        PropVariantClear(&sink->held_marker_context);
+         if (sink->handler)
+             IMFMediaTypeHandler_Release(sink->handler);
+         if (sink->media_sink)
+@@ -1159,7 +1161,10 @@ static HRESULT WINAPI test_stream_sink_PlaceMarker(IMFStreamSink *iface, MFSTREAMSINK_MARKER_TYPE marker_type,
+     struct test_stream_sink *sink = impl_from_IMFStreamSink(iface);
+ 
+     if (sink->hold_markers && marker_type == MFSTREAMSINK_MARKER_ENDOFSEGMENT)
+-        return S_OK;
++    {
++        PropVariantClear(&sink->held_marker_context);
++        return context ? PropVariantCopy(&sink->held_marker_context, context) : S_OK;
++    }
+ 
+     ok(0, "Unexpected call.\n");
+     return E_NOTIMPL;
+@@ -1247,6 +1252,7 @@ static struct test_stream_sink *create_test_stream_sink(IMFMediaSink *media_sink,
+     sink->IMFStreamSink_iface.lpVtbl = &test_stream_sink_vtbl,
+     sink->IMFGetService_iface.lpVtbl = &test_stream_sink_get_service_vtbl,
+     sink->refcount = 1;
++    PropVariantInit(&sink->held_marker_context);
+     if (handler)
+         IMFMediaTypeHandler_AddRef(sink->handler = handler);
+     if (media_sink)
+@@ -8813,7 +8819,8 @@ static void test_media_session_replay_at_eop(void)
+     hr = wait_media_event_until_blocking(session, callback, MESessionStarted, 100, &value);
+     ok(hr == WAIT_TIMEOUT, "Replay completed before the sink drained, hr %#lx.\n", hr);
+ 
+-    hr = IMFStreamSink_QueueEvent(sink->stream, MEStreamSinkMarker, &GUID_NULL, S_OK, NULL);
++    hr = IMFStreamSink_QueueEvent(sink->stream, MEStreamSinkMarker, &GUID_NULL, S_OK,
++            &impl_from_IMFStreamSink(sink->stream)->held_marker_context);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     hr = wait_media_event_until_blocking(session, callback, MESessionTopologyStatus, 1000, &value);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);

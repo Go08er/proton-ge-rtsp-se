@@ -174,6 +174,13 @@ jobs="$(pinned_ge_state_value "$INVOCATION" jobs)"
 global_jobs="$(pinned_ge_state_value "$INVOCATION" global_jobs)"
 make_jobs="$(pinned_ge_state_value "$INVOCATION" make_jobs)"
 ninja_jobs="$(pinned_ge_state_value "$INVOCATION" ninja_jobs)"
+# Old receipts have no override field and retain their pin's cap.
+recorded_job_cap="$PIN_DEFAULT_JOBS"
+if grep -q $'^authorized_job_cap\t' "$INVOCATION"; then
+  recorded_job_cap="$(pinned_ge_state_value "$INVOCATION" authorized_job_cap)"
+fi
+[[ "$recorded_job_cap" == "$(pinned_ge_job_cap)" ]] \
+  || pinned_ge_fail "recorded CPU cap differs; supply the explicitly authorized PINNED_GE_AUTHORIZED_JOB_CAP"
 [[ "$jobs" == "$global_jobs" ]] \
   || pinned_ge_fail "legacy jobs record does not match the global budget"
 expected_product="$(pinned_ge_validate_job_schedule \
@@ -197,6 +204,8 @@ done
     == "$(pinned_ge_state_value "$PREPARED_STATE" proton_launcher_patch_sha256)" ]] \
   || pinned_ge_fail "artifact invocation launcher-patch digest differs from prepared state"
 if [[ "$PIN_SCHEMA_VERSION" == 5 ]]; then
+  pinned_ge_require_ffmpeg_playback_state "$INVOCATION"
+  pinned_ge_require_ffmpeg_playback_state "$PREPARED_STATE"
   for key in \
       ffmpeg_security_fix_commits \
       ffmpeg_security_series_sha256 \
@@ -288,6 +297,10 @@ for path in \
 done
 
 version_file="$TOOL_DIR/version"
+if [[ "$PIN_WITHOUT_VKLAYERS" == 0 ]]; then
+  python3 "$ROOT_DIR/scripts/normalize-ge-low-latency-manifest.py" \
+    --tool-dir "$TOOL_DIR" --check
+fi
 version_line_count="$(wc -l <"$version_file")"
 read -r version_timestamp version_name version_extra <"$version_file" || true
 [[ "$version_line_count" == 1 ]] \
@@ -299,14 +312,16 @@ read -r version_timestamp version_name version_extra <"$version_file" || true
 [[ -z "$version_extra" ]] \
   || pinned_ge_fail "Proton version metadata contains unexpected extra fields"
 # Scan every payload node and every byte of every regular file without ignore
-# rules. Upstream llvm-mingw binaries legitimately retain their immutable
-# public CI root, and Proton's template prefix legitimately names the generic
-# Windows profiles steamuser and Public. No other home path is allowlisted.
+# rules. Upstream llvm-mingw retains its public CI root; one hash-bound Xalia
+# dependency retains its exact public CI PDB path. Proton's template prefix
+# legitimately names the generic Windows profiles steamuser and Public.
+# No other home path is allowlisted, and no payload file is skipped.
 # The archive helper has already proved its complete node inventory, modes,
 # link targets, and regular-file bytes identical to this directory, so this
 # single privacy scan applies to both distribution forms.
 if ! python3 - "$TOOL_DIR" "${HOME:-}" <<'PY'
 from pathlib import Path
+import hashlib
 import mmap
 import os
 import re
@@ -406,6 +421,13 @@ if walk_errors or filesystem_violations:
     raise SystemExit("artifact filesystem safety checks failed")
 
 LLVM_MINGW_PREFIX = b"/home/runner/work/llvm-mingw/"
+# Byte-identical Superpower.dll from pinned xalia-0.5.0-net48-mono.zip
+# (ZIP SHA-256 cf32efdacfa1593f73cf9fecc38918353bc5cb99bc7271f555748e0b7f6e9799).
+# This is public upstream build metadata, not the local builder's home. Bind
+# all three: installed location, complete DLL identity, and complete PDB path.
+XALIA_SUPERPOWER_FILE = "files/share/xalia/Superpower.dll"
+XALIA_SUPERPOWER_SHA256 = "2637bcd7f165e1e88e139672e023d264638bb4555627e373429ca47b99ee467e"
+XALIA_SUPERPOWER_PDB = b"/home/runner/work/superpower/superpower/src/Superpower/obj/Release/netstandard2.0/Superpower.pdb"
 WINDOWS_PROFILE_ALLOWLIST = {b"public", b"steamuser"}
 PATH_CONTINUATION = frozenset(
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+%/-\\"
@@ -430,6 +452,7 @@ home_is_runner = builder_home.rstrip(b"/").lower() == b"/home/runner"
 privacy_violations = set()
 scan_errors = []
 allowed_llvm_occurrences = 0
+allowed_xalia_occurrences = 0
 
 
 def has_absolute_boundary(view, start):
@@ -446,19 +469,27 @@ def is_llvm_mingw(view, start):
     return candidate == LLVM_MINGW_PREFIX
 
 
+def is_xalia_superpower(view, start, allow_xalia):
+    end = start + len(XALIA_SUPERPOWER_PDB)
+    return (allow_xalia and bytes(view[start:end]) == XALIA_SUPERPOWER_PDB
+            and (end == len(view) or view[end] == 0))
+
+
 def add_violation(rel, kind, match, encoding):
     rendered = match.decode("ascii", errors="backslashreplace")
     privacy_violations.add((rel, kind, rendered, encoding))
 
 
-def scan_view(view, rel, encoding):
-    global allowed_llvm_occurrences
+def scan_view(view, rel, encoding, allow_xalia=False):
+    global allowed_llvm_occurrences, allowed_xalia_occurrences
     if home_pattern is not None:
         for match in home_pattern.finditer(view):
             if not has_absolute_boundary(view, match.start()):
                 continue
             if home_is_runner and is_llvm_mingw(view, match.start()):
                 allowed_llvm_occurrences += 1
+            elif home_is_runner and is_xalia_superpower(view, match.start(), allow_xalia):
+                allowed_xalia_occurrences += 1
             else:
                 add_violation(rel, "exact builder HOME", match.group(0), encoding)
 
@@ -467,6 +498,9 @@ def scan_view(view, rel, encoding):
             continue
         if match.group("home") and is_llvm_mingw(view, match.start()):
             allowed_llvm_occurrences += 1
+            continue
+        if match.group("home") and is_xalia_superpower(view, match.start(), allow_xalia):
+            allowed_xalia_occurrences += 1
             continue
         add_violation(rel, "absolute Unix home path", match.group(0), encoding)
 
@@ -485,11 +519,13 @@ for path in sorted(regular_files):
             continue
         with path.open("rb") as stream, mmap.mmap(
                 stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
-            scan_view(data, rel, "bytes")
+            allow_xalia = (rel == XALIA_SUPERPOWER_FILE
+                           and hashlib.sha256(data).hexdigest() == XALIA_SUPERPOWER_SHA256)
+            scan_view(data, rel, "bytes", allow_xalia)
             for match in UTF16_LE_ASCII.finditer(data):
-                scan_view(match.group(0)[::2], rel, "UTF-16LE")
+                scan_view(match.group(0)[::2], rel, "UTF-16LE", allow_xalia)
             for match in UTF16_BE_ASCII.finditer(data):
-                scan_view(match.group(0)[1::2], rel, "UTF-16BE")
+                scan_view(match.group(0)[1::2], rel, "UTF-16BE", allow_xalia)
     except (OSError, ValueError) as error:
         scan_errors.append(f"{rel}: {error}")
 
@@ -508,7 +544,8 @@ if privacy_violations:
 
 print(
     f"Scanned {len(regular_files)} regular files without ignore rules "
-    f"({allowed_llvm_occurrences} allowed LLVM-MinGW paths)"
+    f"({allowed_llvm_occurrences} allowed LLVM-MinGW paths, "
+    f"{allowed_xalia_occurrences} exact hash-bound Xalia PDB paths)"
 )
 PY
 then
@@ -573,6 +610,18 @@ if [[ "$PIN_SCHEMA_VERSION" == 5 ]]; then
     "FFmpeg crypto-build audit SHA-256: $(pinned_ge_state_value \
       "$PREPARED_STATE" ffmpeg_crypto_build_audit_sha256)"
   )
+fi
+if [[ -n "${PIN_FFMPEG_RTSPS_PATCH_SHA256:-}" ]]; then
+  provenance_lines+=("FFmpeg secure-RTSP companion SHA-256: $PIN_FFMPEG_RTSPS_PATCH_SHA256")
+fi
+if [[ -n "${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}" ]]; then
+  provenance_lines+=("FFmpeg HTTP-seek companion SHA-256: $PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256")
+fi
+if [[ -n "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" ]]; then
+  provenance_lines+=("FFmpeg HTTP-filesize companion SHA-256: $PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256")
+fi
+if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" ]]; then
+  provenance_lines+=("FFmpeg HLS-early-seek companion SHA-256: $PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256")
 fi
 if [[ "$PINNED_GE_HAS_PATCH_OVERLAP" == 1 ]]; then
   provenance_lines+=(
