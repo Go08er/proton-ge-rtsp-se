@@ -7,8 +7,8 @@ For seeking, check forward/backward movement and sustained playback afterward.
 For a live stream without a clock, say that rather than inventing timing data.
 
 The SE2 development baseline, candidate P24 (the same Wine series and FFmpeg
-build modules as SE2), passed quiet-host qualification and a maintainer VRChat
-live test; the SE1 baseline, A3.23, passed the maintainer's reported service
+build modules as SE2), passed qualification and a maintainer VRChat live
+test; the SE1 baseline, A3.23, passed the maintainer's reported service
 seek, YouTube seek, Waterwolf RTSP and multiplayer join-in-progress checks.
 Exact synchronization offsets were not measured. See the
 [release notes](../RELEASE.md#qualification-and-limits) for the SE2 results
