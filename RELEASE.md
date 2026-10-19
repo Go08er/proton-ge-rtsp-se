@@ -64,13 +64,70 @@ Source/build materials:
 
 ## Qualification and limits
 
-@SE2_QUALIFICATION@
+## Build and identity
+
+- **Build.** One offline GE `redist` build completed for both Wine
+  architectures:
+  - pinned budget Make 4 × Ninja 2;
+  - all 98 submodules and the 16 contrib inputs seeded locally;
+  - preparation, independent fresh-setup verification, artifact
+    re-verification, source audits and post-build preparation all passed.
+- **Artifact checks passed:**
+  - hashes and gzip integrity;
+  - exact archive/tree match;
+  - links, types and permissions;
+  - home-path privacy scan;
+  - no WineGStreamer payload.
+- **The same content as the tested candidate.** SE2 rebuilds the exact
+  content of candidate P24 under the release name:
+  - the same pin fields apart from identity;
+  - the same 17 Wine patches;
+  - the same prepared Wine tree (all 28 media postimage hashes);
+  - identical FFmpeg configuration.
+- **File-by-file comparison of the tool trees (6,160 files):**
+  - 4,343 files are byte-identical;
+  - the rest differ only by build name or path, build IDs, timestamps or
+    generated IDs;
+  - every media-critical binary (Media Foundation, WineDMO, quartz, FFmpeg)
+    is identical once those fields are normalized;
+  - the launcher is byte-identical.
+- **Nix.** The Nix prebuilt package built from the release archive matches
+  the tool exactly, and the NixOS module evaluates.
+
+## Runtime (SE2 artifact; contained loopback unless noted)
+
+- **Contained tests pass:**
+  - RTSP ×2;
+  - HLS healthy, burst and seek;
+  - HTTP seek;
+  - HLS VOD.
+- **Throttle and warm-up.** Five 80%-throttle/warm-up runs pass the frozen
+  policy scorer, each with two holds of about 6 s and no startup hold.
+- **ALAC.** The ALAC SourceReader ×4 shows no leading-sample loss.
+- **Backward startup.** HTTPS backward startup passes.
+- **F102 102-case regression set:** 79 PASS / 5 FAIL / 12 INCOMPLETE / 6 not run, with no case changing class
+  against the previous candidate baseline (79 / 5 / 18). The FAILs are the
+  two cases whose frozen oracle forbids the adopted GE 403 retry, and three
+  inherited SourceReader cases decided as no product change. The 18
+  decoder-coordinate cases are INCOMPLETE or not run on a clean package
+  (no decoder-identity records), as on the baseline.
+- **Private HTTPS item** (a real remote server): SE2 3/6 and the content-identical candidate 6/6 in interleaved runs on
+  the same night; across all runs that day, SE2 4/10 and the candidate 15/16.
+  Every failure on either build has one signature: after a seek, frames
+  arrive late or not at all, with no error reported. A maintainer VRChat
+  comparison the same night saw very similar content failures on both
+  builds, so this is treated as an open seek-path/network issue, not an
+  SE2-specific defect.
+
+**Candidate history.** P24 is content-identical to SE2. It passed the same
+contained set, had a quiet-host private-item record of 9/10, and went
+through a maintainer VRChat session that played well.
 
 Known limits:
 
-- A freeze right after a backward seek was seen once in 10 runs of a private
-  HTTPS test item on the content-identical candidate, with no error reported.
-  It did not reproduce in later runs; its cause is not established.
+- On a real remote HTTPS item, frames sometimes arrive late or not at all
+  after a seek, with no error (numbers above). It occurs on both SE2 and the
+  candidate; its cause is not established.
 - HTTP reconnect applies only to `.mp4` and googlevideo URLs, as in upstream
   GE-Proton11-9.
 - The 18 decoder-coordinate cases of the 102-case F102 regression set report
