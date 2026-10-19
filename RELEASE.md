@@ -114,10 +114,15 @@ Source/build materials:
 - **Private HTTPS item** (a real remote server): SE2 3/6 and the content-identical candidate 6/6 in interleaved runs on
   the same night; across all runs that day, SE2 4/10 and the candidate 15/16.
   Every failure on either build has one signature: after a seek, frames
-  arrive late or not at all, with no error reported. A maintainer VRChat
-  comparison the same night saw very similar content failures on both
-  builds, so this is treated as an open seek-path/network issue, not an
-  SE2-specific defect.
+  arrive late or not at all, with no error reported. Diagnosis traced this
+  to that server, not to SE2:
+  - a maintainer VRChat comparison saw the same failures on both builds;
+  - a native Windows viewer failed on the same link;
+  - the Proton log showed TLS records arriving corrupted or truncated, even
+    on fresh connections before any seek;
+  - plain `curl` from the same host measured 5–7 s waits for the first byte
+    after a range request and throughput as low as 13–38 KB/s, below what
+    the video needs.
 
 **Candidate history.** P24 is content-identical to SE2. It passed the same
 contained set, had a quiet-host private-item record of 9/10, and went
@@ -125,9 +130,10 @@ through a maintainer VRChat session that played well.
 
 Known limits:
 
-- On a real remote HTTPS item, frames sometimes arrive late or not at all
-  after a seek, with no error (numbers above). It occurs on both SE2 and the
-  candidate; its cause is not established.
+- A slow or erratic HTTP server stalls playback after seeks without an error
+  being reported: HTTP media that sends nothing for 15 s ends the stream,
+  and only `.mp4`/googlevideo URLs reconnect. The private-item stalls above
+  were traced to the server.
 - HTTP reconnect applies only to `.mp4` and googlevideo URLs, as in upstream
   GE-Proton11-9.
 - The 18 decoder-coordinate cases of the 102-case F102 regression set report
