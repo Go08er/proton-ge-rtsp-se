@@ -33,7 +33,7 @@ wrappers, if needed by your setup, remain your own configuration.
 Add this repository as a flake input and import its module:
 
 ```nix
-inputs.rtsp-se3.url = "github:Go08er/proton-ge-real-time-streaming-protocol-slop-edition/se3";
+inputs.rtsp-se3.url = "github:Go08er/proton-ge-rtsp-se/se3";
 
 # In the NixOS configuration, with rtsp-se3 passed through specialArgs:
 imports = [ rtsp-se3.nixosModules.default ];

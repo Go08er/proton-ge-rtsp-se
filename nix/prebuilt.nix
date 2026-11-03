@@ -23,7 +23,7 @@ in stdenvNoCC.mkDerivation {
   '';
   meta = {
     description = "Experimental GE-Proton11-11 RTSP compatibility tool";
-    homepage = "https://github.com/Go08er/proton-ge-real-time-streaming-protocol-slop-edition";
+    homepage = "https://github.com/Go08er/proton-ge-rtsp-se";
     platforms = [ "x86_64-linux" ];
     # Aggregate: component/file licenses remain authoritative.
     license = with lib.licenses; [ bsd3 lgpl21Plus gpl2Plus gpl3Plus mit zlib ];

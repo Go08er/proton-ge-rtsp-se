@@ -62,7 +62,7 @@ documentation, not this overview.
 
 - [Release notes](RELEASE.md): exact build, changes and qualification.
 - [Patch index](patches/README.md): individual changes, explanations and code links.
-- [Downloads and release history](https://github.com/Go08er/proton-ge-real-time-streaming-protocol-slop-edition/releases).
+- [Downloads and release history](https://github.com/Go08er/proton-ge-rtsp-se/releases).
 - [Installation and NixOS](docs/INSTALL.md).
 - [Build from source](docs/BUILDING.md).
 - [Testing and safe issue reports](docs/TESTING.md).

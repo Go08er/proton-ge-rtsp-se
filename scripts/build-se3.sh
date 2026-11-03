@@ -110,7 +110,7 @@ if [[ "$use_release_inputs" == 1 ]]; then
   bundle="$work_dir/se3-build-inputs.tar.zst"
   curl --fail --location --proto '=https' --proto-redir '=https' \
     --output "$bundle" \
-    'https://github.com/Go08er/proton-ge-real-time-streaming-protocol-slop-edition/releases/download/se3/proton-ge-11-11-rtsp-se3-build-inputs.tar.zst'
+    'https://github.com/Go08er/proton-ge-rtsp-se/releases/download/se3/proton-ge-11-11-rtsp-se3-build-inputs.tar.zst'
   printf '%s  %s\n' \
     1e768c80e0fc5180321d3df3b9c093f5537a0d736f80608403ac32a19e4788cf \
     "$bundle" | sha256sum --check --status
