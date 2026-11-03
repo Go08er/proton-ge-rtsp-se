@@ -1,0 +1,38 @@
+Subject: [SE3-P2] winedmo: give raw FLAC a bits-per-sample value
+
+FFmpeg's raw FLAC demuxer leaves bits_per_coded_sample and
+bits_per_raw_sample unset, so the input type has wBitsPerSample 0, the
+decoder offers a 0-bit PCM output, and topology resolution fails
+(MF_E_NO_MORE_TYPES). Raw .flac URLs never play. Fall back to
+bits_per_raw_sample, then to STREAMINFO from the extradata, then to 16 as
+already done for Opus and Vorbis.
+
+---
+diff --git a/dlls/winedmo/unix_media_type.c b/dlls/winedmo/unix_media_type.c
+--- a/dlls/winedmo/unix_media_type.c
++++ b/dlls/winedmo/unix_media_type.c
+@@ -86,7 +86,23 @@
+     format->nSamplesPerSec = params->sample_rate;
+     format->wBitsPerSample = av_get_bits_per_sample( params->codec_id );
+     if (!format->wBitsPerSample) format->wBitsPerSample = params->bits_per_coded_sample;
+-    if (!format->wBitsPerSample && (params->codec_id == AV_CODEC_ID_OPUS || params->codec_id == AV_CODEC_ID_VORBIS))
++    if (!format->wBitsPerSample) format->wBitsPerSample = params->bits_per_raw_sample;
++    if (!format->wBitsPerSample && params->codec_id == AV_CODEC_ID_FLAC)
++    {
++        /* Raw and Ogg FLAC demuxers leave both fields unset; STREAMINFO holds
++         * bits per sample minus one in 5 bits at byte 12 bit 0..byte 13 bit 4. */
++        const uint8_t *info = params->extradata;
++        int size = params->extradata_size;
++
++        if (size >= 8 && !memcmp( info, "fLaC", 4 ))
++        {
++            info += 8;
++            size -= 8;
++        }
++        if (size >= 34) format->wBitsPerSample = (((info[12] & 1) << 4) | (info[13] >> 4)) + 1;
++    }
++    if (!format->wBitsPerSample && (params->codec_id == AV_CODEC_ID_OPUS || params->codec_id == AV_CODEC_ID_VORBIS
++            || params->codec_id == AV_CODEC_ID_FLAC))
+         format->wBitsPerSample = 16;
+     if (!(format->nBlockAlign = params->block_align)) format->nBlockAlign = format->wBitsPerSample * format->nChannels / 8;
+     if (!(format->nAvgBytesPerSec = params->bit_rate / 8)) format->nAvgBytesPerSec = format->nSamplesPerSec * format->nBlockAlign;

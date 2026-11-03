@@ -1,0 +1,54 @@
+Subject: [SE3-P2] winedmo: map MPEG-4 Part 2 and MS-MPEG4 v3 FourCC aliases to registered subtypes
+
+Unmapped codecs use the container's raw codec_tag as the MF subtype, so
+AVIs tagged xvid, divx, fmp4, DIV3 and other aliases produce subtypes no
+decoder registers and topology resolution fails. Map MPEG-4 Part 2 to the
+upper-case registered spelling when it is one (XVID, DIVX, DX50, FMP4,
+M4S2, MP4S) and to MP4V otherwise, and MS-MPEG4 v3 to MP43.
+
+---
+diff --git a/dlls/winedmo/unix_media_type.c b/dlls/winedmo/unix_media_type.c
+--- a/dlls/winedmo/unix_media_type.c
++++ b/dlls/winedmo/unix_media_type.c
+@@ -73,6 +73,20 @@
+     return av_codec_get_tag( table, id );
+ }
+ 
++static UINT32 fourcc_to_upper( UINT32 tag )
++{
++    UINT32 ret = 0;
++    int i;
++
++    for (i = 0; i < 4; i++)
++    {
++        BYTE c = tag >> (8 * i);
++        if (c >= 'a' && c <= 'z') c -= 'a' - 'A';
++        ret |= (UINT32)c << (8 * i);
++    }
++    return ret;
++}
++
+ static void wave_format_ex_init( const AVCodecParameters *params, WAVEFORMATEX *format, UINT32 format_size, WORD format_tag )
+ {
+     memset( format, 0, format_size );
+@@ -409,6 +423,20 @@
+         else if (params->codec_id == AV_CODEC_ID_VP9) format->guidFormat.Data1 = MFVideoFormat_VP90.Data1;
+         else if (params->codec_id == AV_CODEC_ID_AV1) format->guidFormat.Data1 = MFVideoFormat_AV1.Data1;
+         else if (params->codec_id == AV_CODEC_ID_HEVC) format->guidFormat.Data1 = MFVideoFormat_HEVC.Data1;
++        else if (params->codec_id == AV_CODEC_ID_MPEG4)
++        {
++            /* AVI FourCCs vary in case and spelling (xvid, divx, dx50, fmp4, ...);
++             * the decoder registers the upper-case forms and MP4V. */
++            UINT32 tag = fourcc_to_upper( params->codec_tag );
++            if (tag == MAKEFOURCC('X','V','I','D') || tag == MAKEFOURCC('D','I','V','X')
++                    || tag == MAKEFOURCC('D','X','5','0') || tag == MAKEFOURCC('F','M','P','4')
++                    || tag == MAKEFOURCC('M','4','S','2') || tag == MAKEFOURCC('M','P','4','S'))
++                format->guidFormat.Data1 = tag;
++            else
++                format->guidFormat.Data1 = MAKEFOURCC('M','P','4','V');
++        }
++        else if (params->codec_id == AV_CODEC_ID_MSMPEG4V3)
++            format->guidFormat.Data1 = MAKEFOURCC('M','P','4','3');  /* DIV3, DIV4, MPG3, ... */
+         else if (params->codec_tag) format->guidFormat.Data1 = params->codec_tag;
+         else format->guidFormat.Data1 = video_format_tag_from_codec_id( params->codec_id );
+     }

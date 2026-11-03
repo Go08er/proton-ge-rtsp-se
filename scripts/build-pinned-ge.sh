@@ -382,6 +382,14 @@ for path in "${REGISTERED[@]}"; do
         continue
       fi
       ;;
+    # GE-Proton11-11 protonprep patches these two; older GE trees have no patch dir.
+    openvr|d7vk)
+      if [[ -d "$SOURCE_DIR/patches/$path" ]]; then
+        pinned_ge_require_upstream_component_patch_state \
+          "$SOURCE_DIR/$path" "$SOURCE_DIR/patches/$path"
+        continue
+      fi
+      ;;
   esac
   [[ -z "$(pinned_ge_git -C "$SOURCE_DIR/$path" status --porcelain --untracked-files=all)" ]] \
     || pinned_ge_fail "unexpected prepared-source changes in submodule: $path"

@@ -1,0 +1,95 @@
+Subject: [P23] winedmo: adopt GE11-9's HTTP reconnect and 403 retry
+
+GE-Proton11-9 enables FFmpeg's byte-exact HTTP reconnect for progressive
+URLs (.googlevideo.com/videoplayback or .mp4), sets a 15 s rw_timeout for
+non-HLS HTTP and retries a 403 once with its legacy media user agent. P20
+superseded these with a no-reconnect policy; the maintainer revoked that
+policy in favour of upstream. Keep our Windows media identity for the first
+request and use GE's agent only for the 403 retry, sharing the original open
+deadline. Raise our outer packet deadline on the reconnect path to 75 s so it
+does not abort FFmpeg's reconnect sequence; cancellation is unchanged.
+
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -41,8 +41,12 @@
+ #define HLS_IO_TIMEOUT_US    INT64_C(30000000)
+ #define HTTP_OPEN_TIMEOUT_US INT64_C(30000000)
+ #define HTTP_IO_TIMEOUT_US   INT64_C(15000000)
++/* GE's progressive reconnect: a 15 s stalled read, then FFmpeg reconnects with
++ * up to 5 s of delays, each attempt bounded by the same rw_timeout. */
++#define HTTP_RECONNECT_IO_TIMEOUT_US INT64_C(75000000)
+ /* Match the Windows Media Foundation HTTP client identity used by Proton-RTSP. */
+ #define HTTP_USER_AGENT "NSPlayer/12.00.19041.4894 WMFSDK/12.00.19041.4894"
++#define HTTP_FALLBACK_USER_AGENT "GStreamer souphttpsrc"
+ 
+ #define HTTP_HLS_PROTOCOL_WHITELIST "http,https,httpproxy,tcp,tls,crypto"
+ #define HTTPS_HLS_PROTOCOL_WHITELIST "https,httpproxy,tcp,tls,crypto"
+@@ -878,6 +882,13 @@
+     return url && !strncasecmp( url, "http://", 7 ) && ret == AVERROR_INVALIDDATA;
+ }
+ 
++/* Same classifier as GE11-9 for enabling FFmpeg's HTTP reconnect. */
++static BOOL is_http_progressive_url( const char *url )
++{
++    if (!is_http_url( url )) return FALSE;
++    return !!strstr( url, ".googlevideo.com/videoplayback" ) || !!strstr( url, ".mp4" );
++}
++
+ static BOOL is_http_hls_url( const char *url )
+ {
+     const char *cursor;
+@@ -998,6 +1009,7 @@
+         BOOL hls_hint = is_http_hls_url( params->url ), interrupted, detected_hls;
+         const AVInputFormat *hint = hls_hint ? av_find_input_format( "hls" ) : NULL;
+         const char *protocol_whitelist = hls_protocol_whitelist( params->url );
++        BOOL reconnect = !hls_hint && is_http_progressive_url( params->url );
+         BOOL progressive;
+ 
+         if (hls_hint && !hint) goto failed;
+@@ -1009,9 +1021,16 @@
+          * so an auto-detected HLS playlist can use AES-128 and relative URLs too.
+          * This does not add a manifest parser or a second open/probe request. */
+         if (av_dict_set( &options, "protocol_whitelist", protocol_whitelist, 0 ) < 0) goto failed;
+-        /* The selected explicit identity supersedes GE's default-identity 403
+-         * retry. Keep one bounded open, rather than adding a second request. */
++        /* Open with the Windows media identity; GE's 403 retry below may
++         * replace it once, within the same open deadline. */
+         if (av_dict_set( &options, "user_agent", HTTP_USER_AGENT, 0 ) < 0) goto failed;
++        /* As GE11-9: a stalled non-HLS read fails after 15 s, and progressive
++         * byte-range requests reconnect at the same offset after a reset. */
++        if (!hls_hint && av_dict_set( &options, "rw_timeout", "15000000", 0 ) < 0) goto failed;
++        if (reconnect && (av_dict_set( &options, "reconnect", "1", 0 ) < 0
++                || av_dict_set( &options, "reconnect_streamed", "1", 0 ) < 0
++                || av_dict_set( &options, "reconnect_on_network_error", "1", 0 ) < 0
++                || av_dict_set( &options, "reconnect_delay_max", "5", 0 ) < 0)) goto failed;
+         if (av_dict_set_int( &options, "tls_verify", 1, 0 ) < 0) goto failed;
+         /* These two private options are consumed only if FFmpeg selects HLS.
+          * Constrain its child demuxers, not unrelated progressive containers. */
+@@ -1021,11 +1040,25 @@
+         demuxer->direct_url = TRUE;
+         demuxer->require_avio_seek = TRUE;
+         demuxer->io_timeout = HTTP_IO_TIMEOUT_US;
++        /* Our outer packet deadline must not cut FFmpeg's reconnect short. */
++        if (reconnect) demuxer->io_timeout = HTTP_RECONNECT_IO_TIMEOUT_US;
+         demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
+         demuxer->ctx->interrupt_callback.opaque = demuxer;
+         demuxer_set_deadline( demuxer, HTTP_OPEN_TIMEOUT_US );
+         ret = avformat_open_input( &demuxer->ctx, direct_url, hint, &options );
+         interrupted = demuxer_interrupt_callback( demuxer );
++        if (ret == AVERROR_HTTP_FORBIDDEN && !interrupted)
++        {
++            /* As GE11-9: retry a 403 once with its legacy media user agent. A
++             * failed open frees the context but preserves the input options. */
++            WARN( "HTTP source returned 403, retrying with the legacy media user agent.\n" );
++            if (!(demuxer->ctx = avformat_alloc_context())) goto failed;
++            demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
++            demuxer->ctx->interrupt_callback.opaque = demuxer;
++            if ((ret = av_dict_set( &options, "user_agent", HTTP_FALLBACK_USER_AGENT, 0 )) >= 0)
++                ret = avformat_open_input( &demuxer->ctx, direct_url, hint, &options );
++            interrupted = demuxer_interrupt_callback( demuxer );
++        }
+         if (ret < 0)
+         {
+             /* A timeout or cancellation must stay terminal.  Falling back to

@@ -1,0 +1,175 @@
+Subject: [P23] winedmo: deliver read-ahead data errors when playback reaches them
+
+With network read-ahead, a demux/bitstream-filter data error on a future
+packet was queued as MEError immediately, ending playback seconds early and
+discarding the queued good samples. Queue a payload-less error marker behind
+the read-ahead data of every active stream and idle the demux thread; raise
+the error when a stream dequeues the marker. Only STATUS_DATA_ERROR is
+deferred; timeouts, disconnects, cancellation, shutdown and EOS are unchanged.
+Seek/start clears the deferred state with the existing demux_eof reset.
+
+---
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -239,6 +239,7 @@
+     INT64 dts;      /* INT64_MIN if unavailable */
+     INT64 pts;      /* INT64_MIN if unavailable */
+     INT64 duration; /* INT64_MIN if unavailable */
++    HRESULT error;  /* Failure for a payload-less deferred error marker, S_OK otherwise. */
+ };
+ 
+ static void media_packet_free(struct media_packet *pkt)
+@@ -312,6 +313,13 @@
+     stream->queued_duration = stream->queued_unknown = 0;
+ }
+ 
++/* Queue lock held. A deferred error marker is always the last queued entry. */
++static BOOL media_packet_queue_has_error(struct media_stream *stream)
++{
++    struct list *tail = list_tail(&stream->packet_queue);
++    return tail && FAILED(LIST_ENTRY(tail, struct media_packet, entry)->error);
++}
++
+ enum source_async_op
+ {
+     SOURCE_ASYNC_START,
+@@ -492,6 +500,7 @@
+     LONGLONG first = INT64_MAX, last = INT64_MIN;
+     LIST_FOR_EACH_ENTRY(pkt, &stream->packet_queue, struct media_packet, entry)
+     {
++        if (FAILED(pkt->error)) continue;
+         if (pkt->pts == INT64_MIN) return 0;
+         first = min(first, pkt->pts); last = max(last, pkt->pts);
+     }
+@@ -540,7 +549,7 @@
+         if (!stream->active) continue;
+         EnterCriticalSection(&stream->queue_cs);
+         packets += stream->queued_packets; bytes += stream->queued_bytes;
+-        eos = stream->eos;
++        eos = stream->eos || media_packet_queue_has_error(stream);
+         if (!eos && (source->live_enabled && source->rate == 1.0f ? live_queue_span(stream) < live_targets[source->live_level] :
+                 stream->queued_unknown || stream->queued_duration < BUFFERING_RESERVE)) ready = FALSE;
+         LeaveCriticalSection(&stream->queue_cs);
+@@ -665,6 +674,7 @@
+ }
+ 
+ static HRESULT media_stream_send_eos(struct media_source *source, struct media_stream *stream);
++static BOOL media_source_queue_demux_error(struct media_source *source, HRESULT error);
+ 
+ static BOOL media_source_stream_queues_full(struct media_source *source)
+ {
+@@ -1607,10 +1617,13 @@
+     {
+         pkt = LIST_ENTRY(list_head(&stream->packet_queue), struct media_packet, entry);
+         list_remove(&pkt->entry);
+-        --stream->queued_packets;
+-        stream->queued_bytes -= pkt->size;
+-        if (pkt->duration > 0) stream->queued_duration -= min(pkt->duration, BUFFERING_RESERVE);
+-        else --stream->queued_unknown;
++        if (!FAILED(pkt->error)) /* Markers are not counted. */
++        {
++            --stream->queued_packets;
++            stream->queued_bytes -= pkt->size;
++            if (pkt->duration > 0) stream->queued_duration -= min(pkt->duration, BUFFERING_RESERVE);
++            else --stream->queued_unknown;
++        }
+     }
+     LeaveCriticalSection(&stream->queue_cs);
+     return pkt;
+@@ -1620,10 +1633,13 @@
+ {
+     EnterCriticalSection(&stream->queue_cs);
+     list_add_head(&stream->packet_queue, &pkt->entry);
+-    ++stream->queued_packets;
+-    stream->queued_bytes += pkt->size;
+-    if (pkt->duration > 0) stream->queued_duration += min(pkt->duration, BUFFERING_RESERVE);
+-    else ++stream->queued_unknown;
++    if (!FAILED(pkt->error))
++    {
++        ++stream->queued_packets;
++        stream->queued_bytes += pkt->size;
++        if (pkt->duration > 0) stream->queued_duration += min(pkt->duration, BUFFERING_RESERVE);
++        else ++stream->queued_unknown;
++    }
+     WakeConditionVariable(&stream->queue_cv);
+     LeaveCriticalSection(&stream->queue_cs);
+ }
+@@ -1690,6 +1706,15 @@
+             return hr;
+         }
+ 
++        if (pkt && FAILED(pkt->error))
++        {
++            /* Playback reached the packet which failed during read-ahead. */
++            hr = pkt->error;
++            media_packet_free(pkt);
++            media_source_queue_demux_error(source, hr);
++            return hr;
++        }
++
+         if (pkt)
+         {
+             if (source->buffering) { stream_requeue_packet(stream, pkt); continue; }
+@@ -1756,6 +1781,40 @@
+     return queued;
+ }
+ 
++/* Demuxer lock held. Queue an error marker behind the read-ahead data of every
++ * active stream and idle the demux thread like at EOF, without signalling EOS. */
++static BOOL media_source_defer_demux_error(struct media_source *source, LONG epoch, HRESULT error)
++{
++    BOOL deferred = FALSE;
++    UINT i;
++
++    for (i = 0; i < source->stream_count; ++i)
++    {
++        struct media_stream *stream = source->streams[i];
++        struct media_packet *pkt;
++
++        EnterCriticalSection(&stream->queue_cs);
++        if (stream->active && epoch == media_source_get_demux_transition(source)
++                && (pkt = calloc(1, sizeof(*pkt))))
++        {
++            pkt->epoch = epoch;
++            pkt->error = error;
++            pkt->dts = pkt->pts = pkt->duration = INT64_MIN;
++            list_add_tail(&stream->packet_queue, &pkt->entry);
++            WakeAllConditionVariable(&stream->queue_cv);
++            deferred = TRUE;
++        }
++        LeaveCriticalSection(&stream->queue_cs);
++    }
++    if (deferred)
++    {
++        source->demux_eof = TRUE;
++        if (epoch != media_source_get_demux_transition(source))
++            source->demux_eof = FALSE;
++    }
++    return deferred;
++}
++
+ static DWORD CALLBACK source_demux_thread(void *arg)
+ {
+     struct media_source *source = arg;
+@@ -1832,6 +1891,12 @@
+         {
+             HRESULT error = media_source_error_from_demux_status(status);
+ 
++            if (status == STATUS_DATA_ERROR && media_source_defer_demux_error(source, read_epoch, error))
++            {
++                LeaveCriticalSection(&source->demuxer_cs);
++                IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
++                continue;
++            }
+             media_source_queue_demux_error(source, error);
+             LeaveCriticalSection(&source->demuxer_cs);
+             IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+@@ -1905,6 +1970,7 @@
+             memcpy(pkt->data, src_data, data_len);
+             pkt->size = data_len;
+             pkt->epoch = read_epoch;
++            pkt->error = S_OK;
+             pkt->dts      = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIME)
+                             ? output.rtTimestamp : INT64_MIN;
+             pkt->pts      = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIME)

@@ -1,0 +1,107 @@
+Subject: [SE3-P2] mfmediaengine: report a failed topology as SRC_NOT_SUPPORTED
+
+When nothing can decode or render the source (no decoder, no negotiable
+media type), the session reports MESessionTopologySet with a failure status
+and MediaEngine ignored it: the player stayed in its loading state forever
+with no error. Windows raises MF_MEDIA_ENGINE_EVENT_ERROR with
+MF_MEDIA_ENGINE_ERR_SRC_NOT_SUPPORTED.
+
+Each accepted SetTopology() produces exactly one MESessionTopologySet, in
+order, so count them and raise the error only for the current
+presentation's own request; anything that cannot be matched keeps the old
+behaviour. The Start queued behind the failed topology then fails too; do
+not follow the error with a PLAYING event.
+
+---
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -169,6 +169,9 @@
+     HANDLE device_handle;
+     enum media_engine_mode mode;
+     UINT64 source_generation;
++    /* Each accepted SetTopology() yields exactly one MESessionTopologySet. */
++    UINT64 topology_requests;
++    UINT64 topology_events;
+     unsigned int flags;
+     double playback_rate;
+     double default_playback_rate;
+@@ -200,6 +203,7 @@
+         UINT64 generation;
+         IMFMediaSource *source;
+         IMFPresentationDescriptor *pd;
++        UINT64 topology_request;
+         /* Pending MediaSession start state; always VT_EMPTY or VT_I8. */
+         PROPVARIANT start_position;
+         struct video_frame_sink *frame_sink;
+@@ -1180,7 +1184,10 @@
+                     restart_playback = TRUE;
+             }
+ 
+-            playing_event = !engine->buffering && !(engine->flags & (FLAGS_ENGINE_SCRUBBING | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_PAUSED));
++            /* A Start queued behind a failed topology fails too; do not follow the
++             * SRC_NOT_SUPPORTED error with a PLAYING event. */
++            playing_event = !engine->buffering && engine->network_state != MF_MEDIA_ENGINE_NETWORK_NO_SOURCE
++                    && !(engine->flags & (FLAGS_ENGINE_SCRUBBING | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_PAUSED));
+             if (!(engine->flags & FLAGS_ENGINE_SCRUBBING))
+             {
+                 if (!engine->buffering) media_engine_set_flag(engine, FLAGS_ENGINE_WAITING, FALSE);
+@@ -1202,6 +1209,38 @@
+                 IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ENDED, 0, 0);
+             break;
+ 
++        case MESessionTopologySet:
++        {
++            HRESULT status;
++
++            /* A format nothing can decode or render fails topology resolution.
++             * Windows reports it as SRC_NOT_SUPPORTED; without this the player
++             * keeps loading forever. Raise it only for the current presentation's
++             * own request, otherwise leave the state alone. */
++            if (FAILED(IMFMediaEvent_GetStatus(event, &status)))
++                status = S_OK;
++            EnterCriticalSection(&engine->cs);
++            if (++engine->topology_events == engine->presentation.topology_request && FAILED(status)
++                    && !(engine->flags & (FLAGS_ENGINE_SHUT_DOWN | FLAGS_ENGINE_SOURCE_PENDING))
++                    && engine->presentation.generation == engine->source_generation)
++            {
++                engine->network_state = MF_MEDIA_ENGINE_NETWORK_NO_SOURCE;
++                engine->error_code = MF_MEDIA_ENGINE_ERR_SRC_NOT_SUPPORTED;
++                engine->extended_code = status;
++                engine->buffering = FALSE;
++                engine->playback_requested = FALSE;
++                engine->current_seek = NAN;
++                engine->next_seek = NAN;
++                media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING
++                        | FLAGS_ENGINE_PLAY_PENDING | FLAGS_ENGINE_PAUSE_PENDING
++                        | FLAGS_ENGINE_WAITING | FLAGS_ENGINE_SCRUBBING, FALSE);
++                IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ERROR,
++                        engine->error_code, status);
++            }
++            LeaveCriticalSection(&engine->cs);
++            break;
++        }
++
+         case MEError:
+         {
+             MF_MEDIA_ENGINE_ERR error_code;
+@@ -1600,6 +1639,7 @@
+     engine->presentation.generation = 0;
+     engine->presentation.source = NULL;
+     engine->presentation.pd = NULL;
++    engine->presentation.topology_request = 0;
+     engine->presentation.frame_sink = NULL;
+ 
+     /* start_position is pending value state owned by the current source
+@@ -1794,8 +1834,9 @@
+         IMFTopology_SetUINT32(topology, &MF_TOPOLOGY_ENUMERATE_SOURCE_TYPES, TRUE);
+         IMFTopology_SetUINT32(topology, &MF_TOPOLOGY_ENABLE_XVP_FOR_PLAYBACK, TRUE);
+ 
+-        if (SUCCEEDED(hr))
+-            hr = IMFMediaSession_SetTopology(engine->session, MFSESSION_SETTOPOLOGY_IMMEDIATE, topology);
++        if (SUCCEEDED(hr) && SUCCEEDED(hr = IMFMediaSession_SetTopology(engine->session,
++                MFSESSION_SETTOPOLOGY_IMMEDIATE, topology)))
++            engine->presentation.topology_request = ++engine->topology_requests;
+     }
+ 
+     if (topology)

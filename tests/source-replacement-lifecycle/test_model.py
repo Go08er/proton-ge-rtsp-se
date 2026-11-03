@@ -262,7 +262,16 @@ def configure_patch_contract(series: Path) -> None:
                     if entry.startswith(("ge-proton11-9-se2-p20/", "ge-proton11-9-se2-p21/",
                                          "ge-proton11-9-se2-p22/",
                                          "ge-proton11-9-se2-p23/",
-                                         "ge-proton11-9-se2-p24/"))}
+                                         "ge-proton11-9-se2-p24/",
+                                         "ge-proton11-11-se3-p1/",
+                                         "ge-proton11-11-se3-p2/",
+                                         "ge-proton11-11-se3-p3/",
+                                         "ge-proton11-11-se3-p4/",
+                                         "ge-proton11-11-se3-p5/",
+                                         "ge-proton11-11-se3-p6/",
+                                         "ge-proton11-11-se3-p7/",
+                                         "ge-proton11-11-se3-p8/",
+                                         "ge-proton11-11-se3-p9/"))}
     if consolidated:
         if len(consolidated) != 1:
             raise SystemExit("replacement model cannot mix immutable GE11-9 candidates")

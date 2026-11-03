@@ -1,0 +1,47 @@
+Subject: [SE3-P3] winedmo: report the end of a live RTSP session as a network error
+
+A live RTSP server ends the session when its publisher drops or the server
+restarts; FFmpeg reports EOF. WineDMO turned that into a normal end of
+stream, so players froze on the last frame with no error and could not
+retry. Report it as a connection error (MF_E_NET_READ) instead, through the
+existing terminal-error path that network timeouts already use: MediaEngine
+raises ERR_NETWORK, SourceReader returns an error, DirectShow aborts. RTSP
+sources with a duration, HTTP and HLS still end normally.
+
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -81,6 +81,7 @@
+     struct wine_mf_presentation_origin origin;
+     BOOL direct_url;
+     BOOL nonseekable;
++    BOOL live_rtsp;
+     BOOL require_avio_seek;
+     BOOL cancelled_read_pending_recovery;
+     INT64 io_timeout;
+@@ -1180,7 +1181,7 @@
+         }
+ 
+         if (get_context_duration( demuxer->ctx, FALSE ) == AV_NOPTS_VALUE)
+-            demuxer->nonseekable = TRUE;
++            demuxer->nonseekable = demuxer->live_rtsp = TRUE;
+         av_dict_free( &options );
+         free( direct_url );
+         direct_url = NULL;
+@@ -1485,7 +1486,14 @@
+     sample->flags = 0;
+     packet_prefix = 0;
+     packet_skip = 0;
+-    if ((status = demuxer_filter_packet( demuxer, &packet ))) return status;
++    if ((status = demuxer_filter_packet( demuxer, &packet )))
++    {
++        /* A live RTSP server ends the session when its publisher drops or the
++         * server restarts. That is a network failure players can retry, not the
++         * end of the media; sources with a duration still end normally. */
++        if (status == STATUS_END_OF_FILE && demuxer->live_rtsp) return STATUS_CONNECTION_DISCONNECTED;
++        return status;
++    }
+ 
+     stream = demuxer->ctx->streams[packet->stream_index];
+     demuxer_stream = demuxer->streams + packet->stream_index;

@@ -1,0 +1,40 @@
+# SE3-P6 = SE3-P5 with 0038 (mfplat: close the MFT category key after enumeration).
+# SE3-P1 base = the SE2 series (17 Wine patches, content of SE2-P24) rebased onto GE-Proton11-11.
+# Apply strictly after GE ge-video-rework.
+# 14 patches are byte-identical copies of patches/ge-proton11-9-se2-p24/; 0003, 0006 and 0021 are
+# refreshed against the GE11-11 prepared tree (renumbered to zero offset; 0006 also takes the
+# reviewed one-hunk resolution against GE 0094). The 28 patched-file postimages equal the
+# hand-resolved conflict-check tree.
+# The AAC parser change is outside this series: the pinned FFmpeg build module
+# patches/proposed/ffmpeg-enable-aac-parser.patch (--enable-parser=aac in Makefile.in), bound in the pin.
+ge-proton11-11-se3-p6/0001-winedmo-retain-bounded-network-and-origin-contract.patch
+ge-proton11-11-se3-p6/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch
+ge-proton11-11-se3-p6/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch
+ge-proton11-11-se3-p6/0004-winedmo-retain-codec-admission-and-format-validation.patch
+ge-proton11-11-se3-p6/0005-mfreadwrite-retain-reader-error-layout-and-origin-contract.patch
+ge-proton11-11-se3-p6/0006-mf-retain-session-lifecycle-and-demand-accounting.patch
+ge-proton11-11-se3-p6/0007-mf-retain-sar-flush-demand-and-marker-ownership.patch
+ge-proton11-11-se3-p6/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch
+ge-proton11-11-se3-p6/0009-mfmediaengine-retain-render-clock-frame-demand.patch
+ge-proton11-11-se3-p6/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch
+ge-proton11-11-se3-p6/0011-mfplat-retain-failed-async-result-status.patch
+ge-proton11-11-se3-p6/0012-winewayland-retain-vr-device-extensions.patch
+ge-proton11-11-se3-p6/0013-mf-tests-retain-held-marker-context.patch
+ge-proton11-11-se3-p6/0021-mf-stop-clock-after-terminal-start-error.patch
+ge-proton11-11-se3-p6/0022-winedmo-defer-read-ahead-data-errors.patch
+ge-proton11-11-se3-p6/0023-winedmo-interrupt-stalled-read-on-seek.patch
+ge-proton11-11-se3-p6/0024-winedmo-adopt-ge-http-reconnect.patch
+ge-proton11-11-se3-p6/0025-rtworkq-shut-down-system-queues-without-holding-the-lock.patch
+ge-proton11-11-se3-p6/0026-winedmo-let-wm-reader-seek-read-while-flushing.patch
+ge-proton11-11-se3-p6/0027-winedmo-serialise-quartz-parser-seeks-and-rewind-on-restart.patch
+ge-proton11-11-se3-p6/0028-winedmo-activate-selected-streams-before-start.patch
+ge-proton11-11-se3-p6/0029-winedmo-default-raw-flac-bits-per-sample.patch
+ge-proton11-11-se3-p6/0030-winedmo-map-mpeg4-and-msmpeg4-fourcc-aliases.patch
+ge-proton11-11-se3-p6/0031-mfmediaengine-report-unplayable-topology-as-src-not-supported.patch
+ge-proton11-11-se3-p6/0032-winedmo-reconnect-all-direct-http-and-hls-requests.patch
+ge-proton11-11-se3-p6/0033-winedmo-report-live-rtsp-end-as-network-error.patch
+ge-proton11-11-se3-p6/0034-winedmo-timestamp-multipart-mjpeg-by-arrival.patch
+ge-proton11-11-se3-p6/0035-winedmo-probe-audio-streams-missing-format.patch
+ge-proton11-11-se3-p6/0036-qasf-flush-every-stream-when-seeking.patch
+ge-proton11-11-se3-p6/0037-wmvcore-pace-async-delivery-from-the-start-position.patch
+ge-proton11-11-se3-p6/0038-mfplat-close-the-category-key-after-enumerating-transforms.patch

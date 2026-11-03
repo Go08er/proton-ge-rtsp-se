@@ -176,6 +176,15 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-9-se2-p22/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
       -e 'ge-proton11-9-se2-p23/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
       -e 'ge-proton11-9-se2-p24/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-11-se3-p1/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-11-se3-p2/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-11-se3-p3/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-11-se3-p4/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-11-se3-p5/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-11-se3-p6/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-11-se3-p7/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-11-se3-p8/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-11-se3-p9/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
       -e 'ge-proton11-9-se2-p21/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
       -e 'ge-proton11-9-se2-p20/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' "$PATCH_SERIES"; then
     IMMEDIATE_SEEK_SERIES=1
@@ -188,6 +197,15 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-9-se2-p22/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
       -e 'ge-proton11-9-se2-p23/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
       -e 'ge-proton11-9-se2-p24/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-11-se3-p1/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-11-se3-p2/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-11-se3-p3/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-11-se3-p4/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-11-se3-p5/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-11-se3-p6/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-11-se3-p7/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-11-se3-p8/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-11-se3-p9/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
       -e 'ge-proton11-9-se2-p21/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
       -e 'ge-proton11-9-se2-p20/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' "$PATCH_SERIES"; then
     LIVE_BUFFER_SERIES=1
@@ -197,6 +215,15 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-9-se2-p22/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
       -e 'ge-proton11-9-se2-p23/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
       -e 'ge-proton11-9-se2-p24/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-11-se3-p1/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-11-se3-p2/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-11-se3-p3/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-11-se3-p4/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-11-se3-p5/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-11-se3-p6/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-11-se3-p7/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-11-se3-p8/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-11-se3-p9/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
       -e 'ge-proton11-9-se2-p21/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
       -e 'ge-proton11-9-se2-p20/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' "$PATCH_SERIES"; then
     EOS_DRAIN_SERIES=1
@@ -206,6 +233,15 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-9-se2-p22/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
       -e 'ge-proton11-9-se2-p23/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
       -e 'ge-proton11-9-se2-p24/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-11-se3-p1/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-11-se3-p2/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-11-se3-p3/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-11-se3-p4/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-11-se3-p5/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-11-se3-p6/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-11-se3-p7/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-11-se3-p8/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-11-se3-p9/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
       -e 'ge-proton11-9-se2-p21/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
       -e 'ge-proton11-9-se2-p20/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' "$PATCH_SERIES"; then
     NATIVE_AUDIO_TIMELINE_SERIES=1
@@ -294,6 +330,15 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-9-se2-p22/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
       -e 'ge-proton11-9-se2-p23/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
       -e 'ge-proton11-9-se2-p24/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-11-se3-p1/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-11-se3-p2/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-11-se3-p3/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-11-se3-p4/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-11-se3-p5/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-11-se3-p6/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-11-se3-p7/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-11-se3-p8/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-11-se3-p9/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
       -e 'ge-proton11-9-se2-p21/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
       -e 'ge-proton11-9-se2-p20/0009-mfmediaengine-retain-render-clock-frame-demand.patch' "$PATCH_SERIES"; then
     A320_SERIES=1

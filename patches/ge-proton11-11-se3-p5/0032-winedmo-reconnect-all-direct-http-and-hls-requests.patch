@@ -1,0 +1,142 @@
+Subject: [SE3-P3] winedmo: reconnect every direct HTTP source and resume HLS transfers, retry 5xx at open
+
+GE11-9 enables FFmpeg's byte-exact HTTP reconnect only for .mp4 and
+googlevideo URLs, so Jellyfin/Plex/CDN links, .mkv and .webm lose playback
+on a single TCP reset. FFmpeg's HLS demuxer passes only a few options to the
+requests it makes itself, so a reset mid-segment skips the rest of the
+segment. A brief 503 when the source is opened fails at once.
+
+Enable the reconnect for every direct HTTP source and retry 5xx responses
+when it is opened, within the same delays (honouring Retry-After). Let HLS
+segment, key and playlist transfers resume after a reset through an io_open
+hook, but do not retry their failed opens: FFmpeg already reloads a live
+playlist that briefly fails, and retrying it there turned a short playlist
+outage into a terminal error. A known-length response without range support
+cannot resume, so it fails cleanly instead of restarting from byte 0;
+open-ended streams rejoin.
+
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -41,7 +41,7 @@
+ #define HLS_IO_TIMEOUT_US    INT64_C(30000000)
+ #define HTTP_OPEN_TIMEOUT_US INT64_C(30000000)
+ #define HTTP_IO_TIMEOUT_US   INT64_C(15000000)
+-/* GE's progressive reconnect: a 15 s stalled read, then FFmpeg reconnects with
++/* GE's HTTP reconnect: a 15 s stalled read, then FFmpeg reconnects with
+  * up to 5 s of delays, each attempt bounded by the same rw_timeout. */
+ #define HTTP_RECONNECT_IO_TIMEOUT_US INT64_C(75000000)
+ /* Match the Windows Media Foundation HTTP client identity used by Proton-RTSP. */
+@@ -86,6 +86,7 @@
+     INT64 io_timeout;
+     int cancelled;
+     INT64 deadline;
++    int (*io_open)( AVFormatContext *ctx, AVIOContext **pb, const char *url, int flags, AVDictionary **options );
+ 
+     AVPacket *last_packet; /* last read packet */
+     struct stream *last_stream; /* last read packet stream */
+@@ -882,11 +883,43 @@
+     return url && !strncasecmp( url, "http://", 7 ) && ret == AVERROR_INVALIDDATA;
+ }
+ 
+-/* Same classifier as GE11-9 for enabling FFmpeg's HTTP reconnect. */
+-static BOOL is_http_progressive_url( const char *url )
+-{
+-    if (!is_http_url( url )) return FALSE;
+-    return !!strstr( url, ".googlevideo.com/videoplayback" ) || !!strstr( url, ".mp4" );
++/* GE11-9 enables FFmpeg's HTTP reconnect for .googlevideo.com/videoplayback
++ * and .mp4 URLs only. Give every direct HTTP request the same reconnect, which
++ * resumes at the same byte when the server supports ranges, and retry 5xx
++ * responses (a brief 503 at startup) within the same delays. */
++static int set_http_reconnect_options( AVDictionary **options, BOOL streamed )
++{
++    if (av_dict_set( options, "reconnect", "1", 0 ) < 0
++            || (streamed && av_dict_set( options, "reconnect_streamed", "1", 0 ) < 0)
++            || av_dict_set( options, "reconnect_on_network_error", "1", 0 ) < 0
++            || av_dict_set( options, "reconnect_on_http_error", "5xx", 0 ) < 0
++            || av_dict_set( options, "reconnect_delay_max", "5", 0 ) < 0)
++        return -1;
++    return 0;
++}
++
++/* FFmpeg passes only a few HTTP options to the requests a demuxer makes itself
++ * (ffio_copy_url_options()). Let HLS segment, key and playlist transfers resume
++ * after a reset mid-transfer instead of skipping the rest of the segment. Do not
++ * retry failed opens: FFmpeg reloads a live playlist that briefly fails later,
++ * and unranged segments still fail and are skipped as before. */
++static int demuxer_io_open( AVFormatContext *ctx, AVIOContext **pb, const char *url, int flags,
++                            AVDictionary **options )
++{
++    struct demuxer *demuxer = ctx->opaque;
++
++    if (pb != &ctx->pb && options
++            && (av_dict_set( options, "reconnect", "1", AV_DICT_DONT_OVERWRITE ) < 0
++            || av_dict_set( options, "reconnect_delay_max", "5", AV_DICT_DONT_OVERWRITE ) < 0))
++        return AVERROR(ENOMEM);
++    return demuxer->io_open( ctx, pb, url, flags, options );
++}
++
++static void demuxer_hook_io_open( struct demuxer *demuxer )
++{
++    demuxer->ctx->opaque = demuxer;
++    demuxer->io_open = demuxer->ctx->io_open;
++    demuxer->ctx->io_open = demuxer_io_open;
+ }
+ 
+ static BOOL is_http_hls_url( const char *url )
+@@ -1009,7 +1042,7 @@
+         BOOL hls_hint = is_http_hls_url( params->url ), interrupted, detected_hls;
+         const AVInputFormat *hint = hls_hint ? av_find_input_format( "hls" ) : NULL;
+         const char *protocol_whitelist = hls_protocol_whitelist( params->url );
+-        BOOL reconnect = !hls_hint && is_http_progressive_url( params->url );
++        BOOL reconnect = !hls_hint;
+         BOOL progressive;
+ 
+         if (hls_hint && !hint) goto failed;
+@@ -1024,13 +1057,10 @@
+         /* Open with the Windows media identity; GE's 403 retry below may
+          * replace it once, within the same open deadline. */
+         if (av_dict_set( &options, "user_agent", HTTP_USER_AGENT, 0 ) < 0) goto failed;
+-        /* As GE11-9: a stalled non-HLS read fails after 15 s, and progressive
+-         * byte-range requests reconnect at the same offset after a reset. */
++        /* As GE11-9: a stalled non-HLS read fails after 15 s, and byte-range
++         * requests reconnect at the same offset after a reset. */
+         if (!hls_hint && av_dict_set( &options, "rw_timeout", "15000000", 0 ) < 0) goto failed;
+-        if (reconnect && (av_dict_set( &options, "reconnect", "1", 0 ) < 0
+-                || av_dict_set( &options, "reconnect_streamed", "1", 0 ) < 0
+-                || av_dict_set( &options, "reconnect_on_network_error", "1", 0 ) < 0
+-                || av_dict_set( &options, "reconnect_delay_max", "5", 0 ) < 0)) goto failed;
++        if (set_http_reconnect_options( &options, reconnect ) < 0) goto failed;
+         if (av_dict_set_int( &options, "tls_verify", 1, 0 ) < 0) goto failed;
+         /* These two private options are consumed only if FFmpeg selects HLS.
+          * Constrain its child demuxers, not unrelated progressive containers. */
+@@ -1044,6 +1074,7 @@
+         if (reconnect) demuxer->io_timeout = HTTP_RECONNECT_IO_TIMEOUT_US;
+         demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
+         demuxer->ctx->interrupt_callback.opaque = demuxer;
++        demuxer_hook_io_open( demuxer );
+         demuxer_set_deadline( demuxer, HTTP_OPEN_TIMEOUT_US );
+         ret = avformat_open_input( &demuxer->ctx, direct_url, hint, &options );
+         interrupted = demuxer_interrupt_callback( demuxer );
+@@ -1055,6 +1086,7 @@
+             if (!(demuxer->ctx = avformat_alloc_context())) goto failed;
+             demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
+             demuxer->ctx->interrupt_callback.opaque = demuxer;
++            demuxer_hook_io_open( demuxer );
+             if ((ret = av_dict_set( &options, "user_agent", HTTP_FALLBACK_USER_AGENT, 0 )) >= 0)
+                 ret = avformat_open_input( &demuxer->ctx, direct_url, hint, &options );
+             interrupted = demuxer_interrupt_callback( demuxer );
+@@ -1082,6 +1114,12 @@
+         {
+             av_dict_set( &options, "extension_picky", NULL, 0 );
+             av_dict_set( &options, "seg_format_options", NULL, 0 );
++            /* A known-length response without range support cannot resume where
++             * it stopped; a streamed reconnect would restart it from byte 0 under
++             * the current position. Fail cleanly instead; open-ended streams rejoin. */
++            if (demuxer->ctx->pb && !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)
++                    && avio_size( demuxer->ctx->pb ) > 0)
++                av_opt_set( demuxer->ctx->pb, "reconnect_streamed", "0", AV_OPT_SEARCH_CHILDREN );
+             TRACE( "media-route=direct-http-progressive-opened\n" );
+         }
+         /* The HTTP protocol keeps chained options for redirects and range

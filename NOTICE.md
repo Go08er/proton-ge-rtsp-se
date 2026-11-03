@@ -15,7 +15,7 @@ version. Patch 14 is a project-authored change to Wine's MediaEngine.
 Patch 11 is a context-adjusted derivative of commit
 `c1f40112915a6e58f631e0ef15a926c97a42710f` by Torge Matthies; its original
 attribution is retained. The historical launcher patch is BSD-3-Clause and
-is not selected by SE2.
+is not selected by SE3.
 FFmpeg changes retain their applicable upstream file licenses. The other
 bundled components retain their own licenses, including the original font
 license. The root BSD-3-Clause tooling license does not relicense them.

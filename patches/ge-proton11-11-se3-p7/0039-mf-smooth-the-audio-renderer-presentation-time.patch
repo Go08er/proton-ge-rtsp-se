@@ -1,0 +1,149 @@
+Subject: [SE3-P7] mf: smooth the audio renderer's presentation time
+
+Wine's audio drivers (winepulse) advance the IAudioClock position one device
+period (10 ms) at a time, where Windows reports a device-interpolated
+position. The streaming audio renderer maps that position straight to
+presentation time, so an audio-clocked presentation clock moves in 10 ms
+steps: 60 fps video is shown on an uneven 20/20/10 ms cadence and a 60 Hz
+consumer can miss every third frame, depending on phase.
+
+Report the performance counter plus the largest (time - counter) offset
+seen instead. Readings taken just after a step approach the true offset, so
+the result is smooth, never runs backwards and is never more than one device
+period ahead of the reported position. The estimate decays by 1 ms per
+second to follow clock drift. It is reset whenever the timeline restarts
+(seek, stop, flush) and not applied while paused, scrubbing, starting or
+reporting a seek target. With an interpolating driver, as on Windows, the
+reported time is unchanged.
+
+---
+diff --git a/dlls/mf/sar.c b/dlls/mf/sar.c
+--- a/dlls/mf/sar.c
++++ b/dlls/mf/sar.c
+@@ -114,8 +114,22 @@
+     UINT64 position;
+     UINT64 audio_clock_frequency;
+     float rate;
++    /* Correlated time smoothing, see audio_renderer_smooth_time(). */
++    REFERENCE_TIME device_period;
++    LONGLONG smooth_offset;
++    LONGLONG smooth_counter;
++    LONGLONG smooth_time;
++    BOOL smooth_offset_valid;
++    BOOL smooth_time_valid;
+ };
+ 
++/* Call wherever the presentation timeline restarts: seek, stop, flush, reset. */
++static void audio_renderer_reset_smooth_time(struct audio_renderer *renderer)
++{
++    renderer->smooth_offset_valid = FALSE;
++    renderer->smooth_time_valid = FALSE;
++}
++
+ static void release_pending_object(struct queued_object *object)
+ {
+     list_remove(&object->entry);
+@@ -262,6 +276,7 @@
+     }
+     renderer->position = 0;
+     renderer->pts = 0;
++    audio_renderer_reset_smooth_time(renderer);
+     renderer->audio_client = NULL;
+     if (renderer->audio_render_client)
+         IAudioRenderClient_Release(renderer->audio_render_client);
+@@ -683,6 +698,7 @@
+         {
+             renderer->seek_pts = offset;
+             renderer->flags |= (SAR_SEEKING | SAR_REPORT_SEEK_TIME);
++            audio_renderer_reset_smooth_time(renderer);
+         }
+         if (renderer->clock_state != MFCLOCK_STATE_RUNNING
+                 || (renderer->flags & SAR_AUDIO_START_PENDING))
+@@ -724,6 +740,7 @@
+                 {
+                     renderer->position = 0;
+                     renderer->pts = 0;
++                    audio_renderer_reset_smooth_time(renderer);
+                 }
+                 else
+                     WARN("Failed to reset audio client, hr %#lx.\n", hr);
+@@ -1259,6 +1276,51 @@
+     return S_OK;
+ }
+ 
++/* Audio drivers such as winepulse advance the IAudioClock position one device
++ * period at a time, where Windows reports a device-interpolated position. Time
++ * mapped directly from it moves in period-sized steps, so frames due at a finer
++ * cadence (60 fps against a 10 ms period) are shown unevenly. The reported time
++ * lags the true one by less than a period, and by almost nothing just after a
++ * step, so the largest (time - counter) offset seen tracks the true offset.
++ * Report the counter plus that offset: smooth, monotonic, and never more than
++ * one period ahead of the reported position. The estimate decays by 1 ms per
++ * second, so clock drift and backward timeline steps pull it back. */
++static LONGLONG audio_renderer_smooth_time(struct audio_renderer *renderer, LONGLONG time, LONGLONG counter)
++{
++    LONGLONG offset = time - counter, decayed;
++
++    if (renderer->clock_state != MFCLOCK_STATE_RUNNING || renderer->rate == 0.0f
++            || (renderer->flags & SAR_AUDIO_START_PENDING))
++    {
++        renderer->smooth_offset_valid = FALSE;
++        if (renderer->smooth_time_valid && time < renderer->smooth_time)
++            time = renderer->smooth_time;
++        return time;
++    }
++
++    if (!renderer->smooth_offset_valid)
++    {
++        renderer->smooth_offset = offset;
++        renderer->smooth_offset_valid = TRUE;
++    }
++    else
++    {
++        decayed = renderer->smooth_offset;
++        if (counter > renderer->smooth_counter)
++            decayed -= (counter - renderer->smooth_counter) / 1000;
++        renderer->smooth_offset = max(offset, decayed);
++        renderer->smooth_offset = min(renderer->smooth_offset, offset + renderer->device_period);
++    }
++    renderer->smooth_counter = counter;
++
++    time = counter + renderer->smooth_offset;
++    if (renderer->smooth_time_valid && time < renderer->smooth_time)
++        time = renderer->smooth_time;
++    renderer->smooth_time = time;
++    renderer->smooth_time_valid = TRUE;
++    return time;
++}
++
+ static HRESULT audio_renderer_get_correlated_time(struct audio_renderer *renderer, LONGLONG *clock_time,
+         MFTIME *system_time)
+ {
+@@ -1277,6 +1339,8 @@
+         else
+             renderer->flags &= ~SAR_REPORT_SEEK_TIME;
+     }
++    if (!(renderer->flags & SAR_REPORT_SEEK_TIME))
++        time = audio_renderer_smooth_time(renderer, time, counter);
+ 
+     if (clock_time)
+         *clock_time = time;
+@@ -1718,6 +1782,7 @@
+                 {
+                     renderer->position = 0;
+                     renderer->pts = 0;
++                    audio_renderer_reset_smooth_time(renderer);
+                 }
+                 else
+                     WARN("Failed to reset audio client, hr %#lx.\n", hr);
+@@ -1928,6 +1993,10 @@
+         return hr;
+     }
+ 
++    if (FAILED(IAudioClient_GetDevicePeriod(renderer->audio_client, &renderer->device_period, NULL))
++            || renderer->device_period <= 0)
++        renderer->device_period = 100000;
++
+     if (FAILED(hr = IAudioClient_SetEventHandle(renderer->audio_client, renderer->buffer_ready_event)))
+     {
+         WARN("Failed to set event handle, hr %#lx.\n", hr);

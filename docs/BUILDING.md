@@ -1,6 +1,6 @@
-# Build SE2 from source
+# Build SE3 from source
 
-The build uses a pinned GE-Proton11-9 commit, pinned submodules, 16
+The build uses a pinned GE-Proton11-11 commit, pinned submodules, 16
 hash-checked contrib inputs and a specific SteamRT SDK image. The NVIDIA
 library and Vulkan-layer groups are built. Fetching happens
 before compilation; the build container remains `--network=none`.
@@ -14,7 +14,7 @@ From a checkout of this repository, use a NEW directory outside the checkout:
 
 ```sh
 nix run .#build-from-source -- \
-  --work-dir "$HOME/builds/proton-ge-rtsp-se2-1" \
+  --work-dir "$HOME/builds/proton-ge-rtsp-se3-1" \
   --fresh-setup-receipt /path/to/fresh-setup-receipt.json
 ```
 
@@ -52,7 +52,7 @@ paths for any deliberate recovery. The build name and pin are immutable.
 You can inspect the workflow without building:
 
 ```sh
-nix run .#build-from-source -- --work-dir "$HOME/builds/se2-example" --dry-run
+nix run .#build-from-source -- --work-dir "$HOME/builds/se3-example" --dry-run
 ```
 
 The wrapper supplies Nix host tools and orchestrates the existing GE/Podman
@@ -70,8 +70,9 @@ original upstream URLs only for missing entries; use a complete verified
 cache to avoid that branch-drift dependency.
 
 The retained historical pin and patch files support regression controls;
-they are not alternative defaults for SE2. The selected files are
-`config/ge-proton11-9-se2.env` and `patches/series-ge-proton11-9-se2`.
-`scripts/build-se1.sh` and the SE1 pin are kept so the `se1` tags stay
-reproducible, but they predate the receipt requirement and no longer run
-end-to-end with these scripts; build SE1 from its own tag.
+they are not alternative defaults for SE3. The selected files are
+`config/ge-proton11-11-se3.env` and `patches/series-ge-proton11-11-se3`.
+`scripts/build-se1.sh` and `scripts/build-se2.sh`, with their pins, are kept so
+the `se1` and `se2` tags stay reproducible; `build-se1.sh` predates the receipt
+requirement and neither runs end-to-end against these scripts, so build SE1
+and SE2 from their own tags.

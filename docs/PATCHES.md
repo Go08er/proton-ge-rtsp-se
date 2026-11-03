@@ -13,44 +13,44 @@ order. See [building](BUILDING.md) for the supported preparation workflow.
 ## Find the release inputs
 
 Start with the [release notes](../RELEASE.md) and [source account](SOURCE.md)
-for the checkout or release tag you are reviewing. For SE2, the selected pair
+for the checkout or release tag you are reviewing. For SE3, the selected pair
 is:
 
-- [Base/build pin](../config/ge-proton11-9-se2.env).
-- [Machine-readable Wine order](../patches/series-ge-proton11-9-se2), containing
-  17 patch paths relative to `patches/`, with an
+- [Base/build pin](../config/ge-proton11-11-se3.env).
+- [Machine-readable Wine order](../patches/series-ge-proton11-11-se3), containing
+  34 patch paths relative to `patches/`, with an
   [explained list](../patches/README.md#wine-media-and-vr-patches) for browsing.
 
-The [source-build entrypoint](../scripts/build-se2.sh) explicitly selects
+The [source-build entrypoint](../scripts/build-se3.sh) explicitly selects
 both files. The pin records the GE commit, component revisions, input hashes,
 SDK and build options; it does not itself select the Wine series.
 
-`patches/series` is a retained A3.21 selection, **not the SE2 release list**.
+`patches/series` is a retained A3.21 selection, **not the SE3 release list**.
 Other `series-*` files and candidate directories preserve earlier inputs for
-comparison, including the SE2 candidate pins P1–P24 that the preparation
-tests check. Do not apply every patch in the repository or mix revisions of
+comparison, including the SE2 and SE3 candidate pins (SE2-P1 to P24, SE3-P1 to P9) that the
+preparation tests check. Do not apply every patch in the repository or mix revisions of
 the same numbered patch. Gaps in numbering and cross-directory references
-are intentional. SE2's 17 patches live in `patches/ge-proton11-9-se2-p24/`
+are intentional. SE3's 34 patches live in `patches/ge-proton11-11-se3-p9/`
 (the directory keeps its candidate name because the series paths are
 hash-locked).
 
 ## Follow the changes
 
 Open each path in the selected series and read its header for intent, then
-its `diff --git` sections for the actual code changes. To print the SE2
+its `diff --git` sections for the actual code changes. To print the SE3
 application order and inspect one patch without applying anything, run from
 the repository root:
 
 ```sh
-awk 'NF && $1 !~ /^#/ {printf "%2d  %s\n", ++n, $0}' patches/series-ge-proton11-9-se2
-git apply --stat -- patches/ge-proton11-9-se2-p24/0023-winedmo-interrupt-stalled-read-on-seek.patch
+awk 'NF && $1 !~ /^#/ {printf "%2d  %s\n", ++n, $0}' patches/series-ge-proton11-11-se3
+git apply --stat -- patches/ge-proton11-11-se3-p9/0023-winedmo-interrupt-stalled-read-on-seek.patch
 ```
 
 The Wine series covers transport and source lifecycle, seeking and Media
 Session demand, audio clocks, MediaEngine state, WineWayland VR extensions,
 and diagnostics. It is reviewable, but not uniformly one fix per patch:
 0001–0013 are consolidated "retain" patches that re-derive the earlier
-behavior against GE-Proton11-9, and 0002 bundles several queue and buffering
+behavior against GE-Proton11, and 0002 bundles several queue and buffering
 behaviors; they need particular care. Later patches can refine earlier behavior, so review the complete
 selected series as well as individual diffs. A clean replay alone is not
 proof of correctness or playback compatibility.
@@ -68,10 +68,10 @@ proof of correctness or playback compatibility.
 - [FFmpeg build integration](../patches/ffmpeg-build/README.md) has a separate
   [machine-readable order](../patches/ffmpeg-build/series) affecting GE's `Makefile.in`.
   The selected pin supplies its release-specific expected postimage.
-- SE2 also pins six FFmpeg build/companion modules in
+- SE3 also pins six FFmpeg build/companion modules in
   [`patches/proposed/`](../patches/README.md#ffmpeg-build-and-companion-modules),
   each bound by hash in the pin and applied by the FFmpeg preparation step.
-- Launcher behavior is a separate pin policy. SE2 uses GE's unchanged
+- Launcher behavior is a separate pin policy. SE3 uses GE's unchanged
   launcher; the retained launcher compatibility patch is not applied.
 
 Use the pinned preparation tooling rather than invoking the Wine hook alone:

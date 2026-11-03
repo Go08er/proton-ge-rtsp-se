@@ -1,47 +1,74 @@
-# SE2 — GE-Proton11-9 RTSP prerelease
+# SE3 — GE-Proton11-11 RTSP prerelease
 
-Experimental x86_64 Linux prerelease on the GE-Proton11-9 base, built and
-qualified on 2026-10-18.
+Experimental x86_64 Linux prerelease on the GE-Proton11-11 base, built and
+qualified on @SE3_DATE@.
 Intended for users experienced with Proton debugging; assistance is not guaranteed.
 
-Tool name: `proton-ge-11-9-rtsp-se2`. Nix users: use tag `se2`.
+Tool name: `proton-ge-11-11-rtsp-se3`. Nix users: use tag `se3`.
 
-SE2 carries 17 Wine media patches (the P23 set) plus FFmpeg build modules,
-including a new AAC parser. The launcher must match the pinned upstream GE
-file exactly; there is no launcher-side XR policy. SE1 (GE-Proton11-6) remains
-available under its own tags.
+SE3 carries 34 Wine media patches plus FFmpeg build modules, including the AAC
+parser. The launcher must match the pinned upstream GE file exactly; there is
+no launcher-side XR policy. SE1 (GE-Proton11-6) and SE2 (GE-Proton11-9) remain
+available under their own tags.
 
-## Changes since SE1
+## Changes since SE2
 
-- **Rebased on GE-Proton11-9.** The Wine series was re-derived against the new
-  base as 17 patches; the SE1 patch set was not reapplied unchanged.
-- **Reload after a network error works.** A terminal source error during a
-  restarting seek no longer leaves the presentation clock running, so the
-  replacement source starts and finishes preroll.
-- **Corrupt-data errors are delivered when playback reaches them.** A data
-  error on a future packet no longer ends playback seconds early or discards
-  the already-queued good samples.
-- **Instant seek during a stalled download.** A seek interrupts the stalled
-  read and reopens the transport with a fresh request, rather than waiting for
-  the read to time out.
-- **GE11-9's HTTP reconnect and single 403 retry are adopted.** As upstream,
-  reconnect applies only to `.mp4` and googlevideo progressive URLs; other
-  HTTP media is unchanged.
-- **HLS refill holds are shorter.** An FFmpeg AAC parser build module gives
-  MPEG-TS audio correct packet durations, so read-ahead is no longer
-  under-credited: in a contained loopback test under an 80% throttle, holds
-  were about 6 s instead of one 19 s hold.
-- FFmpeg build modules: secure RTSPS redirects, HTTP seek and file-size
-  fixes, an HLS seek before the first segment, the MPEG video parser and the
-  AAC parser. Details are in the [patch index](patches/README.md).
+- **Rebased on GE-Proton11-11.** The 17 SE2 Wine patches were carried to the
+  new base (three needed new offsets or a rebase) and 17 new patches were added
+  on top.
+- **No hang at exit while a URL is still opening.** Media Foundation shutdown
+  no longer waits forever on an open that has not finished, and a startup that
+  overlaps a shutdown waits for it instead of leaving the platform half
+  started.
+- **Videos reach their natural end.** Playback no longer stops short of the
+  end, with the audio running dry, in configurations where an audio effect
+  answers a drain request with an empty sample.
+- **No lost leading frames at stream start.** All selected streams become
+  active together, so the first packets of a later stream (for example a
+  leading ALAC block) are not dropped.
+- **HTTP reconnect for every direct URL.** GE enabled byte-exact reconnect
+  only for `.mp4` and googlevideo URLs; SE3 enables it for any direct HTTP
+  source, resumes at the exact byte on servers that support ranges, and
+  retries a brief 5xx response at open. HLS segment, key and playlist
+  transfers also resume after a connection reset.
+- **HLS segment retries.** A segment or key request answered with a server
+  error (5xx) or 429 is retried three times, after 1, 2 and 3 seconds, rather
+  than skipped at once; a first segment that fails no longer fails the open.
+- **A source that goes silent ends sooner.** A direct HTTP source that stops
+  sending now reconnects after 8 s without data and reports one error after
+  15 s (known-length media) or 20 s (live) of silence, instead of waiting up
+  to 75 s. A source that returns within that window still resumes at the same
+  byte.
+- **A live RTSP stream that ends reports a network error.** When the
+  publisher drops or the server restarts, the player gets a connection error
+  and can retry, instead of freezing on the last frame as if the stream had
+  finished normally.
+- **Unplayable media reports an error.** When nothing can decode a source,
+  MediaEngine raises "not supported" instead of staying in its loading state.
+- **More files play.** Raw FLAC files play; AVI files tagged with the usual
+  MPEG-4 Part 2 aliases (xvid, divx, DX50, FMP4) and MS-MPEG4 v3 (DIV3, MPG3)
+  are recognized.
+- **Seeking in legacy Windows Media and DirectShow content.**
+  - Windows Media reader seeks land on the requested position.
+  - Seeks in MPEG program streams and Matroska files, and a Stop then Run
+    restart, work in the DirectShow parser.
+  - A seek in an ASF file no longer hangs, and video resumes straight away
+    afterwards.
+- **Multipart MJPEG over HTTP** is timed by frame arrival rather than a
+  nominal frame rate.
+- **A handle leak is fixed.** Opening a video leaked about five kernel
+  handles (three for a source reader); they are now closed.
+- FFmpeg build modules are unchanged from SE2: secure RTSPS redirects, HTTP
+  seek and file-size fixes, an HLS seek before the first segment, the MPEG
+  video parser and the AAC parser. Details are in the [patch index](patches/README.md).
 
 ## Download and verify
 
-Binary: `proton-ge-11-9-rtsp-se2.tar.gz` — **565,841,164 bytes**.
+Binary: `proton-ge-11-11-rtsp-se3.tar.gz` — **@SE3_BINARY_BYTES@ bytes**.
 
 SHA-256:
 ```text
-0568079f9685b4647eb31490ea9e64ca4dcec8b3ae60468e66b36c5c69db1591
+@SE3_BINARY_SHA256@
 ```
 
 Download `SHA256SUMS` alongside your chosen assets and run
@@ -50,12 +77,12 @@ each downloaded file. See [installation and NixOS](docs/INSTALL.md).
 
 Source/build materials:
 
-- `proton-ge-11-9-rtsp-se2-source-x86_64.tar.zst`: prepared corresponding
-  source, 1,402,978,802 bytes; SHA-256
-  `240cd96951722b53486373acc95a8d8eb780f59ec8867bb013bface5e9a6b538`.
-- `proton-ge-11-9-rtsp-se2-build-inputs.tar.zst`: the 16 verified contrib
-  inputs, 475,823,823 bytes; SHA-256
-  `a65db70c69c4af73d2b4d3d005ebd409283fce5ce1ec574b17234cb6f52039c1`.
+- `proton-ge-11-11-rtsp-se3-source-x86_64.tar.zst`: prepared corresponding
+  source, 1,408,247,639 bytes; SHA-256
+  `e5f128a9785830096b5d649a2d66076a66fe224ae53f9bfe7ca2b19fc67373b9`.
+- `proton-ge-11-11-rtsp-se3-build-inputs.tar.zst`: the 16 verified contrib
+  inputs, 475,844,563 bytes; SHA-256
+  `1e768c80e0fc5180321d3df3b9c093f5537a0d736f80608403ac32a19e4788cf`.
 - `SUBMODULES.tsv`, `UPSTREAM-SOURCES.tsv` and the additional Gecko, ONNX
   Runtime, Xalia and zenity-rs source archives complete the source account
   described in [source and licensing](docs/SOURCE.md).
@@ -70,66 +97,31 @@ Source/build materials:
   architectures:
   - pinned budget Make 4 × Ninja 2;
   - all 98 submodules and the 16 contrib inputs seeded locally;
-  - preparation, independent fresh-setup verification, artifact
-    re-verification, source audits and post-build preparation all passed.
-- **Artifact checks passed:**
-  - hashes and gzip integrity;
-  - exact archive/tree match;
-  - links, types and permissions;
-  - home-path privacy scan;
-  - no WineGStreamer payload.
-- **The same content as the tested candidate.** SE2 rebuilds the exact
-  content of candidate P24 under the release name:
-  - the same pin fields apart from identity;
-  - the same 17 Wine patches;
-  - the same prepared Wine tree (all 28 media postimage hashes);
-  - identical FFmpeg configuration.
-- **File-by-file comparison of the tool trees (6,160 files):**
-  - 4,343 files are byte-identical;
-  - the rest differ only by build name or path, build IDs, timestamps or
-    generated IDs;
-  - every media-critical binary (Media Foundation, WineDMO, quartz, FFmpeg)
-    is identical once those fields are normalized;
-  - the launcher is byte-identical.
-- **Nix.** The Nix prebuilt package built from the release archive matches
-  the tool exactly, and the NixOS module evaluates.
+  - @SE3_BUILD_CHECKS@
+- **The same content as the tested candidate.** @SE3_IDENTITY_TEXT@
+- **Nix.** @SE3_NIX_TEXT@
 
-## Runtime (SE2 artifact; contained loopback unless noted)
+## Runtime
 
-- **Contained tests pass:**
-  - RTSP ×2;
-  - HLS healthy, burst and seek;
-  - HTTP seek;
-  - HLS VOD.
-- **Throttle and warm-up.** Five 80%-throttle/warm-up runs pass the frozen
-  policy scorer, each with two holds of about 6 s and no startup hold.
-- **ALAC.** The ALAC SourceReader ×4 shows no leading-sample loss.
-- **Backward startup.** HTTPS backward startup passes.
-- **F102 102-case regression set:** 79 PASS / 5 FAIL / 12 INCOMPLETE / 6 not run, with no case changing class
-  against the previous candidate baseline (79 / 5 / 18). The FAILs are the
-  two cases whose frozen oracle forbids the adopted GE 403 retry, and three
-  inherited SourceReader cases decided as no product change. The 18
-  decoder-coordinate cases are INCOMPLETE or not run on a clean package
-  (no decoder-identity records), as on the baseline.
-
-**Candidate history.** P24 is content-identical to SE2. It passed the same
-contained set and went through a maintainer VRChat session that played well.
+@SE3_QUALIFICATION@
 
 Known limits:
 
-- HTTP reconnect applies only to `.mp4` and googlevideo URLs, as in upstream
-  GE-Proton11-9.
-- The 18 decoder-coordinate cases of the 102-case F102 regression set report
-  INCOMPLETE on a clean package: they need decoder-identity records that only
-  a qualification overlay emits. They are not passes.
-- A maintainer VRChat session on the content-identical candidate played well,
-  but its logs show background errors that have not yet been classified. Log
-  output is not a playback oracle.
+- The audio clock advances in 10 ms steps, as in GE-Proton11-11 and earlier
+  releases; at 60 fps, frames therefore land 20, 20 and 10 ms apart.
+- The silent-source policy is deliberate: an outage longer than roughly 10 to
+  14 seconds ends playback with one error, and the last buffered seconds are
+  not played before that error.
+- RGB32 output keeps GE's orientation behavior. The ARGB32 path used by
+  Media Foundation players is unaffected; the Unity VideoPlayer path has not
+  been checked.
+- Legacy and niche paths (for example AMStream ASF, mfplay and live MJPEG
+  startup) are not part of the qualification claims.
 - The unattended source-build wrapper needs a fresh-setup receipt that this
   repository's tooling does not produce on its own; see
   [building](docs/BUILDING.md).
 
-SE2 is pre-release. No general stability, format coverage, long-soak or
+SE3 is pre-release. No general stability, format coverage, long-soak or
 measured A/V synchronization guarantee follows. Keep a fallback compatibility
 tool and report confirmed, privacy-reviewed reproductions. See
 [testing](docs/TESTING.md).

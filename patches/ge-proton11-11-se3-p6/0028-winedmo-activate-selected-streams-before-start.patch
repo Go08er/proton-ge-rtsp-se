@@ -1,0 +1,36 @@
+Subject: [SE3-P5] winedmo: activate all selected streams before starting
+
+media_source_start() activated streams one at a time while the demux
+thread was already reading, so the first packets of a later-index stream
+could be dropped as belonging to an inactive stream (seen as a lost leading
+ALAC block, worst case a lost first video GOP). When starting from STOPPED,
+mark every selected stream active before the per-stream start loop, holding
+all stream queue locks at once: the demux thread checks whether any stream
+is active, and drops a packet for an inactive one, under those locks, so it
+cannot observe a partial activation.
+
+---
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -1400,6 +1400,20 @@
+         return hr;
+     }
+ 
++    /* The demux thread reads once any stream is active and drops a packet whose
++     * stream is inactive, checking both under the stream queue locks. Activate
++     * every selected stream while holding all of them, so that no later stream
++     * can still be inactive when the first packets arrive. */
++    if (starting)
++    {
++        for (i = 0; i < source->stream_count; i++)
++            EnterCriticalSection(&source->streams[i]->queue_cs);
++        for (i = 0; i < source->stream_count; i++)
++            source->streams[i]->active = !!descriptors[i];
++        for (i = 0; i < source->stream_count; i++)
++            LeaveCriticalSection(&source->streams[i]->queue_cs);
++    }
++
+     for (i = 0; i < source->stream_count; i++)
+     {
+         struct media_stream *stream = source->streams[i];

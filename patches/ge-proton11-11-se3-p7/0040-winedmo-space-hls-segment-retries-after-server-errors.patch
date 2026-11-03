@@ -1,0 +1,132 @@
+Subject: [SE3-P7] winedmo: space HLS segment retries after server errors
+
+A segment or key request that returns 503 (or another 5xx, or 429) was
+skipped at once, and a failure on the first segment of a VOD playlist failed
+the whole open. Let FFmpeg's HLS demuxer retry a failed segment three times
+(seg_max_retry) and wait 1, 2 and 3 s before those retries when the failure
+was a server error, so a brief overload does not lose the segment. Other
+failures, such as 404, are retried at once and then skipped as before.
+Playlist requests are untouched: FFmpeg paces live playlist reloads itself,
+and adding open retries there turned a short playlist outage into a terminal
+error (SE3-P2).
+
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -44,6 +44,10 @@
+ /* GE's HTTP reconnect: a 15 s stalled read, then FFmpeg reconnects with
+  * up to 5 s of delays, each attempt bounded by the same rw_timeout. */
+ #define HTTP_RECONNECT_IO_TIMEOUT_US INT64_C(75000000)
++/* FFmpeg's HLS demuxer retries a failed segment open at once (seg_max_retry).
++ * Space retries after a 5xx or 429 out, so a brief overload doesn't skip it. */
++#define HLS_SEGMENT_RETRIES       "3"
++#define HLS_SEGMENT_RETRY_WINDOW_US INT64_C(1000000)
+ /* Match the Windows Media Foundation HTTP client identity used by Proton-RTSP. */
+ #define HTTP_USER_AGENT "NSPlayer/12.00.19041.4894 WMFSDK/12.00.19041.4894"
+ #define HTTP_FALLBACK_USER_AGENT "GStreamer souphttpsrc"
+@@ -91,6 +95,9 @@
+     int cancelled;
+     INT64 deadline;
+     int (*io_open)( AVFormatContext *ctx, AVIOContext **pb, const char *url, int flags, AVDictionary **options );
++    char *hls_failed_url; /* last HLS segment or key request that failed with a 5xx or 429 */
++    INT64 hls_failed_time;
++    unsigned int hls_failed_count;
+ 
+     AVPacket *last_packet; /* last read packet */
+     struct stream *last_stream; /* last read packet stream */
+@@ -930,16 +937,61 @@
+  * after a reset mid-transfer instead of skipping the rest of the segment. Do not
+  * retry failed opens: FFmpeg reloads a live playlist that briefly fails later,
+  * and unranged segments still fail and are skipped as before. */
++static BOOL is_http_hls_url( const char *url );
++
++static int demuxer_sleep( struct demuxer *demuxer, INT64 delay )
++{
++    INT64 end = av_gettime_relative() + delay, now;
++
++    while ((now = av_gettime_relative()) < end)
++    {
++        if (demuxer_interrupt_callback( demuxer )) return AVERROR_EXIT;
++        av_usleep( min( end - now, INT64_C(100000) ) );
++    }
++    return demuxer_interrupt_callback( demuxer ) ? AVERROR_EXIT : 0;
++}
++
+ static int demuxer_io_open( AVFormatContext *ctx, AVIOContext **pb, const char *url, int flags,
+                             AVDictionary **options )
+ {
++    static const INT64 retry_delays_us[] = {1000000, 2000000, 3000000};
+     struct demuxer *demuxer = ctx->opaque;
++    BOOL retry;
++    int ret;
+ 
+-    if (pb != &ctx->pb && options
++    if (pb == &ctx->pb) return demuxer->io_open( ctx, pb, url, flags, options );
++
++    if (options
+             && (av_dict_set( options, "reconnect", "1", AV_DICT_DONT_OVERWRITE ) < 0
+             || av_dict_set( options, "reconnect_delay_max", "5", AV_DICT_DONT_OVERWRITE ) < 0))
+         return AVERROR(ENOMEM);
+-    return demuxer->io_open( ctx, pb, url, flags, options );
++
++    /* An immediate reopen of the request that just failed is FFmpeg's segment
++     * retry. Playlist URLs are never tracked: FFmpeg paces their reloads. */
++    retry = demuxer->hls_failed_url && !strcmp( url, demuxer->hls_failed_url )
++            && av_gettime_relative() - demuxer->hls_failed_time < HLS_SEGMENT_RETRY_WINDOW_US;
++    if (retry && demuxer->hls_failed_count <= ARRAY_SIZE(retry_delays_us)
++            && (ret = demuxer_sleep( demuxer, retry_delays_us[demuxer->hls_failed_count - 1] )) < 0)
++        return ret;
++
++    ret = demuxer->io_open( ctx, pb, url, flags, options );
++    if ((ret == AVERROR_HTTP_SERVER_ERROR || ret == AVERROR_HTTP_TOO_MANY_REQUESTS) && !is_http_hls_url( url ))
++    {
++        if (retry) demuxer->hls_failed_count++;
++        else
++        {
++            free( demuxer->hls_failed_url );
++            demuxer->hls_failed_url = strdup( url );
++            demuxer->hls_failed_count = 1;
++        }
++        demuxer->hls_failed_time = av_gettime_relative();
++    }
++    else if (retry)
++    {
++        free( demuxer->hls_failed_url );
++        demuxer->hls_failed_url = NULL;
++    }
++    return ret;
+ }
+ 
+ static void demuxer_hook_io_open( struct demuxer *demuxer )
+@@ -1020,6 +1072,8 @@
+ {
+     av_packet_free( &demuxer->last_packet );
+     demuxer->last_stream = NULL;
++    free( demuxer->hls_failed_url );
++    demuxer->hls_failed_url = NULL;
+     if (!demuxer->ctx) return;
+ 
+     if (demuxer->direct_url)
+@@ -1089,11 +1143,12 @@
+         if (!hls_hint && av_dict_set( &options, "rw_timeout", "15000000", 0 ) < 0) goto failed;
+         if (set_http_reconnect_options( &options, reconnect ) < 0) goto failed;
+         if (av_dict_set_int( &options, "tls_verify", 1, 0 ) < 0) goto failed;
+-        /* These two private options are consumed only if FFmpeg selects HLS.
++        /* These private options are consumed only if FFmpeg selects HLS.
+          * Constrain its child demuxers, not unrelated progressive containers. */
+         if (av_dict_set_int( &options, "extension_picky", 0, 0 ) < 0) goto failed;
+         if (av_dict_set( &options, "seg_format_options",
+                         "format_whitelist=mpegts,mov,aac,ac3,eac3,mp3,webvtt,wav,flac,ogg,matroska", 0 ) < 0) goto failed;
++        if (av_dict_set( &options, "seg_max_retry", HLS_SEGMENT_RETRIES, 0 ) < 0) goto failed;
+         demuxer->direct_url = TRUE;
+         demuxer->require_avio_seek = TRUE;
+         demuxer->io_timeout = HTTP_IO_TIMEOUT_US;
+@@ -1141,6 +1196,7 @@
+         {
+             av_dict_set( &options, "extension_picky", NULL, 0 );
+             av_dict_set( &options, "seg_format_options", NULL, 0 );
++            av_dict_set( &options, "seg_max_retry", NULL, 0 );
+             /* A known-length response without range support cannot resume where
+              * it stopped; a streamed reconnect would restart it from byte 0 under
+              * the current position. Fail cleanly instead; open-ended streams rejoin. */

@@ -1,0 +1,56 @@
+Subject: [SE3-P3] winedmo: timestamp multipart MJPEG by arrival time
+
+Multipart MJPEG over HTTP (IP cameras) carries no timestamps and FFmpeg
+stamps it at a nominal 25 fps, so a 10 fps camera plays at 2.5x speed,
+starves and rebuffers for seconds at a time. Stamp each frame with its
+arrival time, relative to the first frame, and give it the measured
+arrival gap as its duration: the source's buffering reserve counts sample
+durations, and the nominal 40 ms would hold startup until 125 frames had
+arrived whatever the camera rate (12.5 s at 10 fps).
+
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -82,6 +82,9 @@
+     BOOL direct_url;
+     BOOL nonseekable;
+     BOOL live_rtsp;
++    BOOL wallclock_timestamps;
++    INT64 wallclock_base;
++    INT64 wallclock_last;
+     BOOL require_avio_seek;
+     BOOL cancelled_read_pending_recovery;
+     INT64 io_timeout;
+@@ -1123,6 +1126,13 @@
+                 av_opt_set( demuxer->ctx->pb, "reconnect_streamed", "0", AV_OPT_SEARCH_CHILDREN );
+             TRACE( "media-route=direct-http-progressive-opened\n" );
+         }
++        /* Multipart MJPEG (IP cameras) has no timestamps; FFmpeg stamps it at
++         * a nominal 25 fps whatever the camera sends. Use the arrival time. */
++        if (!strcmp( demuxer->ctx->iformat->name, "mpjpeg" ))
++        {
++            demuxer->wallclock_timestamps = TRUE;
++            demuxer->wallclock_base = AV_NOPTS_VALUE;
++        }
+         /* The HTTP protocol keeps chained options for redirects and range
+          * reopens.  A plaintext-only request leaves tls_verify in this outer
+          * dictionary even though a later HTTPS hop still consumes it. */
+@@ -1519,6 +1529,17 @@
+         normalize_stream_timestamps( demuxer_stream, sample );
+     fixup_asf_vc1_timestamps( demuxer->ctx, stream, demuxer_stream, sample );
+     fixup_asf_mpeg4_final_timestamps( demuxer->ctx, stream, demuxer_stream, sample );
++    if (demuxer->wallclock_timestamps)
++    {
++        INT64 now = av_gettime_relative();
++
++        if (demuxer->wallclock_base == AV_NOPTS_VALUE) demuxer->wallclock_base = demuxer->wallclock_last = now;
++        sample->pts = sample->dts = (now - demuxer->wallclock_base) * 10;
++        /* Buffering counts sample durations; the nominal 25 fps duration would
++         * hold back 125 frames whatever the camera rate. Use the arrival gap. */
++        sample->duration = (now > demuxer->wallclock_last ? now - demuxer->wallclock_last : 1) * 10;
++        demuxer->wallclock_last = now;
++    }
+ 
+     if (packet->flags & AV_PKT_FLAG_KEY) sample->flags |= SAMPLE_FLAG_SYNC_POINT;
+     if (packet_prefix)

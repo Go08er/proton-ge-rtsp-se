@@ -1,0 +1,41 @@
+Subject: [P23] mf: stop the presentation clock when a terminal source error ends a start
+
+A restarting seek moves the session to STOPPED while the presentation clock
+keeps running. When the source then fails with a terminal error, the command
+completes without stopping the clock, so a replacement topology attaches its
+sinks to a stale running clock: the video sink starts, the SAR (time source)
+is not notified, and preroll never completes. Stop the clock and clear
+clock_started in that case. Fixes reload after a terminal seek error
+(P22 lifecycle terminal-reload); P19b2 passed only because older clock.c
+also notified the time-source sink.
+Rebased onto GE-Proton11-11 (SE3-P1)
+
+---
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -5024,7 +5024,24 @@
+                     if (session->command_state == COMMAND_STATE_STARTING_SOURCES
+                             || session->command_state == COMMAND_STATE_PREROLLING_SINKS
+                             || session->command_state == COMMAND_STATE_STARTING_SINKS)
++                    {
++                        MFCLOCK_STATE clock_state;
++
++                        /* A restarting seek keeps the old clock running while the
++                         * session is already STOPPED. If that start fails, stop the
++                         * clock too, so a replacement topology does not attach its
++                         * sinks to a stale running clock and never finish preroll. */
++                        if (session->state == SESSION_STATE_STOPPED && session->clock_started
++                                && SUCCEEDED(IMFPresentationClock_GetState(session->clock, 0, &clock_state)))
++                        {
++                            if (clock_state == MFCLOCK_STATE_INVALID || clock_state == MFCLOCK_STATE_STOPPED
++                                    || SUCCEEDED(IMFPresentationClock_Stop(session->clock)))
++                                session->clock_started = FALSE;
++                            else
++                                WARN("Failed to stop presentation clock after terminal source error.\n");
++                        }
+                         session_command_complete(session);
++                    }
+                 }
+             }
+             LeaveCriticalSection(&session->cs);

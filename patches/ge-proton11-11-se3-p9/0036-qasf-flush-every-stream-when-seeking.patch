@@ -1,0 +1,44 @@
+Subject: [SE3-P3] qasf: flush every stream when seeking
+
+The WM ASF Reader's seek (IMediaSeeking::ChangeCurrent) flushes downstream
+before stopping the asynchronous reader, but both loops flushed the seeked
+stream's peer stream_count times and never flushed the other streams. With
+an audio and a video stream, the reader's callback thread can be blocked
+delivering a sample to the unflushed renderer, and the same thread has to
+process the stop, so WMT_STOPPED never arrives and the seek hangs
+(intermittently, depending on which stream was being delivered). Flush the
+peer of every connected stream, as GE's ge-video-rework 0027 already makes
+graph Stop release blocked deliveries.
+
+---
+diff --git a/dlls/qasf/asfreader.c b/dlls/qasf/asfreader.c
+--- a/dlls/qasf/asfreader.c
++++ b/dlls/qasf/asfreader.c
+@@ -404,10 +404,14 @@
+ 
+     TRACE("iface %p.\n", iface);
+ 
+-    /* Send begin flush commands downstream. */
++    /* Send begin flush commands downstream. Every stream must be flushed: the
++     * reader's callback thread can be blocked delivering to any of them, and it
++     * also has to process the stop. */
+     for (i = 0; i < filter->stream_count; ++i)
+     {
+-        if (FAILED(IPin_BeginFlush(stream->source.pin.peer)))
++        IPin *peer = filter->streams[i].source.pin.peer;
++
++        if (peer && FAILED(IPin_BeginFlush(peer)))
+             WARN("Failed to BeginFlush for stream %u.\n", i);
+     }
+ 
+@@ -417,7 +421,9 @@
+     /* Send end flush commands downstream. */
+     for (i = 0; i < filter->stream_count; ++i)
+     {
+-        if (FAILED(IPin_EndFlush(stream->source.pin.peer)))
++        IPin *peer = filter->streams[i].source.pin.peer;
++
++        if (peer && FAILED(IPin_EndFlush(peer)))
+             WARN("Failed to EndFlush for stream %u.\n", i);
+     }
+ 

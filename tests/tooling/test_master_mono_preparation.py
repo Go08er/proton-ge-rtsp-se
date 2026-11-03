@@ -173,6 +173,16 @@ class MasterPreparationTests(unittest.TestCase):
         self.assertIn('"$SOURCE_DIR/$path" "$SOURCE_DIR/patches/low_latency_layer"', arm)
         self.assertIn("low_latency_args+=(--check)", script)
 
+    def test_build_accepts_ge_patched_openvr_and_d7vk_only_with_pinned_patches(self):
+        script = (ROOT / "scripts/build-pinned-ge.sh").read_text()
+        arm = script.split("    openvr|d7vk)", 1)[1].split(";;", 1)[0]
+        self.assertIn('if [[ -d "$SOURCE_DIR/patches/$path" ]]', arm)
+        self.assertIn("pinned_ge_require_upstream_component_patch_state", arm)
+        self.assertIn('"$SOURCE_DIR/$path" "$SOURCE_DIR/patches/$path"', arm)
+        # Without a GE patch dir the component falls through to the clean-tree check.
+        loop = script.split("    openvr|d7vk)", 1)[1].split("done", 1)[0]
+        self.assertIn("unexpected prepared-source changes in submodule", loop)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

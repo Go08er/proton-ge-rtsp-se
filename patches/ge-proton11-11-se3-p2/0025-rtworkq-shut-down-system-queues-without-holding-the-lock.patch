@@ -1,0 +1,61 @@
+Subject: [SE3-P2] rtworkq: shut down the system queues without holding queues_section
+
+shutdown_system_queues() waits for running callbacks (pool_queue_shutdown()
+-> CloseThreadpoolCleanupGroupMembers()) while holding queues_section. A
+callback that locks or unlocks a user queue then deadlocks MFShutdown()
+forever. WineDMO hits this when a URL is still opening at shutdown: the
+creation callback runs on the IO queue, and its failure path calls
+MFUnlockWorkQueue() on the source's queues. The process never exits.
+
+GE's ge-video-rework 0003 already moved shutdown_queue() out of the lock in
+unlock_user_queue(); do the same for the system queues. Lazy creation of a
+system queue is refused with RTWQ_E_SHUTDOWN while they close, instead of
+racing the teardown. MFShutdown() now waits until the pending open gives up
+(bounded by its timeouts) instead of hanging.
+
+---
+diff --git a/dlls/rtworkq/queue.c b/dlls/rtworkq/queue.c
+--- a/dlls/rtworkq/queue.c
++++ b/dlls/rtworkq/queue.c
+@@ -56,6 +56,7 @@
+ static struct queue_handle *next_unused_user_queue = user_queues;
+ static WORD queue_generation;
+ static DWORD shared_mt_queue;
++static BOOL system_queues_closing;
+ 
+ static CRITICAL_SECTION queues_section;
+ static CRITICAL_SECTION_DEBUG queues_critsect_debug =
+@@ -665,6 +666,11 @@
+         struct queue_desc desc;
+ 
+         EnterCriticalSection(&queues_section);
++        if (system_queues_closing)
++        {
++            LeaveCriticalSection(&queues_section);
++            return RTWQ_E_SHUTDOWN;
++        }
+         switch (queue_id)
+         {
+             case RTWQ_CALLBACK_QUEUE_IO:
+@@ -1310,13 +1316,21 @@
+     unsigned int i;
+     HRESULT hr;
+ 
++    /* Like unlock_user_queue(), do not wait for running callbacks while holding
++     * queues_section: a callback that locks or unlocks a user queue would deadlock.
++     * Lazy queue creation is refused meanwhile. */
+     EnterCriticalSection(&queues_section);
++    system_queues_closing = TRUE;
++    LeaveCriticalSection(&queues_section);
+ 
+     for (i = 0; i < ARRAY_SIZE(system_queues); ++i)
+     {
+         shutdown_queue(&system_queues[i]);
+     }
+ 
++    EnterCriticalSection(&queues_section);
++    system_queues_closing = FALSE;
++
+     if (FAILED(hr = CoDecrementMTAUsage(mta_cookie)))
+         WARN("Failed to uninitialize MTA, hr %#lx.\n", hr);
+ 

@@ -1,0 +1,94 @@
+Subject: [P20 review] mfsrcsnk retain source origin and queued tail drain
+
+Residual against GE-Proton11-9 after ge-video-rework.
+Source-reviewed only: not compiler or runtime qualification.
+Prior P19b2 patch ownership (some behavior is now upstream):
+  ge-proton11-7-se2-p19b/0071-mfreadwrite-map-source-origin-metadata.patch
+  ge-proton11-7-se2-p19b/0075-mfsrcsnk-drain-queued-tail-before-eos.patch
+
+---
+diff --git a/dlls/mfsrcsnk/media_source.c b/dlls/mfsrcsnk/media_source.c
+--- a/dlls/mfsrcsnk/media_source.c
++++ b/dlls/mfsrcsnk/media_source.c
+@@ -23,6 +23,9 @@
+ #include "wine/list.h"
+ #include "wine/debug.h"
+ #include "wine/winedmo.h"
++
++#include "initguid.h"
++#include "wine/mforigin.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
+ 
+@@ -328,6 +331,7 @@
+ 
+     struct winedmo_demuxer winedmo_demuxer;
+     struct winedmo_stream winedmo_stream;
++    struct wine_mf_presentation_origin origin;
+     UINT64 file_size;
+     UINT64 position;
+     INT64 duration;
+@@ -465,6 +469,8 @@
+     IUnknown_Release(op);
+ }
+ 
++static HRESULT media_source_send_eos(struct media_source *source, struct media_stream *stream);
++
+ static void media_stream_start(struct media_stream *stream, UINT index, const PROPVARIANT *position)
+ {
+     struct media_source *source = media_source_from_IMFMediaSource(stream->source);
+@@ -500,7 +506,7 @@
+         }
+ 
+         token_count = list_count(&stream->tokens);
+-        while (source->pending_reads < token_count)
++        while (!source->demux_eos && source->pending_reads < token_count)
+             queue_media_source_read(source);
+     }
+ }
+@@ -579,6 +585,9 @@
+     source->state = SOURCE_RUNNING;
+ 
+     queue_media_event_value(source->queue, seeking ? MESourceSeeked : MESourceStarted, position);
++    if (source->demux_eos)
++        for (i = 0; i < source->stream_count; i++)
++            media_source_send_eos(source, source->streams[i]);
+     return hr;
+ }
+ 
+@@ -763,7 +772,7 @@
+     PROPVARIANT empty = {.vt = VT_EMPTY};
+     UINT i;
+ 
+-    if (stream->active && !stream->eos)
++    if (stream->active && !stream->eos && list_empty(&stream->samples))
+     {
+         WARN("Queueing MEEndOfStream for stream %p, queued samples %u.\n",
+                 stream, list_count(&stream->samples));
+@@ -996,7 +1005,7 @@
+         return S_OK;
+     }
+ 
+-    if (source->demux_eos)
++    if (source->demux_eos && list_empty(&stream->samples))
+     {
+         media_source_send_eos(source, stream);
+         return S_OK;
+@@ -1491,6 +1500,9 @@
+             WARN("Failed to set presentation descriptor MF_PD_TOTAL_FILE_SIZE, hr %#lx\n", hr);
+         if (FAILED(hr = IMFPresentationDescriptor_SetUINT64(*descriptor, &MF_PD_DURATION, source->duration)))
+             WARN("Failed to set presentation descriptor MF_PD_DURATION, hr %#lx\n", hr);
++        if (FAILED(hr = IMFPresentationDescriptor_SetBlob(*descriptor, &MF_WINE_PD_PRESENTATION_ORIGIN,
++                (const BYTE *)&source->origin, sizeof(source->origin))))
++            WARN("Failed to set presentation origin, hr %#lx\n", hr);
+ 
+         for (i = 0; i < source->stream_count; ++i)
+         {
+@@ -2028,6 +2040,7 @@
+         hr = HRESULT_FROM_NT(status);
+         goto done;
+     }
++    winedmo_demuxer_get_origin(source->winedmo_demuxer, &source->origin);
+ 
+     if (!(source->stream_map = calloc(stream_count, sizeof(*source->stream_map)))
+             || !(source->streams = calloc(stream_count, sizeof(*source->streams))))

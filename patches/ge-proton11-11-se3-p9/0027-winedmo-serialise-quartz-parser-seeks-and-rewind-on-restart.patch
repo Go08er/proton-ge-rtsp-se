@@ -1,0 +1,104 @@
+Subject: [SE3-P2] winedmo: serialise quartz parser seeks and reposition on every restart
+
+The DirectShow WineDMO parser has the same flush-EOF problem as the WM
+reader: seeks that need reads (MPEG-PS, Matroska) deliver nothing. Its demux
+thread also reads the AVFormatContext while SetPositions() seeks it.
+
+Serialise demuxer reads and seeks with a new demuxer_cs, let the seek's own
+reads through, and re-check the flush generation before reading. Stop
+discards read-ahead packets without rewinding the demuxer, so always
+reposition it in init_stream(); otherwise a Stop->Run restart (menu and
+cutscene loops) resumes past the dropped data and shows nothing.
+
+---
+diff --git a/dlls/winedmo/winedmo_quartz_parser.c b/dlls/winedmo/winedmo_quartz_parser.c
+--- a/dlls/winedmo/winedmo_quartz_parser.c
++++ b/dlls/winedmo/winedmo_quartz_parser.c
+@@ -220,7 +220,9 @@
+ 
+     /* Set TRUE to make the read callback return 0 bytes (interrupts demuxer). */
+     BOOL read_flushing;
++    bool seeking;                 /* a seek holds demuxer_cs and may read while flushing */
+     unsigned int read_flush_generation;
++    CRITICAL_SECTION demuxer_cs;  /* serialises winedmo_demuxer_read vs winedmo_demuxer_seek */
+ 
+     CRITICAL_SECTION streaming_cs;
+     CONDITION_VARIABLE flushing_cv;
+@@ -382,7 +384,7 @@
+     LONGLONG avail;
+     HRESULT hr;
+ 
+-    if (filter->read_flushing)
++    if (filter->read_flushing && !filter->seeking)
+     {
+         *size = 0;
+         return STATUS_SUCCESS;
+@@ -655,7 +657,11 @@
+         LONGLONG seek_time = filter->sources[0]->seek.llCurrent;
+         NTSTATUS status;
+         WARN("DirectShow parser SetPositions seek to %s.\n", debugstr_time(seek_time));
++        EnterCriticalSection(&filter->demuxer_cs);
++        filter->seeking = true;
+         status = winedmo_demuxer_seek(filter->winedmo_demuxer, seek_time);
++        filter->seeking = false;
++        LeaveCriticalSection(&filter->demuxer_cs);
+         if (status)
+             WARN("winedmo_demuxer_seek failed, status %#lx.\n", status);
+     }
+@@ -1147,7 +1153,20 @@
+         stream_idx = 0;
+         needed_size = buffer_size;
+ 
++        EnterCriticalSection(&filter->demuxer_cs);
++        /* A seek may have started since the flushing check; reading now would
++         * see a flushing EOF and leave the demuxer at EOF after the seek. */
++        EnterCriticalSection(&filter->streaming_cs);
++        if (filter->flushing || flush_generation != filter->read_flush_generation)
++        {
++            LeaveCriticalSection(&filter->streaming_cs);
++            LeaveCriticalSection(&filter->demuxer_cs);
++            IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
++            continue;
++        }
++        LeaveCriticalSection(&filter->streaming_cs);
+         status = winedmo_demuxer_read(filter->winedmo_demuxer, &stream_idx, &output, &needed_size);
++        LeaveCriticalSection(&filter->demuxer_cs);
+ 
+         EnterCriticalSection(&filter->streaming_cs);
+         if (!filter->streaming || filter->flushing || flush_generation != filter->read_flush_generation)
+@@ -1560,6 +1579,8 @@
+ 
+     filter->streaming_cs.DebugInfo->Spare[0] = 0;
+     DeleteCriticalSection(&filter->streaming_cs);
++    filter->demuxer_cs.DebugInfo->Spare[0] = 0;
++    DeleteCriticalSection(&filter->demuxer_cs);
+ 
+     strmbase_sink_cleanup(&filter->sink);
+     strmbase_filter_cleanup(&filter->filter);
+@@ -1577,11 +1598,16 @@
+     /* Seek to the current position (retain seek state across Stop/Pause/Run). */
+     {
+         LONGLONG seek_time = filter->source_count ? filter->sources[0]->seek.llCurrent : 0;
+-        if (seek_time)
++        /* Stop discards the read-ahead packets without rewinding the demuxer;
++         * always reposition it, or a restart resumes past the dropped data. */
+         {
+             NTSTATUS status;
+             WARN("DirectShow parser init seek to %s.\n", debugstr_time(seek_time));
++            EnterCriticalSection(&filter->demuxer_cs);
++            filter->seeking = true;
+             status = winedmo_demuxer_seek(filter->winedmo_demuxer, seek_time);
++            filter->seeking = false;
++            LeaveCriticalSection(&filter->demuxer_cs);
+             if (status)
+                 WARN("Initial seek failed, status %#lx.\n", status);
+         }
+@@ -1852,6 +1878,8 @@
+     InitializeCriticalSectionEx(&filter->streaming_cs, 0,
+             RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     filter->streaming_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": filter.streaming_cs");
++    InitializeCriticalSectionEx(&filter->demuxer_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    filter->demuxer_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": filter.demuxer_cs");
+     InitializeConditionVariable(&filter->flushing_cv);
+     InitializeConditionVariable(&filter->queue_space_cv);
+ 

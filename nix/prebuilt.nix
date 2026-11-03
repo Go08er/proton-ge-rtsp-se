@@ -3,11 +3,11 @@ let
   release = import ./release.nix;
 in stdenvNoCC.mkDerivation {
   pname = "proton-ge-rtsp-slop-edition";
-  version = "se2";
+  version = "se3";
   src = if localArchive != null then localArchive else fetchurl {
     inherit (release) url hash;
   };
-  sourceRoot = "proton-ge-11-9-rtsp-se2";
+  sourceRoot = "proton-ge-11-11-rtsp-se3";
   outputs = [ "out" "steamcompattool" ];
   dontConfigure = true;
   dontBuild = true;
@@ -22,7 +22,7 @@ in stdenvNoCC.mkDerivation {
     runHook postInstall
   '';
   meta = {
-    description = "Experimental GE-Proton11-9 RTSP compatibility tool";
+    description = "Experimental GE-Proton11-11 RTSP compatibility tool";
     homepage = "https://github.com/Go08er/proton-ge-real-time-streaming-protocol-slop-edition";
     platforms = [ "x86_64-linux" ];
     # Aggregate: component/file licenses remain authoritative.

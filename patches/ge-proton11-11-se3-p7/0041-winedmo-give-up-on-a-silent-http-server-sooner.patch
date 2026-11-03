@@ -1,0 +1,65 @@
+Subject: [SE3-P7] winedmo: give up on a silent HTTP server sooner
+
+A direct HTTP source whose server stopped answering took up to 75 s to
+report its error: a 15 s stalled read, then reconnects each bounded by the
+same 15 s, under a 75 s packet deadline. A refused reconnect already fails
+within about 4 s; only a silent server waited that long.
+
+Reconnect after 8 s without data, and give up when a packet read has waited
+15 s for a known-length source or 20 s for an open-ended (live) one. A server
+that returns within that window still resumes at the same byte. The open
+deadline is unchanged; the first response may now take 8 s per attempt
+instead of 15 s, with FFmpeg's network-error retries inside the 30 s open.
+
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -41,9 +41,13 @@
+ #define HLS_IO_TIMEOUT_US    INT64_C(30000000)
+ #define HTTP_OPEN_TIMEOUT_US INT64_C(30000000)
+ #define HTTP_IO_TIMEOUT_US   INT64_C(15000000)
+-/* GE's HTTP reconnect: a 15 s stalled read, then FFmpeg reconnects with
+- * up to 5 s of delays, each attempt bounded by the same rw_timeout. */
+-#define HTTP_RECONNECT_IO_TIMEOUT_US INT64_C(75000000)
++/* GE's HTTP reconnect: after 8 s without data (rw_timeout) FFmpeg reconnects at
++ * the same byte, retrying 0, 1 and 3 s apart, so a refused server fails within
++ * about 4 s and one that returns resumes where it stopped. A server that stays
++ * silent fails when the packet read runs out of time: 15 s for a known-length
++ * source, 20 s for an open-ended (live) one, which may pause at the origin. */
++#define HTTP_RECONNECT_IO_TIMEOUT_US      INT64_C(15000000)
++#define HTTP_RECONNECT_LIVE_IO_TIMEOUT_US INT64_C(20000000)
+ /* FFmpeg's HLS demuxer retries a failed segment open at once (seg_max_retry).
+  * Space retries after a 5xx or 429 out, so a brief overload doesn't skip it. */
+ #define HLS_SEGMENT_RETRIES       "3"
+@@ -1138,9 +1142,9 @@
+         /* Open with the Windows media identity; GE's 403 retry below may
+          * replace it once, within the same open deadline. */
+         if (av_dict_set( &options, "user_agent", HTTP_USER_AGENT, 0 ) < 0) goto failed;
+-        /* As GE11-9: a stalled non-HLS read fails after 15 s, and byte-range
+-         * requests reconnect at the same offset after a reset. */
+-        if (!hls_hint && av_dict_set( &options, "rw_timeout", "15000000", 0 ) < 0) goto failed;
++        /* As GE11-9, byte-range requests reconnect at the same offset after a
++         * reset; a non-HLS read that stalls for 8 s (GE: 15 s) reconnects too. */
++        if (!hls_hint && av_dict_set( &options, "rw_timeout", "8000000", 0 ) < 0) goto failed;
+         if (set_http_reconnect_options( &options, reconnect ) < 0) goto failed;
+         if (av_dict_set_int( &options, "tls_verify", 1, 0 ) < 0) goto failed;
+         /* These private options are consumed only if FFmpeg selects HLS.
+@@ -1152,7 +1156,7 @@
+         demuxer->direct_url = TRUE;
+         demuxer->require_avio_seek = TRUE;
+         demuxer->io_timeout = HTTP_IO_TIMEOUT_US;
+-        /* Our outer packet deadline must not cut FFmpeg's reconnect short. */
++        /* The packet deadline bounds a stall including FFmpeg's reconnects. */
+         if (reconnect) demuxer->io_timeout = HTTP_RECONNECT_IO_TIMEOUT_US;
+         demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
+         demuxer->ctx->interrupt_callback.opaque = demuxer;
+@@ -1203,6 +1207,8 @@
+             if (demuxer->ctx->pb && !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)
+                     && avio_size( demuxer->ctx->pb ) > 0)
+                 av_opt_set( demuxer->ctx->pb, "reconnect_streamed", "0", AV_OPT_SEARCH_CHILDREN );
++            if (reconnect && (!demuxer->ctx->pb || avio_size( demuxer->ctx->pb ) <= 0))
++                demuxer->io_timeout = HTTP_RECONNECT_LIVE_IO_TIMEOUT_US;
+             TRACE( "media-route=direct-http-progressive-opened\n" );
+         }
+         /* Multipart MJPEG (IP cameras) has no timestamps; FFmpeg stamps it at

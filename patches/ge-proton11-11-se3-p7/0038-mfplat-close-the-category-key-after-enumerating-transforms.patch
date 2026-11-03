@@ -1,0 +1,23 @@
+Subject: [SE3-P6] mfplat: close the category key after enumerating transforms
+
+mft_collect_machine_reg() opened the registry key of the requested MFT
+category, enumerated its subkeys and returned without closing it, so every
+MFTEnum/MFTEnumEx/MFTEnum2 lookup in the machine registry leaked one key
+handle. The media engine looks up about five categories each time it opens
+a video and the source reader about three, so a player that is created and
+destroyed repeatedly kept accumulating handles (5 per open/close cycle in a
+100-cycle loop, on vanilla GE-Proton11-11 as well). Close the key once the
+enumeration is done.
+
+---
+diff --git a/dlls/mfplat/main.c b/dlls/mfplat/main.c
+--- a/dlls/mfplat/main.c
++++ b/dlls/mfplat/main.c
+@@ -1257,6 +1257,7 @@
+         index++;
+     }
+ 
++    RegCloseKey(hlist);
+     return S_OK;
+ }
+ 

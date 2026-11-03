@@ -1,0 +1,173 @@
+Subject: [P23] winedmo: interrupt a stalled read on seek and reopen the transport
+
+P21/P22 serialized an ordinary seek behind the in-flight demux read, as GE
+does, so a seek during a stalled read waited for that read (measured 10.1 s,
+P19b2 0.16 s). Restore P19b2's interrupt-on-seek. Any failure or EOF of a
+read we deliberately cancelled on the direct progressive HTTP path is a
+cancellation, never a terminal error or EOS; the seek clears the AVIO
+error/eof state. MOV defers the Range reopen to its first post-seek read and
+FFmpeg may short-seek forward on the old connection, which a cancelled TLS
+read can leave broken (EIO): force that first read to use the underlying
+seek (pb->direct), i.e. a fresh HTTP request. Private HTTPS item 25 s/8 s:
+6/6 pass (diagnostic build without the fresh request: 1/6).
+
+---
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -1312,29 +1312,29 @@
+         }
+ 
+         WARN("MF media source seek to %s.\n", debugstr_time(position->hVal.QuadPart));
+-        /* Do not interrupt a transport which the seek must reuse. Keep the
+-         * source lock free while waiting for the old bounded read, so Shutdown
+-         * can still cancel it. The counted callback owns the pending seek. */
+-        source->demux_seek_pending = true;
+-        LeaveCriticalSection(&source->cs);
+-        EnterCriticalSection(&source->demuxer_cs);
+-        EnterCriticalSection(&source->cs);
+-        if (FAILED(seek_error = media_source_get_demux_error(source)))
+-            status = STATUS_SUCCESS;
+-        else if (source->state == SOURCE_SHUTDOWN || source->demux_thread_shutdown)
+-            status = STATUS_CANCELLED;
+-        else
++        if (!(status = winedmo_demuxer_set_cancelled(source->demuxer, TRUE)))
+         {
+-            LeaveCriticalSection(&source->cs);
+-            status = winedmo_demuxer_seek(source->demuxer, position->hVal.QuadPart);
+-            EnterCriticalSection(&source->cs);
+-            if (!status && (source->state == SOURCE_SHUTDOWN
+-                    || source->demux_thread_shutdown))
+-                status = STATUS_CANCELLED;
++            EnterCriticalSection(&source->demuxer_cs);
++            if (FAILED(seek_error = media_source_get_demux_error(source)))
++                status = STATUS_SUCCESS;
++            else if (!(status = winedmo_demuxer_set_cancelled(source->demuxer, FALSE)))
++            {
++                /* Let Shutdown acquire source->cs and trip the demuxer's
++                 * interrupt callback while a direct network seek is blocked.
++                 * The pending work-item count keeps this source alive, while
++                 * demux_seek_pending keeps other source commands serialized. */
++                source->demux_seek_pending = true;
++                LeaveCriticalSection(&source->cs);
++                status = winedmo_demuxer_seek(source->demuxer, position->hVal.QuadPart);
++                EnterCriticalSection(&source->cs);
++                source->demux_seek_pending = false;
++                WakeAllConditionVariable(&source->work_cv);
++                if (!status && (source->state == SOURCE_SHUTDOWN
++                        || source->demux_thread_shutdown))
++                    status = STATUS_CANCELLED;
++            }
++            LeaveCriticalSection(&source->demuxer_cs);
+         }
+-        source->demux_seek_pending = false;
+-        WakeAllConditionVariable(&source->work_cv);
+-        LeaveCriticalSection(&source->demuxer_cs);
+ 
+         if (FAILED(seek_error) || status)
+         {
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -78,6 +78,7 @@
+     BOOL direct_url;
+     BOOL nonseekable;
+     BOOL require_avio_seek;
++    BOOL cancelled_read_pending_recovery;
+     INT64 io_timeout;
+     int cancelled;
+     INT64 deadline;
+@@ -1270,6 +1271,18 @@
+     BOOL input_error;
+     int i, ret;
+ 
++    /* A read which was deliberately cancelled for a seek may fail with
++     * AVERROR_EXIT, EIO or EOF, particularly over TLS. Never report that as a
++     * terminal error or EOS: the pending seek clears the AVIO state. */
++    if (demuxer->cancelled_read_pending_recovery) return STATUS_CANCELLED;
++    if (demuxer->require_avio_seek
++            && __atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )
++            && demuxer->ctx->pb && (demuxer->ctx->pb->error || demuxer->ctx->pb->eof_reached))
++    {
++        demuxer->cancelled_read_pending_recovery = TRUE;
++        return STATUS_CANCELLED;
++    }
++
+     do
+     {
+         /* One budget for the complete packet request, including ignored tracks
+@@ -1309,6 +1322,15 @@
+                     && demuxer->empty_input_packets != ~0u)
+                 ++demuxer->empty_input_packets;
+             input_error = ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN);
++            if (demuxer->require_avio_seek
++                    && __atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )
++                    && (ret < 0 || (demuxer->ctx->pb
++                    && (demuxer->ctx->pb->error || demuxer->ctx->pb->eof_reached))))
++            {
++                demuxer->cancelled_read_pending_recovery = TRUE;
++                av_packet_free( packet );
++                return STATUS_CANCELLED;
++            }
+             if (!ret)
+             {
+                 if (demuxer->ctx->iformat && strstr( demuxer->ctx->iformat->name, "mp4" ) &&
+@@ -1478,12 +1500,14 @@
+     struct demuxer_seek_params *params = arg;
+     struct demuxer *demuxer = get_demuxer( params->demuxer );
+     int64_t timestamp = av_rescale( params->timestamp, AV_TIME_BASE, 10000000 );
++    BOOL fresh_connection;
+     NTSTATUS status;
+     int i, ret, anchor;
+ 
+     TRACE( "demuxer %p, timestamp 0x%s\n", demuxer, wine_dbgstr_longlong( params->timestamp ) );
+ 
+     if (!demuxer_is_seekable( demuxer )) return STATUS_NOT_SUPPORTED;
++    fresh_connection = demuxer->require_avio_seek && demuxer->cancelled_read_pending_recovery;
+ 
+     /* avformat_seek_file expects source timestamps, not MF-relative positions. */
+     if (demuxer->hls_timestamp_base != AV_NOPTS_VALUE)
+@@ -1494,6 +1518,14 @@
+     if (status != STATUS_NOT_SUPPORTED)
+         return status;
+ 
++    if (demuxer->require_avio_seek && demuxer->cancelled_read_pending_recovery && demuxer->ctx->pb)
++    {
++        /* The cancelled read left an error or EOF (any value) in the AVIO
++         * context; the seek reuses this transport. */
++        demuxer->ctx->pb->error = 0;
++        demuxer->ctx->pb->eof_reached = 0;
++    }
++
+     anchor = demuxer_seek_anchor( demuxer, timestamp );
+     if (anchor >= 0) timestamp = av_rescale_q( timestamp, AV_TIME_BASE_Q, demuxer->ctx->streams[anchor]->time_base );
+     if (demuxer->io_timeout) demuxer_set_deadline( demuxer, demuxer->io_timeout );
+@@ -1515,6 +1547,7 @@
+         return STATUS_UNSUCCESSFUL;
+     }
+ done:
++    demuxer->cancelled_read_pending_recovery = FALSE;
+     demuxer->input_eofs = 0;
+     demuxer->empty_input_packets = 0;
+     for (i = 0; i < demuxer->stream_count; i++)
+@@ -1544,8 +1577,19 @@
+             && (demuxer->duration <= 0 || params->timestamp < demuxer->duration))
+     {
+         AVPacket *packet = NULL;
++        int direct = 0;
+ 
+-        if ((status = demuxer_filter_packet( demuxer, &packet )))
++        /* The cancelled read may have broken its transport (TLS can fail with
++         * EIO). Make the deferred MOV reopen issue a fresh HTTP request rather
++         * than short-seeking forward on that connection. */
++        if (fresh_connection && demuxer->ctx->pb)
++        {
++            direct = demuxer->ctx->pb->direct;
++            demuxer->ctx->pb->direct = 1;
++        }
++        status = demuxer_filter_packet( demuxer, &packet );
++        if (fresh_connection && demuxer->ctx->pb) demuxer->ctx->pb->direct = direct;
++        if (status)
+         {
+             /* An unknown-duration seek may legitimately land at EOF.  Let the
+              * normal read path publish EOS instead of making Start fail. A

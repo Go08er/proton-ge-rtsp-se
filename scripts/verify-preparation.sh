@@ -533,6 +533,326 @@ case "$PIN_ID" in
         || fail "$PIN_ID is immutable and must not carry the AAC parser build module"
     fi
     ;;
+  ge-proton11-11-se3-p1)
+    # SE3-P1: the SE2 series (17 Wine patches, 0003/0006/0021 refreshed) rebased onto
+    # GE-Proton11-11. Bind every pin field; GE11-9 candidates above stay immutable.
+    SELECTED_PROFILE=se3p1
+    selected_pin_sha256=2c65d37b3fe951936d9b27e0a510ee3a4dafb51cf49faa19804f850a39c72de8
+    selected_residual_digest=8e8a156cc553cff66450f0b177bfb04f4dc166849f4db1d62889b1569a002eb5
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-11-rtsp-se3-p1 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-11 \
+        && "$PIN_SOURCE_COMMIT" == c0c2ee35e6d4d3bff4d39c6246ac46636434feb8 \
+        && "$PIN_SOURCE_TREE" == c172c6ce0963373c2b498916d74c42e5fa733797 \
+        && "$PIN_WINE_COMMIT" == c53678ab22a85f0fad3588dd34f0452a463bd015 \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == 2f2569df12710459603f9f8b1ba4d078d156aaf0 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-11 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == db09146eb92a83607657e98c2c00958c0740ecc8 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 16a91ff3b5bc37d419846ed4eefd435cef58914c ]] \
+      || fail "SE3-P1 requires its exact AAC parser build module after the MPEGVIDEO module"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    ;;
+  ge-proton11-11-se3-p2)
+    # SE3-P2: SE3-P1's 17 Wine patches byte-identical + 0025-0034, on
+    # GE-Proton11-11. Bind every pin field; GE11-9 candidates above stay immutable.
+    SELECTED_PROFILE=se3p2
+    selected_pin_sha256=dc0cbf760fd271eb9cd1b056cee5c8d44dde062f5fa15ea4aad2cf8756fea4bb
+    selected_residual_digest=a53527b7e326d88cf3ffd5828ce8e4582544b478015211a03dd02d227cdcbf5e
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-11-rtsp-se3-p2 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-11 \
+        && "$PIN_SOURCE_COMMIT" == c0c2ee35e6d4d3bff4d39c6246ac46636434feb8 \
+        && "$PIN_SOURCE_TREE" == c172c6ce0963373c2b498916d74c42e5fa733797 \
+        && "$PIN_WINE_COMMIT" == c53678ab22a85f0fad3588dd34f0452a463bd015 \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == 2f2569df12710459603f9f8b1ba4d078d156aaf0 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-11 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == db09146eb92a83607657e98c2c00958c0740ecc8 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 16a91ff3b5bc37d419846ed4eefd435cef58914c ]] \
+      || fail "SE3-P2 requires its exact AAC parser build module after the MPEGVIDEO module"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    ;;
+  ge-proton11-11-se3-p3)
+    # SE3-P3: SE3-P1's 17 Wine patches + 0025-0036, on
+    # GE-Proton11-11. Bind every pin field; GE11-9 candidates above stay immutable.
+    SELECTED_PROFILE=se3p3
+    selected_pin_sha256=735fb14b9ad1d0e5dd40cdbf141e0f6ae120cf285b9feda8b15a80a355afa5fb
+    selected_residual_digest=4690633db6f45d9ad8103d44441034cc7a448125faeb394302bed34a165d1bf9
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-11-rtsp-se3-p3 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-11 \
+        && "$PIN_SOURCE_COMMIT" == c0c2ee35e6d4d3bff4d39c6246ac46636434feb8 \
+        && "$PIN_SOURCE_TREE" == c172c6ce0963373c2b498916d74c42e5fa733797 \
+        && "$PIN_WINE_COMMIT" == c53678ab22a85f0fad3588dd34f0452a463bd015 \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == 2f2569df12710459603f9f8b1ba4d078d156aaf0 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-11 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == db09146eb92a83607657e98c2c00958c0740ecc8 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 16a91ff3b5bc37d419846ed4eefd435cef58914c ]] \
+      || fail "SE3-P3 requires its exact AAC parser build module after the MPEGVIDEO module"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    ;;
+  ge-proton11-11-se3-p4)
+    # SE3-P4: SE3-P1's 17 Wine patches + 0025-0037, on
+    # GE-Proton11-11. Bind every pin field; GE11-9 candidates above stay immutable.
+    SELECTED_PROFILE=se3p4
+    selected_pin_sha256=62907f5d1e521a3fc6f72d8fa31261dacbc9e4b48cc66222ca7949c843daf23d
+    selected_residual_digest=3bf24ca68715faeb20ed1cf39c0ecd98f3416e95889b5215cbccea5c31145097
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-11-rtsp-se3-p4 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-11 \
+        && "$PIN_SOURCE_COMMIT" == c0c2ee35e6d4d3bff4d39c6246ac46636434feb8 \
+        && "$PIN_SOURCE_TREE" == c172c6ce0963373c2b498916d74c42e5fa733797 \
+        && "$PIN_WINE_COMMIT" == c53678ab22a85f0fad3588dd34f0452a463bd015 \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == 2f2569df12710459603f9f8b1ba4d078d156aaf0 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-11 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == db09146eb92a83607657e98c2c00958c0740ecc8 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 16a91ff3b5bc37d419846ed4eefd435cef58914c ]] \
+      || fail "SE3-P4 requires its exact AAC parser build module after the MPEGVIDEO module"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    ;;
+  ge-proton11-11-se3-p5)
+    # SE3-P5: SE3-P1's 17 Wine patches + 0025-0037, on
+    # GE-Proton11-11. Bind every pin field; GE11-9 candidates above stay immutable.
+    SELECTED_PROFILE=se3p5
+    selected_pin_sha256=526e4a93b9fc6eacf7b65ab3c6e916598212d542a361af84ea2b8d4b705cd83f
+    selected_residual_digest=829b181d44a45c7bb10b4f235c4de1d4521886e3fa361b3c330275b674e5c133
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-11-rtsp-se3-p5 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-11 \
+        && "$PIN_SOURCE_COMMIT" == c0c2ee35e6d4d3bff4d39c6246ac46636434feb8 \
+        && "$PIN_SOURCE_TREE" == c172c6ce0963373c2b498916d74c42e5fa733797 \
+        && "$PIN_WINE_COMMIT" == c53678ab22a85f0fad3588dd34f0452a463bd015 \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == 2f2569df12710459603f9f8b1ba4d078d156aaf0 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-11 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == db09146eb92a83607657e98c2c00958c0740ecc8 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 16a91ff3b5bc37d419846ed4eefd435cef58914c ]] \
+      || fail "SE3-P5 requires its exact AAC parser build module after the MPEGVIDEO module"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    ;;
+  ge-proton11-11-se3-p6)
+    # SE3-P6: SE3-P1's 17 Wine patches + 0025-0038, on
+    # GE-Proton11-11. Bind every pin field; GE11-9 candidates above stay immutable.
+    SELECTED_PROFILE=se3p6
+    selected_pin_sha256=fe0df21e963178d91ee4ba5cd41df90a745c7b5f356aef9e2636b5a0f8d62120
+    selected_residual_digest=6bd58e6f4911ddb8a9e1aaed440973639a00a443338e5141a710e2237cb5d4f9
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-11-rtsp-se3-p6 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-11 \
+        && "$PIN_SOURCE_COMMIT" == c0c2ee35e6d4d3bff4d39c6246ac46636434feb8 \
+        && "$PIN_SOURCE_TREE" == c172c6ce0963373c2b498916d74c42e5fa733797 \
+        && "$PIN_WINE_COMMIT" == c53678ab22a85f0fad3588dd34f0452a463bd015 \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == 2f2569df12710459603f9f8b1ba4d078d156aaf0 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-11 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == db09146eb92a83607657e98c2c00958c0740ecc8 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 16a91ff3b5bc37d419846ed4eefd435cef58914c ]] \
+      || fail "SE3-P6 requires its exact AAC parser build module after the MPEGVIDEO module"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    ;;
+  ge-proton11-11-se3-p7)
+    # SE3-P7: SE3-P1's 17 Wine patches + 0025-0041, on
+    # GE-Proton11-11. Bind every pin field; GE11-9 candidates above stay immutable.
+    SELECTED_PROFILE=se3p7
+    selected_pin_sha256=94da5db661ffcf49493726e8c69d91c2b99b7ac5fb78fc5e16ccfd1e751803c3
+    selected_residual_digest=20ce449770cb2650b11127a855bb88e28eda48921f01eb6f73333955189df280
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-11-rtsp-se3-p7 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-11 \
+        && "$PIN_SOURCE_COMMIT" == c0c2ee35e6d4d3bff4d39c6246ac46636434feb8 \
+        && "$PIN_SOURCE_TREE" == c172c6ce0963373c2b498916d74c42e5fa733797 \
+        && "$PIN_WINE_COMMIT" == c53678ab22a85f0fad3588dd34f0452a463bd015 \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == 2f2569df12710459603f9f8b1ba4d078d156aaf0 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-11 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == db09146eb92a83607657e98c2c00958c0740ecc8 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 16a91ff3b5bc37d419846ed4eefd435cef58914c ]] \
+      || fail "SE3-P7 requires its exact AAC parser build module after the MPEGVIDEO module"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    ;;
+  ge-proton11-11-se3-p8)
+    # SE3-P8: SE3-P1's 17 Wine patches + 0025-0041 minus 0039, on
+    # GE-Proton11-11. Bind every pin field; GE11-9 candidates above stay immutable.
+    SELECTED_PROFILE=se3p8
+    selected_pin_sha256=3b34f2e0c5165bf27006af7c610815861810bc3c88f1dc3e28db605ac67b59c6
+    selected_residual_digest=f3a358edbf65b0bcf15087d76cdd0ae3ffa730aa54a37075c8d2fa935606da68
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-11-rtsp-se3-p8 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-11 \
+        && "$PIN_SOURCE_COMMIT" == c0c2ee35e6d4d3bff4d39c6246ac46636434feb8 \
+        && "$PIN_SOURCE_TREE" == c172c6ce0963373c2b498916d74c42e5fa733797 \
+        && "$PIN_WINE_COMMIT" == c53678ab22a85f0fad3588dd34f0452a463bd015 \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == 2f2569df12710459603f9f8b1ba4d078d156aaf0 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-11 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == db09146eb92a83607657e98c2c00958c0740ecc8 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 16a91ff3b5bc37d419846ed4eefd435cef58914c ]] \
+      || fail "SE3-P8 requires its exact AAC parser build module after the MPEGVIDEO module"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    ;;
+  ge-proton11-11-se3-p9)
+    # SE3-P9: SE3-P1's 17 Wine patches + 0025-0042 minus 0039, on
+    # GE-Proton11-11. Bind every pin field; GE11-9 candidates above stay immutable.
+    SELECTED_PROFILE=se3p9
+    selected_pin_sha256=2540d8776ac28696ca9e86949c01e0fd9ea53301b8bd7949f41f6592bd8bc433
+    selected_residual_digest=d845d1cb7e28109a48225b563ba34286b47ea7bf0e9a605fadbe8e1ec552789c
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-11-rtsp-se3-p9 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-11 \
+        && "$PIN_SOURCE_COMMIT" == c0c2ee35e6d4d3bff4d39c6246ac46636434feb8 \
+        && "$PIN_SOURCE_TREE" == c172c6ce0963373c2b498916d74c42e5fa733797 \
+        && "$PIN_WINE_COMMIT" == c53678ab22a85f0fad3588dd34f0452a463bd015 \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == 2f2569df12710459603f9f8b1ba4d078d156aaf0 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-11 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == db09146eb92a83607657e98c2c00958c0740ecc8 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 16a91ff3b5bc37d419846ed4eefd435cef58914c ]] \
+      || fail "SE3-P9 requires its exact AAC parser build module after the MPEGVIDEO module"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    ;;
+  ge-proton11-11-se3)
+    # SE3 release: SE3-P9's content (34 Wine patches) under the release identity, on
+    # GE-Proton11-11. Bind every pin field; GE11-9 candidates above stay immutable.
+    SELECTED_PROFILE=se3
+    selected_pin_sha256=daf5ad072a39e7c65a076963740fbe512c3bda2e8dcc753c4d3f9ea42681add5
+    selected_residual_digest=ca987d562522c0da79f68b9720e9efee9cb6d0ae46de569a7820028e0603ec4b
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-11-rtsp-se3 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-11 \
+        && "$PIN_SOURCE_COMMIT" == c0c2ee35e6d4d3bff4d39c6246ac46636434feb8 \
+        && "$PIN_SOURCE_TREE" == c172c6ce0963373c2b498916d74c42e5fa733797 \
+        && "$PIN_WINE_COMMIT" == c53678ab22a85f0fad3588dd34f0452a463bd015 \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == 2f2569df12710459603f9f8b1ba4d078d156aaf0 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-11 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == db09146eb92a83607657e98c2c00958c0740ecc8 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 16a91ff3b5bc37d419846ed4eefd435cef58914c ]] \
+      || fail "SE3 requires its exact AAC parser build module after the MPEGVIDEO module"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    ;;
   *)
     fail "verify-preparation does not recognize selected pin $PIN_ID"
     ;;
@@ -553,7 +873,7 @@ fi
   || fail "selected game-test series must remain PACKAGE_RELEASE=0"
 expected_default_jobs=16
 expected_default_make_jobs=8
-if [[ "$PIN_ID" == ge-proton11-7-se2-p16 || "$PIN_ID" == ge-proton11-7-se2-p17 || "$PIN_ID" == ge-proton11-7-se2-p18 || "$PIN_ID" == ge-proton11-7-se2-p19a || "$PIN_ID" == ge-proton11-7-se2-p19b || "$PIN_ID" == ge-proton11-7-se2-p19b2 || "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 ]]; then
+if [[ "$PIN_ID" == ge-proton11-7-se2-p16 || "$PIN_ID" == ge-proton11-7-se2-p17 || "$PIN_ID" == ge-proton11-7-se2-p18 || "$PIN_ID" == ge-proton11-7-se2-p19a || "$PIN_ID" == ge-proton11-7-se2-p19b || "$PIN_ID" == ge-proton11-7-se2-p19b2 || "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 || "$SELECTED_PROFILE" == se3p1 || "$SELECTED_PROFILE" == se3p2 || "$SELECTED_PROFILE" == se3p3 || "$SELECTED_PROFILE" == se3p4 || "$SELECTED_PROFILE" == se3p5 || "$SELECTED_PROFILE" == se3p6 || "$SELECTED_PROFILE" == se3p7 || "$SELECTED_PROFILE" == se3p8 || "$SELECTED_PROFILE" == se3p9 || "$SELECTED_PROFILE" == se3 ]]; then
   expected_default_jobs=8
   expected_default_make_jobs=4
 fi
@@ -717,7 +1037,7 @@ expected_base_series=(
   experimental/0017-winedmo-propagate-terminal-network-read-errors.patch
   experimental/0018-winewayland-advertise-wine-vr-device-extensions.patch
 )
-if [[ "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 ]]; then
+if [[ "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 || "$SELECTED_PROFILE" == se3p1 || "$SELECTED_PROFILE" == se3p2 || "$SELECTED_PROFILE" == se3p3 || "$SELECTED_PROFILE" == se3p4 || "$SELECTED_PROFILE" == se3p5 || "$SELECTED_PROFILE" == se3p6 || "$SELECTED_PROFILE" == se3p7 || "$SELECTED_PROFILE" == se3p8 || "$SELECTED_PROFILE" == se3p9 || "$SELECTED_PROFILE" == se3 ]]; then
   # Digest covers every ordered residual path AND every patch byte; no count
   # or historical patch basename can stand in for this composition identity.
   [[ "$(pinned_ge_series_digest "$ROOT_DIR/patches" "$PATCH_SERIES")" \
@@ -1024,7 +1344,7 @@ python3 "$ROOT_DIR/tests/wine-header-compile/test_fresh_setup.py" >/dev/null
 python3 "$ROOT_DIR/tests/avpro-audio-state/test_model.py" >/dev/null
 python3 "$ROOT_DIR/tests/media-engine-pause-scrub/test_model.py" >/dev/null
 python3 "$ROOT_DIR/tests/source-replacement-lifecycle/test_model.py" --series "$PATCH_SERIES" >/dev/null
-if [[ ( "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 ) && -n "${PREPARED_SOURCE:-}" ]]; then
+if [[ ( "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 || "$SELECTED_PROFILE" == se3p1 || "$SELECTED_PROFILE" == se3p2 || "$SELECTED_PROFILE" == se3p3 || "$SELECTED_PROFILE" == se3p4 || "$SELECTED_PROFILE" == se3p5 || "$SELECTED_PROFILE" == se3p6 || "$SELECTED_PROFILE" == se3p7 || "$SELECTED_PROFILE" == se3p8 || "$SELECTED_PROFILE" == se3p9 || "$SELECTED_PROFILE" == se3 ) && -n "${PREPARED_SOURCE:-}" ]]; then
   # The consolidated series retains the source contracts, not the old patch
   # filenames. Audit their actual postimages; no runtime oracle is changed.
   bash "$ROOT_DIR/scripts/audit-patched-wine.sh" \

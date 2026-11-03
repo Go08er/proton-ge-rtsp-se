@@ -1,0 +1,20 @@
+Subject: [P20 review] winewayland retain vr device extensions
+
+Residual against GE-Proton11-9 after ge-video-rework.
+Source-reviewed only: not compiler or runtime qualification.
+Prior P19b2 patch ownership (some behavior is now upstream):
+  ge-proton11-6/0018-winewayland-advertise-wine-vr-device-extensions.patch
+
+---
+diff --git a/dlls/winewayland.drv/vulkan.c b/dlls/winewayland.drv/vulkan.c
+--- a/dlls/winewayland.drv/vulkan.c
++++ b/dlls/winewayland.drv/vulkan.c
+@@ -158,6 +158,8 @@
+     if (extensions->has_VK_KHR_external_semaphore_fd) extensions->has_VK_KHR_external_semaphore_win32 = 1;
+     if (extensions->has_VK_KHR_external_fence_win32) extensions->has_VK_KHR_external_fence_fd = 1;
+     if (extensions->has_VK_KHR_external_fence_fd) extensions->has_VK_KHR_external_fence_win32 = 1;
++    extensions->has_VK_WINE_openvr_device_extensions = 1;
++    extensions->has_VK_WINE_openxr_device_extensions = 1;
+ }
+ 
+ static VkColorSpaceKHR wayland_vulkan_map_colorspace(VkColorSpaceKHR colorspace, struct client_surface *client)
