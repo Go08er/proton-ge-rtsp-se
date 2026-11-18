@@ -1,0 +1,27 @@
+Subject: [SE3-P9] winedmo: ignore empty input samples
+
+An empty input sample left the transform's AVPacket empty, and FFmpeg takes
+an empty packet as the end of the stream. In VRChat, AVPro's audio effect
+answers DRAIN with one empty sample. The resampler after it then returned
+MF_E_END_OF_STREAM instead of asking for more input, the session stopped
+pulling that branch, and the audio renderer never got its end marker: every
+video stopped at its end while the audio ran dry.
+
+An empty sample carries no data, so accept it and send nothing. Draining has
+its own request, so no caller relies on an empty push.
+
+---
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -1088,6 +1088,10 @@
+         return STATUS_SUCCESS;
+     }
+ 
++    /* An empty sample carries no data, and an empty AVPacket would tell FFmpeg
++     * that the stream ended. Draining has its own request (transform_drain). */
++    if (!params->size) return STATUS_SUCCESS;
++
+     if (t->drain_requested || t->draining) return STATUS_DEVICE_BUSY;
+ 
+     if (!t->is_audio)

@@ -36,10 +36,62 @@ def function_body(text: str, start: str, end: str) -> str:
     return text[begin:finish]
 
 
+def check_se4_callback(callback: str, media: str) -> None:
+    """SE4-P1: the scheme callback creates the source directly, once, and returns its failure."""
+    if callback.count("media_source_create(context") != 1:
+        raise SystemExit("FAIL: SE4 scheme callback must create the media source directly exactly once")
+    for gone in ("STATUS_BAD_NETWORK_PATH", "cache_http_url", "URLOpenBlockingStreamW", "urlmon",
+                 "media-route=urlmon-cache-fallback", "get_http_bytestream_url_hint", "is_http_hls_url"):
+        if gone in callback:
+            raise SystemExit(f"FAIL: SE4 scheme callback still contains the URLMon fallback marker {gone!r}")
+    require_order(
+        callback,
+        ["if (FAILED(hr = media_source_create(context, (IMFMediaSource **)&object)))",
+         "IMFAsyncResult_SetStatus(context->result, hr);", "MFInvokeCallback(context->result);"],
+        "SE4 scheme callback does not hand the create failure to the caller",
+    )
+    # hr is only ever assigned inside FAILED(...) checks, so a failure is never replaced by success.
+    if callback.count("hr =") != callback.count("FAILED(hr ="):
+        raise SystemExit("FAIL: SE4 scheme callback reassigns hr outside a FAILED() check")
+    for gone in ("cache_http_url", "URLOpenBlockingStreamW", "urlmon", "media-route=urlmon-cache-fallback"):
+        if gone in media:
+            raise SystemExit(f"FAIL: SE4 media_source.c still contains {gone!r}")
+
+
+def check_se4_demuxer(demuxer: str) -> None:
+    """SE4-P1: GE's single protocol list, verified TLS, top-level reconnect, no fallback or io_open hook."""
+    ge_list = "http,https,tls,rtp,tcp,udp,crypto,httpproxy,data"
+    defines = re.findall(r'^#define HTTP_PROTOCOL_WHITELIST .*$', demuxer, re.M)
+    if defines != [f'#define HTTP_PROTOCOL_WHITELIST "{ge_list}"']:
+        raise SystemExit("FAIL: SE4 requires exactly GE's one HTTP_PROTOCOL_WHITELIST define")
+    if "file" in ge_list.split(","):
+        raise SystemExit("FAIL: SE4 protocol list contains file")
+    for old in ("HTTPS_PROTOCOL_WHITELIST", "HTTP_HLS_PROTOCOL_WHITELIST", "HTTPS_HLS_PROTOCOL_WHITELIST",
+                "hls_protocol_whitelist", "http_protocol_whitelist"):
+        if old in demuxer:
+            raise SystemExit(f"FAIL: SE4 source still has the old protocol-list element {old!r}")
+    lines = [l for l in demuxer.splitlines() if '"protocol_whitelist"' in l]
+    if not lines or any(l.strip() != 'if (av_dict_set( &options, "protocol_whitelist", HTTP_PROTOCOL_WHITELIST, 0 ) < 0) goto failed;'
+                        for l in lines):
+        raise SystemExit("FAIL: every SE4 protocol_whitelist option must use HTTP_PROTOCOL_WHITELIST")
+    if demuxer.count('av_dict_set_int( &options, "tls_verify", 1, 0 )') != 2:
+        raise SystemExit("FAIL: SE4 must set tls_verify 1 for HTTP(S) and for RTSPS only")
+    if not re.search(r'DIRECT_NETWORK_RTSPS_TCP &&\s*av_dict_set_int\( &options, "tls_verify", 1, 0 \) < 0', demuxer):
+        raise SystemExit("FAIL: RTSPS no longer sets tls_verify 1")
+    for gone in ("http_open_allows_urlmon_fallback", "STATUS_BAD_NETWORK_PATH", "demuxer_io_open", "seg_max_retry",
+                 "urlmon", "io_open"):
+        if gone in demuxer:
+            raise SystemExit(f"FAIL: SE4 demuxer still contains {gone!r}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--wine-tree", required=True, type=Path)
+    parser.add_argument("--se4-network-contract", action="store_true",
+                        help="SE4-P1: GE's protocol list for every HTTP(S)/HLS open, direct create, "
+                             "no URLMon fallback, no nested-request io_open hook")
     args = parser.parse_args()
+    se4 = args.se4_network_contract
 
     media_path = args.wine_tree / "dlls/winedmo/media_source.c"
     demuxer_path = args.wine_tree / "dlls/winedmo/unix_demuxer.c"
@@ -60,31 +112,34 @@ def main() -> None:
         "static HRESULT WINAPI scheme_handler_callback_Invoke",
         "static const IMFAsyncCallbackVtbl scheme_handler_callback_vtbl",
     )
-    require_order(
-        callback,
-        [
-            "media_source_create(context",
-            "hr == HRESULT_FROM_NT(STATUS_BAD_NETWORK_PATH)",
-            "cache_http_url(context)",
-            "get_http_bytestream_url_hint(url)",
-            "media_source_create(context",
-            "context->url = url",
-        ],
-        "direct-first/fallback-once routing changed",
-    )
-    require(callback, "!is_http_hls_url(context->url)", "HLS is not excluded from URLMon fallback")
-    require(callback, 'WARN("media-route=urlmon-cache-fallback reason=direct-open-failure',
-            "fallback begin marker is absent or may expose a URL")
-    require(callback, 'TRACE("media-route=urlmon-cache-fallback-opened',
-            "fallback ready marker is absent or may expose a URL")
-    if callback.find("URLOpenBlockingStreamW") >= 0:
-        raise SystemExit("FAIL: scheme callback downloads before selecting the fallback")
+    if se4:
+        check_se4_callback(callback, media)
+    else:
+        require_order(
+            callback,
+            [
+                "media_source_create(context",
+                "hr == HRESULT_FROM_NT(STATUS_BAD_NETWORK_PATH)",
+                "cache_http_url(context)",
+                "get_http_bytestream_url_hint(url)",
+                "media_source_create(context",
+                "context->url = url",
+            ],
+            "direct-first/fallback-once routing changed",
+        )
+        require(callback, "!is_http_hls_url(context->url)", "HLS is not excluded from URLMon fallback")
+        require(callback, 'WARN("media-route=urlmon-cache-fallback reason=direct-open-failure',
+                "fallback begin marker is absent or may expose a URL")
+        require(callback, 'TRACE("media-route=urlmon-cache-fallback-opened',
+                "fallback ready marker is absent or may expose a URL")
+        if callback.find("URLOpenBlockingStreamW") >= 0:
+            raise SystemExit("FAIL: scheme callback downloads before selecting the fallback")
 
-    cache = function_body(media, "static HRESULT cache_http_url", "static HRESULT WINAPI scheme_handler_callback_Invoke")
-    if cache.count("URLOpenBlockingStreamW") != 1:
-        raise SystemExit("FAIL: fallback must perform exactly one URLMon open")
-    require(cache, "context->file_size = -1", "fallback leaves a stale direct-stream length")
-    require(cache, "MFBYTESTREAM_IS_SEEKABLE", "fallback does not re-read cached-stream capabilities")
+        cache = function_body(media, "static HRESULT cache_http_url", "static HRESULT WINAPI scheme_handler_callback_Invoke")
+        if cache.count("URLOpenBlockingStreamW") != 1:
+            raise SystemExit("FAIL: fallback must perform exactly one URLMon open")
+        require(cache, "context->file_size = -1", "fallback leaves a stale direct-stream length")
+        require(cache, "MFBYTESTREAM_IS_SEEKABLE", "fallback does not re-read cached-stream capabilities")
 
     require_order(
         demuxer,
@@ -96,63 +151,68 @@ def main() -> None:
         ]),
         "direct HTTP/HLS route or explicit HLS hint changed",
     )
-    if not combined_http:
-        require(demuxer, '#define HTTP_PROTOCOL_WHITELIST "http,https,httpproxy,tcp,tls"',
-                "HTTP protocol allowlist broadened or removed")
-        require(demuxer, '#define HTTPS_PROTOCOL_WHITELIST "https,httpproxy,tcp,tls"',
-                "HTTPS downgrade protection is absent or broadened")
-    require(demuxer, '#define HTTP_HLS_PROTOCOL_WHITELIST "http,https,httpproxy,tcp,tls,crypto"',
-            "HTTP-root HLS AES wrapper or protocol boundary changed")
-    require(demuxer, '#define HTTPS_HLS_PROTOCOL_WHITELIST "https,httpproxy,tcp,tls,crypto"',
-            "HTTPS-root HLS AES wrapper or downgrade protection changed")
-    if not combined_http:
-        whitelist_selector = function_body(
+    if se4:
+        check_se4_demuxer(demuxer)
+    else:
+        if not combined_http:
+            require(demuxer, '#define HTTP_PROTOCOL_WHITELIST "http,https,httpproxy,tcp,tls"',
+                    "HTTP protocol allowlist broadened or removed")
+            require(demuxer, '#define HTTPS_PROTOCOL_WHITELIST "https,httpproxy,tcp,tls"',
+                    "HTTPS downgrade protection is absent or broadened")
+        require(demuxer, '#define HTTP_HLS_PROTOCOL_WHITELIST "http,https,httpproxy,tcp,tls,crypto"',
+                "HTTP-root HLS AES wrapper or protocol boundary changed")
+        require(demuxer, '#define HTTPS_HLS_PROTOCOL_WHITELIST "https,httpproxy,tcp,tls,crypto"',
+                "HTTPS-root HLS AES wrapper or downgrade protection changed")
+        if not combined_http:
+            whitelist_selector = function_body(
+                demuxer,
+                "static const char *http_protocol_whitelist",
+                "static const char *hls_protocol_whitelist",
+            )
+            require_order(
+                whitelist_selector,
+                [
+                    '!strncasecmp( url, "https://", 8 )',
+                    "? HTTPS_PROTOCOL_WHITELIST : HTTP_PROTOCOL_WHITELIST",
+                ],
+                "generic HTTP scheme-specific protocol selection changed",
+            )
+        hls_whitelist_selector = function_body(
             demuxer,
-            "static const char *http_protocol_whitelist",
             "static const char *hls_protocol_whitelist",
+            "static BOOL http_open_allows_urlmon_fallback",
         )
         require_order(
-            whitelist_selector,
+            hls_whitelist_selector,
             [
                 '!strncasecmp( url, "https://", 8 )',
-                "? HTTPS_PROTOCOL_WHITELIST : HTTP_PROTOCOL_WHITELIST",
+                "? HTTPS_HLS_PROTOCOL_WHITELIST : HTTP_HLS_PROTOCOL_WHITELIST",
             ],
-            "generic HTTP scheme-specific protocol selection changed",
+            "HLS root scheme no longer constrains its AES wrapper and nested URL",
         )
-    hls_whitelist_selector = function_body(
-        demuxer,
-        "static const char *hls_protocol_whitelist",
-        "static BOOL http_open_allows_urlmon_fallback",
-    )
-    require_order(
-        hls_whitelist_selector,
-        [
-            '!strncasecmp( url, "https://", 8 )',
-            "? HTTPS_HLS_PROTOCOL_WHITELIST : HTTP_HLS_PROTOCOL_WHITELIST",
-        ],
-        "HLS root scheme no longer constrains its AES wrapper and nested URL",
-    )
-    fallback_gate = function_body(
-        demuxer,
-        "static BOOL http_open_allows_urlmon_fallback",
-        "static BOOL is_http_hls_url",
-    )
-    require_order(
-        fallback_gate,
-        [
-            '!strncasecmp( url, "http://", 7 )',
-            "ret == AVERROR_INVALIDDATA",
-        ],
-        "URLMon fallback is not restricted to plain-HTTP media validation",
-    )
-    if '"https://' in fallback_gate:
-        raise SystemExit("FAIL: HTTPS can enter the URLMon compatibility fallback")
-    if demuxer.count("STATUS_BAD_NETWORK_PATH") != 1:
-        raise SystemExit("FAIL: direct-open fallback status must have one narrow producer")
+        fallback_gate = function_body(
+            demuxer,
+            "static BOOL http_open_allows_urlmon_fallback",
+            "static BOOL is_http_hls_url",
+        )
+        require_order(
+            fallback_gate,
+            [
+                '!strncasecmp( url, "http://", 7 )',
+                "ret == AVERROR_INVALIDDATA",
+            ],
+            "URLMon fallback is not restricted to plain-HTTP media validation",
+        )
+        if '"https://' in fallback_gate:
+            raise SystemExit("FAIL: HTTPS can enter the URLMon compatibility fallback")
+        if demuxer.count("STATUS_BAD_NETWORK_PATH") != 1:
+            raise SystemExit("FAIL: direct-open fallback status must have one narrow producer")
     require(demuxer, "*cursor != '?' && *cursor != '#'", "HLS classifier still scans query or fragment")
-    require(media, "*cursor != '?' && *cursor != '#'", "Windows HLS classifier still scans query or fragment")
+    if not se4:  # the Windows-side classifier left media_source.c with the URLMon fallback
+        require(media, "*cursor != '?' && *cursor != '#'", "Windows HLS classifier still scans query or fragment")
     require(demuxer, "while (*cursor && *cursor != '/'", "Unix HLS classifier still scans the URL authority")
-    require(media, "while (*cursor && *cursor != '/'", "Windows HLS classifier still scans the URL authority")
+    if not se4:
+        require(media, "while (*cursor && *cursor != '/'", "Windows HLS classifier still scans the URL authority")
     http_branch = function_body(
         demuxer,
         ("\n    if (is_http_url( params->url ))" if combined_http
@@ -172,27 +232,47 @@ def main() -> None:
         require(demuxer[demuxer.rfind("failed:"):], "free( direct_url );",
                 "failed HTTP open leaks its owned canonical URL")
         http_url = "direct_url"
-    require_order(
-        http_branch,
-        [
-            ("protocol_whitelist = hls_protocol_whitelist( params->url )" if combined_http
-             else "protocol_whitelist = http_protocol_whitelist( params->url )"),
-            'av_dict_set( &options, "protocol_whitelist", protocol_whitelist, 0 )',
-            'av_dict_set_int( &options, "tls_verify", 1, 0 )',
-            "demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback",
-            "demuxer_set_deadline( demuxer, HTTP_OPEN_TIMEOUT_US )",
-            (f"avformat_open_input( &demuxer->ctx, {http_url}, hint, &options )" if combined_http
-             else "avformat_open_input( &demuxer->ctx, params->url, NULL, &options )"),
-            "interrupted = demuxer_interrupt_callback( demuxer )",
-            ("if (!hls_hint && !interrupted && http_open_allows_urlmon_fallback( params->url, ret ))"
-             if combined_http else "if (!interrupted && http_open_allows_urlmon_fallback( params->url, ret ))"),
-            "failure_status = STATUS_BAD_NETWORK_PATH",
-            'TRACE( "media-route=direct-http-progressive-opened',
-            'av_dict_set( &options, "tls_verify", NULL, 0 )',
-            "if (av_dict_count( options ))",
-        ],
-        "direct HTTP open or its fallback signal changed",
-    )
+    if se4:
+        require_order(
+            http_branch,
+            [
+                'av_dict_set( &options, "protocol_whitelist", HTTP_PROTOCOL_WHITELIST, 0 )',
+                'av_dict_set_int( &options, "tls_verify", 1, 0 )',
+                "demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback",
+                "demuxer_set_deadline( demuxer, HTTP_OPEN_TIMEOUT_US )",
+                f"avformat_open_input( &demuxer->ctx, {http_url}, hint, &options )",
+                'TRACE( "media-route=direct-http-progressive-opened',
+                'av_dict_set( &options, "tls_verify", NULL, 0 )',
+                "if (av_dict_count( options ))",
+            ],
+            "direct HTTP open changed",
+        )
+        require(http_branch, "if (set_http_reconnect_options( &options, reconnect ) < 0) goto failed;",
+                "top-level HTTP reconnect options are absent")
+        if "failure_status" in http_branch and "STATUS_BAD_NETWORK_PATH" in http_branch:
+            raise SystemExit("FAIL: direct HTTP open still signals a URLMon fallback")
+    else:
+        require_order(
+            http_branch,
+            [
+                ("protocol_whitelist = hls_protocol_whitelist( params->url )" if combined_http
+                 else "protocol_whitelist = http_protocol_whitelist( params->url )"),
+                'av_dict_set( &options, "protocol_whitelist", protocol_whitelist, 0 )',
+                'av_dict_set_int( &options, "tls_verify", 1, 0 )',
+                "demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback",
+                "demuxer_set_deadline( demuxer, HTTP_OPEN_TIMEOUT_US )",
+                (f"avformat_open_input( &demuxer->ctx, {http_url}, hint, &options )" if combined_http
+                 else "avformat_open_input( &demuxer->ctx, params->url, NULL, &options )"),
+                "interrupted = demuxer_interrupt_callback( demuxer )",
+                ("if (!hls_hint && !interrupted && http_open_allows_urlmon_fallback( params->url, ret ))"
+                 if combined_http else "if (!interrupted && http_open_allows_urlmon_fallback( params->url, ret ))"),
+                "failure_status = STATUS_BAD_NETWORK_PATH",
+                'TRACE( "media-route=direct-http-progressive-opened',
+                'av_dict_set( &options, "tls_verify", NULL, 0 )',
+                "if (av_dict_count( options ))",
+            ],
+            "direct HTTP open or its fallback signal changed",
+        )
     require(http_branch, "demuxer->io_timeout = HTTP_IO_TIMEOUT_US", "HTTP read/seek/close timeout is absent")
     require(http_branch, "demuxer->require_avio_seek = TRUE", "direct HTTP does not fail closed on missing AVIO")
     require(http_branch, ('TRACE( "media-route=direct-http-probe' if combined_http
@@ -223,9 +303,12 @@ def main() -> None:
         demuxer, "if (is_http_hls_url( params->url ))", "else if (is_http_url( params->url ))")
     require_order(
         hls_branch,
-        [
+        ([
+            'av_dict_set( &options, "protocol_whitelist", HTTP_PROTOCOL_WHITELIST, 0 )',
+        ] if se4 else [
             "protocol_whitelist = hls_protocol_whitelist( params->url )",
             'av_dict_set( &options, "protocol_whitelist", protocol_whitelist, 0 )',
+        ]) + [
             'av_dict_set_int( &options, "tls_verify", 1, 0 )',
             "demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback",
             (f"avformat_open_input( &demuxer->ctx, {http_url}, hint, &options )" if combined_http
@@ -264,7 +347,8 @@ def main() -> None:
         if '"format_whitelist",' in http_branch:
             raise SystemExit("FAIL: HLS child whitelist restricts unrelated progressive root formats")
         opens = http_branch.count("avformat_open_input")
-        retry_guard = "if (ret == AVERROR_HTTP_FORBIDDEN && !interrupted)"
+        retry_guard = ("if (ret == AVERROR_HTTP_FORBIDDEN && !demuxer_interrupt_callback( demuxer ))" if se4
+                       else "if (ret == AVERROR_HTTP_FORBIDDEN && !interrupted)")
         if opens == 2 and retry_guard in http_branch:
             # GE11-9's single 403 retry (maintainer policy 2026-10-17): it must be
             # the only extra open and must share the original open deadline.

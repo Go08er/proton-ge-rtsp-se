@@ -165,6 +165,17 @@ if [[ -n "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" ]]; then
     "$PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256" "$PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB" >>"$audit_tmp"
 fi
 
+if [[ -n "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" ]]; then
+  http_chunkend_patch="$(pinned_ge_http_chunkend_patch)"
+  pinned_ge_git -C "$SOURCE_DIR/ffmpeg" apply --check --whitespace=error-all -- "$http_chunkend_patch"
+  pinned_ge_git -C "$SOURCE_DIR/ffmpeg" apply --whitespace=error-all -- "$http_chunkend_patch"
+  [[ "$(pinned_ge_git -C "$SOURCE_DIR/ffmpeg" hash-object --no-filters -- libavformat/http.c)" \
+      == "$PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB" ]] \
+    || pinned_ge_fail "HTTP chunked-end module postimage differs from the pin"
+  printf 'http_chunkend_patch_sha256\t%s\nhttp_chunkend_http_blob\t%s\n' \
+    "$PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256" "$PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB" >>"$audit_tmp"
+fi
+
 if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" ]]; then
   hls_early_seek_patch="$(pinned_ge_hls_early_seek_patch)"
   pinned_ge_git -C "$SOURCE_DIR/ffmpeg" apply --check --whitespace=error-all -- "$hls_early_seek_patch"
@@ -175,6 +186,17 @@ if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" ]]; then
   expected_touched_paths="$(printf '%s\nlibavformat/hls.c\n' "$expected_touched_paths" | LC_ALL=C sort -u)"
   printf 'hls_early_seek_patch_sha256\t%s\nhls_early_seek_hls_blob\t%s\n' \
     "$PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256" "$PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB" >>"$audit_tmp"
+fi
+
+if [[ -n "${PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256:-}" ]]; then
+  hls_init_config_patch="$(pinned_ge_hls_init_config_patch)"
+  pinned_ge_git -C "$SOURCE_DIR/ffmpeg" apply --check --whitespace=error-all -- "$hls_init_config_patch"
+  pinned_ge_git -C "$SOURCE_DIR/ffmpeg" apply --whitespace=error-all -- "$hls_init_config_patch"
+  [[ "$(pinned_ge_git -C "$SOURCE_DIR/ffmpeg" hash-object --no-filters -- libavformat/hls.c)" \
+      == "$PIN_FFMPEG_HLS_INIT_CONFIG_HLS_BLOB" ]] \
+    || pinned_ge_fail "HLS init-config companion postimage differs from the pin"
+  printf 'hls_init_config_patch_sha256\t%s\nhls_init_config_hls_blob\t%s\n' \
+    "$PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256" "$PIN_FFMPEG_HLS_INIT_CONFIG_HLS_BLOB" >>"$audit_tmp"
 fi
 
 pinned_ge_git -C "$SOURCE_DIR/ffmpeg" diff --check

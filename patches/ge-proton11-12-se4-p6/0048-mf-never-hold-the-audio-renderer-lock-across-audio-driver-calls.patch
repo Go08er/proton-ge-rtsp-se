@@ -1,0 +1,1077 @@
+Subject: [SE4-P6] mf: never hold the audio renderer lock across audio driver calls
+
+The audio renderer held its lock, renderer->cs, across calls into the audio
+driver: IAudioClient::Start, Stop and Reset when the presentation clock
+started, paused, stopped or restarted it and when the stream was flushed,
+IAudioClient::Initialize when the media type was set, and Stop, Reset and
+Release when the client was torn down. The presentation clock reads the
+audio position through the same lock on every video frame, so a per-frame
+query such as IMFMediaEngine::OnVideoStreamTick or GetCurrentTime waited
+behind a driver call. A driver call waits for the audio server, and when the
+server does not answer, for as long as it does not: the thread that
+displays the video stopped for the whole time, although the video itself
+was running.
+
+No thread holds renderer->cs across a call that changes the state of the
+audio client, or that creates, initialises or destroys it, any more. Such
+calls are made on a reference to the client with the lock dropped, and the
+renderer state is revalidated afterwards against a generation counter, which
+changes whenever the client is replaced or released; results for a client
+that is gone are dropped. The calls on the volume interfaces are made the
+same way. A shutdown during a driver call therefore never waits for it: it
+detaches the client and hands it, with the event the client signals, to a
+worker thread of the default thread pool, which stops and releases it and
+then closes the event, and the thread that is in the call holds its own
+reference.
+
+Clock state transitions (start, stop, pause, restart, flush) and the
+replacement of the audio client are serialised by a new lock, transition_cs,
+which is taken before renderer->cs and never by the clock read path. A
+transition sets the state it is going to before it drops renderer->cs. While
+a transition is in flight, clock reads return the time it freezes: the time
+reached so far for a pause or a flush, 0 for a stop. A start leaves the
+position unchanged until the client runs. The render callback does not touch
+the client while a transition is driving it, or while there is none, and
+keeps its wait armed and the queued samples. Reads never wait for the
+transition, and the clock states, the stream sink events, their order and
+the results reported to the callers are the same as before.
+
+The audio position and the buffer calls made by the render callback are
+quick queries that do not wait for the server; they stay under the lock.
+
+A driver call that takes 100 ms or more is reported with a warning, and one
+that takes a second or more with an error, naming the call, its duration,
+the result and the thread, at most once per second per renderer and
+severity, so that a stalled audio server shows in the log.
+
+While a start is blocked in the driver, the clock does not advance, so the
+video waits for the audio, as it did, but the thread that displays it is
+free.
+
+---
+diff --git a/dlls/mf/sar.c b/dlls/mf/sar.c
+--- a/dlls/mf/sar.c
++++ b/dlls/mf/sar.c
+@@ -40,6 +40,8 @@
+     SAR_ADDING_SILENCE = 0x20,
+     SAR_AUDIO_START_PENDING = 0x40,
+     SAR_END_OF_SEGMENT_RECEIVED = 0x80,
++    SAR_CLOCK_FROZEN = 0x100,
++    SAR_CLIENT_BUSY = 0x200,
+ };
+ 
+ enum queued_object_type
+@@ -67,6 +69,39 @@
+     } u;
+ };
+ 
++/* The renderer lock, renderer->cs, protects the renderer's own state only. The presentation clock reads the audio
++ * position under it on every video frame, and a call into the audio driver can wait for an unresponsive audio
++ * server, so no thread may hold renderer->cs across such a call.
++ *
++ * Calls that change the state of the audio client, or replace the client, are transitions. A transition takes
++ * renderer->transition_cs, then renderer->cs, and drops renderer->cs for its driver calls, which it makes on a
++ * reference to the client. The clock read path never takes transition_cs. Lock order is transition_cs, then cs.
++ *
++ * A transition sets the state it is going to, and SAR_CLIENT_BUSY, under renderer->cs before it drops it, and
++ * revalidates against client_generation after taking it again; the generation changes whenever the client is
++ * replaced or released, and results for a client that is gone are dropped. The render path uses the client only
++ * when no transition is driving it: while SAR_CLIENT_BUSY is set, or while there is no client, it leaves the
++ * client and the queued samples alone.
++ *
++ * A transition that moves the position (pause, stop, flush) freezes the time the clock read path returns for its
++ * duration: the time reached so far, or 0 for a stop. A start leaves the position unchanged until the client runs.
++ *
++ * The resources the client uses go with the client: a shutdown hands the client, and the event it signals, to a
++ * worker thread of the default thread pool, which pins this module. A worker stalled in the driver occupies one
++ * thread of that pool until the driver call returns.
++ *
++ * The rate limit on the diagnostics is not locked: a call that is logged twice in a second is harmless. A call that
++ * never returns logs nothing; the next transition waiting for transition_cs for it is reported by the lock wait of
++ * the system. */
++struct audio_objects
++{
++    IAudioClient *client;
++    IAudioRenderClient *render_client;
++    IAudioStreamVolume *stream_volume;
++    ISimpleAudioVolume *volume;
++    IAudioClock *clock;
++};
++
+ struct audio_renderer
+ {
+     IMFMediaSink IMFMediaSink_iface;
+@@ -106,6 +141,10 @@
+     struct list queue;
+     unsigned int flags;
+     CRITICAL_SECTION cs;
++    CRITICAL_SECTION transition_cs;
++    unsigned int client_generation;
++    LONGLONG frozen_time;
++    DWORD last_warn_tick, last_err_tick;
+ 
+     MFCLOCK_STATE clock_state;
+     DWORD sample_rate;
+@@ -243,7 +282,35 @@
+     return refcount;
+ }
+ 
+-static void audio_renderer_release_audio_client(struct audio_renderer *renderer)
++/* Warns about, at most once per second per renderer and severity, an audio driver call that took long. */
++static void audio_renderer_call_done(struct audio_renderer *renderer, const char *name, DWORD start, HRESULT hr)
++{
++    DWORD now = GetTickCount(), ms = now - start;
++
++    if (ms >= 1000)
++    {
++        if (!renderer || !renderer->last_err_tick || now - renderer->last_err_tick >= 1000)
++        {
++            if (renderer)
++                renderer->last_err_tick = now;
++            ERR("Audio driver call %s took %lu ms, hr %#lx, renderer %p, thread %04lx.\n", name, ms, hr, renderer,
++                    GetCurrentThreadId());
++        }
++    }
++    else if (ms >= 100)
++    {
++        if (!renderer || !renderer->last_warn_tick || now - renderer->last_warn_tick >= 1000)
++        {
++            if (renderer)
++                renderer->last_warn_tick = now;
++            WARN("Audio driver call %s took %lu ms, hr %#lx, renderer %p, thread %04lx.\n", name, ms, hr, renderer,
++                    GetCurrentThreadId());
++        }
++    }
++}
++
++/* Called with renderer->cs held. The objects are destroyed by the caller, without the lock. */
++static void audio_renderer_detach_audio_client(struct audio_renderer *renderer, struct audio_objects *old)
+ {
+     struct queued_object *obj, *obj2;
+ 
+@@ -254,34 +321,103 @@
+     }
+     renderer->queued_frames = 0;
+     renderer->buffer_ready_key = 0;
+-    if (renderer->audio_client)
+-    {
+-        IAudioClient_Stop(renderer->audio_client);
+-        IAudioClient_Reset(renderer->audio_client);
+-        IAudioClient_Release(renderer->audio_client);
+-    }
+-    renderer->position = 0;
+-    renderer->pts = 0;
++    old->client = renderer->audio_client;
++    old->render_client = renderer->audio_render_client;
++    old->stream_volume = renderer->stream_volume;
++    old->volume = renderer->audio_volume;
++    old->clock = renderer->audio_clock;
+     renderer->audio_client = NULL;
+-    if (renderer->audio_render_client)
+-        IAudioRenderClient_Release(renderer->audio_render_client);
+     renderer->audio_render_client = NULL;
+-    if (renderer->stream_volume)
+-        IAudioStreamVolume_Release(renderer->stream_volume);
+     renderer->stream_volume = NULL;
+-    if (renderer->audio_volume)
+-        ISimpleAudioVolume_Release(renderer->audio_volume);
+     renderer->audio_volume = NULL;
+-    if (renderer->audio_clock)
+-        IAudioClock_Release(renderer->audio_clock);
+     renderer->audio_clock = NULL;
+-    renderer->flags &= ~SAR_PREROLLED;
++    renderer->position = 0;
++    renderer->pts = 0;
++    renderer->flags &= ~(SAR_PREROLLED | SAR_CLOCK_FROZEN | SAR_ADDING_SILENCE);
++    ++renderer->client_generation;
++}
++
++/* Must be called without renderer->cs. The renderer may be NULL when it is not safe to use any more, then the calls
++ * are reported without rate limiting. */
++static void audio_renderer_destroy_audio_objects(struct audio_renderer *renderer, struct audio_objects *objects)
++{
++    HRESULT hr;
++    DWORD start;
++
++    if (objects->client)
++    {
++        start = GetTickCount();
++        hr = IAudioClient_Stop(objects->client);
++        audio_renderer_call_done(renderer, "Stop", start, hr);
++        start = GetTickCount();
++        hr = IAudioClient_Reset(objects->client);
++        audio_renderer_call_done(renderer, "Reset", start, hr);
++        start = GetTickCount();
++        IAudioClient_Release(objects->client);
++        audio_renderer_call_done(renderer, "Release", start, S_OK);
++    }
++    if (objects->render_client)
++        IAudioRenderClient_Release(objects->render_client);
++    if (objects->stream_volume)
++        IAudioStreamVolume_Release(objects->stream_volume);
++    if (objects->volume)
++        ISimpleAudioVolume_Release(objects->volume);
++    if (objects->clock)
++        IAudioClock_Release(objects->clock);
++    memset(objects, 0, sizeof(*objects));
++}
++
++struct audio_objects_work
++{
++    struct audio_objects objects;
++    HANDLE event;
++    HMODULE module;
++};
++
++static void CALLBACK audio_renderer_destroy_audio_objects_callback(TP_CALLBACK_INSTANCE *instance, void *context)
++{
++    struct audio_objects_work *work = context;
++
++    audio_renderer_destroy_audio_objects(NULL, &work->objects);
++    CloseHandle(work->event);
++    if (work->module)
++        FreeLibraryWhenCallbackReturns(instance, work->module);
++    free(work);
++}
++
++/* Shutdown does not wait for the audio driver: the audio client is stopped and released by a worker thread, which
++ * takes over the event the client signals. The worker does not use the renderer, which may be released by then. */
++static void audio_renderer_destroy_audio_objects_async(struct audio_renderer *renderer, struct audio_objects *objects,
++        HANDLE event)
++{
++    struct audio_objects_work *work;
++
++    if (objects->client && event && (work = malloc(sizeof(*work))))
++    {
++        work->objects = *objects;
++        work->event = event;
++        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (const WCHAR *)audio_renderer_destroy_audio_objects_callback,
++                &work->module))
++            work->module = NULL;
++        if (TrySubmitThreadpoolCallback(audio_renderer_destroy_audio_objects_callback, work, NULL))
++        {
++            memset(objects, 0, sizeof(*objects));
++            return;
++        }
++        if (work->module)
++            FreeLibrary(work->module);
++        free(work);
++    }
++    audio_renderer_destroy_audio_objects(renderer, objects);
++    if (event)
++        CloseHandle(event);
+ }
+ 
+ static ULONG WINAPI audio_renderer_sink_Release(IMFMediaSink *iface)
+ {
+     struct audio_renderer *renderer = impl_from_IMFMediaSink(iface);
+     ULONG refcount = InterlockedDecrement(&renderer->refcount);
++    struct audio_objects old;
+ 
+     TRACE("%p, refcount %lu.\n", iface, refcount);
+ 
+@@ -299,8 +435,11 @@
+             IMFMediaType_Release(renderer->media_type);
+         if (renderer->current_media_type)
+             IMFMediaType_Release(renderer->current_media_type);
+-        audio_renderer_release_audio_client(renderer);
+-        CloseHandle(renderer->buffer_ready_event);
++        audio_renderer_detach_audio_client(renderer, &old);
++        audio_renderer_destroy_audio_objects(renderer, &old);
++        if (renderer->buffer_ready_event)
++            CloseHandle(renderer->buffer_ready_event);
++        DeleteCriticalSection(&renderer->transition_cs);
+         DeleteCriticalSection(&renderer->cs);
+         free(renderer);
+     }
+@@ -477,6 +616,8 @@
+ static HRESULT WINAPI audio_renderer_sink_Shutdown(IMFMediaSink *iface)
+ {
+     struct audio_renderer *renderer = impl_from_IMFMediaSink(iface);
++    struct audio_objects old = {0};
++    HANDLE event = NULL;
+     HRESULT hr = S_OK;
+ 
+     TRACE("%p.\n", iface);
+@@ -491,10 +632,16 @@
+         IMFMediaEventQueue_Shutdown(renderer->event_queue);
+         IMFMediaEventQueue_Shutdown(renderer->stream_event_queue);
+         audio_renderer_set_presentation_clock(renderer, NULL);
+-        audio_renderer_release_audio_client(renderer);
++        audio_renderer_detach_audio_client(renderer, &old);
++        if (old.client)
++        {
++            event = renderer->buffer_ready_event;
++            renderer->buffer_ready_event = NULL;
++        }
+     }
+ 
+     LeaveCriticalSection(&renderer->cs);
++    audio_renderer_destroy_audio_objects_async(renderer, &old, event);
+ 
+     return hr;
+ }
+@@ -634,23 +781,74 @@
+     audio_renderer_events_QueueEvent,
+ };
+ 
++/* Called with renderer->cs and transition_cs held. Drops renderer->cs for the driver call. */
+ static HRESULT audio_renderer_start_audio_client(struct audio_renderer *renderer)
+ {
++    unsigned int generation = renderer->client_generation;
++    IAudioClient *client;
+     HRESULT hr = S_OK;
++    DWORD start;
+ 
+-    if (renderer->rate != 0.0f)
++    if (renderer->rate == 0.0f)
+     {
+-        if (FAILED(hr = IAudioClient_Start(renderer->audio_client)))
+-            renderer->flags |= SAR_AUDIO_START_PENDING;
+-        else
+-            renderer->flags &= ~SAR_AUDIO_START_PENDING;
++        renderer->flags &= ~SAR_AUDIO_START_PENDING;
++        return hr;
+     }
++
++    client = renderer->audio_client;
++    IAudioClient_AddRef(client);
++    renderer->flags |= SAR_CLIENT_BUSY;
++    LeaveCriticalSection(&renderer->cs);
++    start = GetTickCount();
++    hr = IAudioClient_Start(client);
++    audio_renderer_call_done(renderer, "Start", start, hr);
++    IAudioClient_Release(client);
++    EnterCriticalSection(&renderer->cs);
++    renderer->flags &= ~SAR_CLIENT_BUSY;
++
++    if (generation != renderer->client_generation)
++        return hr;
++    if (FAILED(hr))
++        renderer->flags |= SAR_AUDIO_START_PENDING;
+     else
+         renderer->flags &= ~SAR_AUDIO_START_PENDING;
+ 
+     return hr;
+ }
+ 
++/* Called with renderer->cs and transition_cs held. Drops renderer->cs for the driver calls. Reset is skipped if
++ * Stop failed. Returns FALSE if the audio client was replaced meanwhile, in which case the renderer state must not
++ * be updated from the results. */
++static BOOL audio_renderer_stop_reset(struct audio_renderer *renderer, BOOL stop, BOOL reset, HRESULT *stop_hr,
++        HRESULT *reset_hr)
++{
++    unsigned int generation = renderer->client_generation;
++    IAudioClient *client = renderer->audio_client;
++    DWORD start;
++
++    *stop_hr = *reset_hr = S_OK;
++    IAudioClient_AddRef(client);
++    renderer->flags |= SAR_CLIENT_BUSY;
++    LeaveCriticalSection(&renderer->cs);
++    if (stop)
++    {
++        start = GetTickCount();
++        *stop_hr = IAudioClient_Stop(client);
++        audio_renderer_call_done(renderer, "Stop", start, *stop_hr);
++    }
++    if (SUCCEEDED(*stop_hr) && reset)
++    {
++        start = GetTickCount();
++        *reset_hr = IAudioClient_Reset(client);
++        audio_renderer_call_done(renderer, "Reset", start, *reset_hr);
++    }
++    IAudioClient_Release(client);
++    EnterCriticalSection(&renderer->cs);
++    renderer->flags &= ~SAR_CLIENT_BUSY;
++
++    return generation == renderer->client_generation;
++}
++
+ static HRESULT WINAPI audio_renderer_clock_sink_QueryInterface(IMFClockStateSink *iface, REFIID riid, void **obj)
+ {
+     struct audio_renderer *renderer = impl_from_IMFClockStateSink(iface);
+@@ -676,6 +874,7 @@
+ 
+     TRACE("%p, %s, %s.\n", iface, debugstr_time(systime), debugstr_time(offset));
+ 
++    EnterCriticalSection(&renderer->transition_cs);
+     EnterCriticalSection(&renderer->cs);
+     if (renderer->audio_client)
+     {
+@@ -687,9 +886,9 @@
+         if (renderer->clock_state != MFCLOCK_STATE_RUNNING
+                 || (renderer->flags & SAR_AUDIO_START_PENDING))
+         {
++            renderer->clock_state = MFCLOCK_STATE_RUNNING;
+             if (FAILED(hr = audio_renderer_start_audio_client(renderer)))
+                 WARN("Failed to start audio client, hr %#lx.\n", hr);
+-            renderer->clock_state = MFCLOCK_STATE_RUNNING;
+         }
+     }
+     else
+@@ -701,6 +900,7 @@
+     if (SUCCEEDED(hr))
+         audio_renderer_preroll(renderer);
+     LeaveCriticalSection(&renderer->cs);
++    LeaveCriticalSection(&renderer->transition_cs);
+ 
+     return hr;
+ }
+@@ -708,30 +908,38 @@
+ static HRESULT WINAPI audio_renderer_clock_sink_OnClockStop(IMFClockStateSink *iface, MFTIME systime)
+ {
+     struct audio_renderer *renderer = impl_from_IMFClockStateSink(iface);
+-    HRESULT hr = S_OK;
++    HRESULT hr = S_OK, stop_hr, reset_hr;
+ 
+     TRACE("%p, %s.\n", iface, debugstr_time(systime));
+ 
++    EnterCriticalSection(&renderer->transition_cs);
+     EnterCriticalSection(&renderer->cs);
+     if (renderer->audio_client)
+     {
+         if (renderer->clock_state != MFCLOCK_STATE_STOPPED)
+         {
+-            if (SUCCEEDED(hr = IAudioClient_Stop(renderer->audio_client)))
++            renderer->clock_state = MFCLOCK_STATE_STOPPED;
++            renderer->flags &= ~SAR_PREROLLED;
++            renderer->flags |= SAR_CLOCK_FROZEN;
++            renderer->frozen_time = 0;
++            if (audio_renderer_stop_reset(renderer, TRUE, TRUE, &stop_hr, &reset_hr))
+             {
+-                renderer->flags &= ~SAR_AUDIO_START_PENDING;
+-                if (SUCCEEDED(hr = IAudioClient_Reset(renderer->audio_client)))
++                renderer->flags &= ~SAR_CLOCK_FROZEN;
++                if (SUCCEEDED(stop_hr))
+                 {
+-                    renderer->position = 0;
+-                    renderer->pts = 0;
++                    renderer->flags &= ~SAR_AUDIO_START_PENDING;
++                    if (SUCCEEDED(reset_hr))
++                    {
++                        renderer->position = 0;
++                        renderer->pts = 0;
++                    }
++                    else
++                        WARN("Failed to reset audio client, hr %#lx.\n", reset_hr);
+                 }
+                 else
+-                    WARN("Failed to reset audio client, hr %#lx.\n", hr);
++                    WARN("Failed to stop audio client, hr %#lx.\n", stop_hr);
+             }
+-            else
+-                WARN("Failed to stop audio client, hr %#lx.\n", hr);
+-            renderer->clock_state = MFCLOCK_STATE_STOPPED;
+-            renderer->flags &= ~SAR_PREROLLED;
++            hr = FAILED(stop_hr) ? stop_hr : reset_hr;
+         }
+     }
+     else
+@@ -739,32 +947,50 @@
+ 
+     IMFMediaEventQueue_QueueEventParamVar(renderer->stream_event_queue, MEStreamSinkStopped, &GUID_NULL, hr, NULL);
+     LeaveCriticalSection(&renderer->cs);
++    LeaveCriticalSection(&renderer->transition_cs);
+ 
+     return hr;
+ }
+ 
++static HRESULT audio_renderer_get_correlated_time(struct audio_renderer *renderer, LONGLONG *clock_time,
++        MFTIME *system_time);
++
++/* A client that could not be initialised completely has no clock, or no frequency, to read. */
++static BOOL audio_renderer_can_read_time(struct audio_renderer *renderer)
++{
++    return renderer->audio_clock && renderer->audio_clock_frequency;
++}
++
+ static HRESULT WINAPI audio_renderer_clock_sink_OnClockPause(IMFClockStateSink *iface, MFTIME systime)
+ {
+     struct audio_renderer *renderer = impl_from_IMFClockStateSink(iface);
+-    HRESULT hr;
++    HRESULT hr, reset_hr;
+ 
+     TRACE("%p, %s.\n", iface, debugstr_time(systime));
+ 
++    EnterCriticalSection(&renderer->transition_cs);
+     EnterCriticalSection(&renderer->cs);
+     if (renderer->clock_state == MFCLOCK_STATE_RUNNING)
+     {
+         if (renderer->audio_client)
+         {
+-            if (FAILED(hr = IAudioClient_Stop(renderer->audio_client)))
++            if (audio_renderer_can_read_time(renderer)
++                    && SUCCEEDED(audio_renderer_get_correlated_time(renderer, &renderer->frozen_time, NULL)))
++                renderer->flags |= SAR_CLOCK_FROZEN;
++            renderer->clock_state = MFCLOCK_STATE_PAUSED;
++            if (audio_renderer_stop_reset(renderer, TRUE, FALSE, &hr, &reset_hr))
+             {
+-                WARN("Failed to stop audio client, hr %#lx.\n", hr);
++                renderer->flags &= ~SAR_CLOCK_FROZEN;
++                if (FAILED(hr))
++                    WARN("Failed to stop audio client, hr %#lx.\n", hr);
++                else
++                {
++                    renderer->flags &= ~SAR_AUDIO_START_PENDING;
++                    hr = S_OK;
++                }
+             }
+-            else
+-            {
+-                renderer->flags &= ~SAR_AUDIO_START_PENDING;
++            else if (SUCCEEDED(hr))
+                 hr = S_OK;
+-            }
+-            renderer->clock_state = MFCLOCK_STATE_PAUSED;
+         }
+         else
+             hr = MF_E_NOT_INITIALIZED;
+@@ -774,6 +1000,7 @@
+     else
+         hr = MF_E_INVALID_STATE_TRANSITION;
+     LeaveCriticalSection(&renderer->cs);
++    LeaveCriticalSection(&renderer->transition_cs);
+ 
+     return hr;
+ }
+@@ -786,15 +1013,16 @@
+ 
+     TRACE("%p, %s.\n", iface, debugstr_time(systime));
+ 
++    EnterCriticalSection(&renderer->transition_cs);
+     EnterCriticalSection(&renderer->cs);
+     if (renderer->audio_client)
+     {
+         preroll = renderer->clock_state != MFCLOCK_STATE_RUNNING;
+         if (preroll || (renderer->flags & SAR_AUDIO_START_PENDING))
+         {
++            renderer->clock_state = MFCLOCK_STATE_RUNNING;
+             if (FAILED(hr = audio_renderer_start_audio_client(renderer)))
+                 WARN("Failed to start audio client, hr %#lx.\n", hr);
+-            renderer->clock_state = MFCLOCK_STATE_RUNNING;
+         }
+     }
+     else
+@@ -807,6 +1035,7 @@
+         audio_renderer_preroll(renderer);
+ 
+     LeaveCriticalSection(&renderer->cs);
++    LeaveCriticalSection(&renderer->transition_cs);
+ 
+     return hr;
+ }
+@@ -938,13 +1167,19 @@
+ {
+     struct audio_renderer *renderer = impl_from_IMFSimpleAudioVolume(iface);
+     HRESULT hr = S_OK;
++    ISimpleAudioVolume *volume;
+ 
+     TRACE("%p, %f.\n", iface, level);
+ 
+     EnterCriticalSection(&renderer->cs);
+-    if (renderer->audio_volume)
+-        hr = ISimpleAudioVolume_SetMasterVolume(renderer->audio_volume, level, NULL);
++    if ((volume = renderer->audio_volume))
++        ISimpleAudioVolume_AddRef(volume);
+     LeaveCriticalSection(&renderer->cs);
++    if (volume)
++    {
++        hr = ISimpleAudioVolume_SetMasterVolume(volume, level, NULL);
++        ISimpleAudioVolume_Release(volume);
++    }
+ 
+     return hr;
+ }
+@@ -953,6 +1188,7 @@
+ {
+     struct audio_renderer *renderer = impl_from_IMFSimpleAudioVolume(iface);
+     HRESULT hr = S_OK;
++    ISimpleAudioVolume *volume;
+ 
+     TRACE("%p, %p.\n", iface, level);
+ 
+@@ -962,9 +1198,14 @@
+     *level = 0.0f;
+ 
+     EnterCriticalSection(&renderer->cs);
+-    if (renderer->audio_volume)
+-        hr = ISimpleAudioVolume_GetMasterVolume(renderer->audio_volume, level);
++    if ((volume = renderer->audio_volume))
++        ISimpleAudioVolume_AddRef(volume);
+     LeaveCriticalSection(&renderer->cs);
++    if (volume)
++    {
++        hr = ISimpleAudioVolume_GetMasterVolume(volume, level);
++        ISimpleAudioVolume_Release(volume);
++    }
+ 
+     return hr;
+ }
+@@ -973,13 +1214,19 @@
+ {
+     struct audio_renderer *renderer = impl_from_IMFSimpleAudioVolume(iface);
+     HRESULT hr = S_OK;
++    ISimpleAudioVolume *volume;
+ 
+     TRACE("%p, %d.\n", iface, mute);
+ 
+     EnterCriticalSection(&renderer->cs);
+-    if (renderer->audio_volume)
+-        hr = ISimpleAudioVolume_SetMute(renderer->audio_volume, mute, NULL);
++    if ((volume = renderer->audio_volume))
++        ISimpleAudioVolume_AddRef(volume);
+     LeaveCriticalSection(&renderer->cs);
++    if (volume)
++    {
++        hr = ISimpleAudioVolume_SetMute(volume, mute, NULL);
++        ISimpleAudioVolume_Release(volume);
++    }
+ 
+     return hr;
+ }
+@@ -988,6 +1235,7 @@
+ {
+     struct audio_renderer *renderer = impl_from_IMFSimpleAudioVolume(iface);
+     HRESULT hr = S_OK;
++    ISimpleAudioVolume *volume;
+ 
+     TRACE("%p, %p.\n", iface, mute);
+ 
+@@ -997,9 +1245,14 @@
+     *mute = FALSE;
+ 
+     EnterCriticalSection(&renderer->cs);
+-    if (renderer->audio_volume)
+-        hr = ISimpleAudioVolume_GetMute(renderer->audio_volume, mute);
++    if ((volume = renderer->audio_volume))
++        ISimpleAudioVolume_AddRef(volume);
+     LeaveCriticalSection(&renderer->cs);
++    if (volume)
++    {
++        hr = ISimpleAudioVolume_GetMute(volume, mute);
++        ISimpleAudioVolume_Release(volume);
++    }
+ 
+     return hr;
+ }
+@@ -1048,6 +1301,7 @@
+ {
+     struct audio_renderer *renderer = impl_from_IMFAudioStreamVolume(iface);
+     HRESULT hr = S_OK;
++    IAudioStreamVolume *volume;
+ 
+     TRACE("%p, %p.\n", iface, count);
+ 
+@@ -1057,9 +1311,14 @@
+     *count = 0;
+ 
+     EnterCriticalSection(&renderer->cs);
+-    if (renderer->stream_volume)
+-        hr = IAudioStreamVolume_GetChannelCount(renderer->stream_volume, count);
++    if ((volume = renderer->stream_volume))
++        IAudioStreamVolume_AddRef(volume);
+     LeaveCriticalSection(&renderer->cs);
++    if (volume)
++    {
++        hr = IAudioStreamVolume_GetChannelCount(volume, count);
++        IAudioStreamVolume_Release(volume);
++    }
+ 
+     return hr;
+ }
+@@ -1068,13 +1327,19 @@
+ {
+     struct audio_renderer *renderer = impl_from_IMFAudioStreamVolume(iface);
+     HRESULT hr = S_OK;
++    IAudioStreamVolume *volume;
+ 
+     TRACE("%p, %u, %f.\n", iface, index, level);
+ 
+     EnterCriticalSection(&renderer->cs);
+-    if (renderer->stream_volume)
+-        hr = IAudioStreamVolume_SetChannelVolume(renderer->stream_volume, index, level);
++    if ((volume = renderer->stream_volume))
++        IAudioStreamVolume_AddRef(volume);
+     LeaveCriticalSection(&renderer->cs);
++    if (volume)
++    {
++        hr = IAudioStreamVolume_SetChannelVolume(volume, index, level);
++        IAudioStreamVolume_Release(volume);
++    }
+ 
+     return hr;
+ }
+@@ -1083,6 +1348,7 @@
+ {
+     struct audio_renderer *renderer = impl_from_IMFAudioStreamVolume(iface);
+     HRESULT hr = S_OK;
++    IAudioStreamVolume *volume;
+ 
+     TRACE("%p, %u, %p.\n", iface, index, level);
+ 
+@@ -1092,9 +1358,14 @@
+     *level = 0.0f;
+ 
+     EnterCriticalSection(&renderer->cs);
+-    if (renderer->stream_volume)
+-        hr = IAudioStreamVolume_GetChannelVolume(renderer->stream_volume, index, level);
++    if ((volume = renderer->stream_volume))
++        IAudioStreamVolume_AddRef(volume);
+     LeaveCriticalSection(&renderer->cs);
++    if (volume)
++    {
++        hr = IAudioStreamVolume_GetChannelVolume(volume, index, level);
++        IAudioStreamVolume_Release(volume);
++    }
+ 
+     return hr;
+ }
+@@ -1104,13 +1375,19 @@
+ {
+     struct audio_renderer *renderer = impl_from_IMFAudioStreamVolume(iface);
+     HRESULT hr = S_OK;
++    IAudioStreamVolume *volume;
+ 
+     TRACE("%p, %u, %p.\n", iface, count, volumes);
+ 
+     EnterCriticalSection(&renderer->cs);
+-    if (renderer->stream_volume)
+-        hr = IAudioStreamVolume_SetAllVolumes(renderer->stream_volume, count, volumes);
++    if ((volume = renderer->stream_volume))
++        IAudioStreamVolume_AddRef(volume);
+     LeaveCriticalSection(&renderer->cs);
++    if (volume)
++    {
++        hr = IAudioStreamVolume_SetAllVolumes(volume, count, volumes);
++        IAudioStreamVolume_Release(volume);
++    }
+ 
+     return hr;
+ }
+@@ -1119,6 +1396,7 @@
+ {
+     struct audio_renderer *renderer = impl_from_IMFAudioStreamVolume(iface);
+     HRESULT hr = S_OK;
++    IAudioStreamVolume *volume;
+ 
+     TRACE("%p, %u, %p.\n", iface, count, volumes);
+ 
+@@ -1129,9 +1407,14 @@
+         memset(volumes, 0, sizeof(*volumes) * count);
+ 
+     EnterCriticalSection(&renderer->cs);
+-    if (renderer->stream_volume)
+-        hr = IAudioStreamVolume_GetAllVolumes(renderer->stream_volume, count, volumes);
++    if ((volume = renderer->stream_volume))
++        IAudioStreamVolume_AddRef(volume);
+     LeaveCriticalSection(&renderer->cs);
++    if (volume)
++    {
++        hr = IAudioStreamVolume_GetAllVolumes(volume, count, volumes);
++        IAudioStreamVolume_Release(volume);
++    }
+ 
+     return hr;
+ }
+@@ -1265,8 +1548,21 @@
+     UINT64 position, counter;
+     LONGLONG time;
+     HRESULT hr;
++    DWORD start;
++
++    if (renderer->flags & SAR_CLOCK_FROZEN)
++    {
++        if (clock_time)
++            *clock_time = renderer->frozen_time;
++        if (system_time)
++            *system_time = MFGetSystemTime();
++        return S_OK;
++    }
+ 
+-    if (FAILED(hr = IAudioClock_GetPosition(renderer->audio_clock, &position, &counter)))
++    start = GetTickCount();
++    hr = IAudioClock_GetPosition(renderer->audio_clock, &position, &counter);
++    audio_renderer_call_done(renderer, "GetPosition", start, hr);
++    if (FAILED(hr))
+         return hr;
+ 
+     time = renderer->pts + (INT64)(position - renderer->position) * MFCLOCK_FREQUENCY_HNS / (INT64)renderer->audio_clock_frequency;
+@@ -1678,11 +1974,12 @@
+ {
+     struct audio_renderer *renderer = impl_from_IMFStreamSink(iface);
+     struct queued_object *obj, *obj2;
++    HRESULT hr = S_OK, restart_hr, stop_hr, reset_hr;
+     BOOL restart;
+-    HRESULT hr = S_OK, restart_hr;
+ 
+     TRACE("%p.\n", iface);
+ 
++    EnterCriticalSection(&renderer->transition_cs);
+     EnterCriticalSection(&renderer->cs);
+     if (renderer->flags & SAR_SHUT_DOWN)
+         hr = MF_E_STREAMSINK_REMOVED;
+@@ -1705,37 +2002,47 @@
+         if (renderer->audio_client)
+         {
+             restart = renderer->clock_state == MFCLOCK_STATE_RUNNING && renderer->rate != 0.0f;
+-            if (restart && FAILED(hr = IAudioClient_Stop(renderer->audio_client)))
++            if (audio_renderer_can_read_time(renderer)
++                    && SUCCEEDED(audio_renderer_get_correlated_time(renderer, &renderer->frozen_time, NULL)))
++                renderer->flags |= SAR_CLOCK_FROZEN;
++            if (audio_renderer_stop_reset(renderer, restart, TRUE, &stop_hr, &reset_hr))
+             {
+-                WARN("Failed to stop audio client for flush, hr %#lx.\n", hr);
+-            }
+-            else
+-            {
+-                if (restart)
+-                    renderer->flags |= SAR_AUDIO_START_PENDING;
+-
+-                if (SUCCEEDED(hr = IAudioClient_Reset(renderer->audio_client)))
++                renderer->flags &= ~SAR_CLOCK_FROZEN;
++                if (FAILED(hr = stop_hr))
+                 {
+-                    renderer->position = 0;
+-                    renderer->pts = 0;
++                    WARN("Failed to stop audio client for flush, hr %#lx.\n", hr);
+                 }
+                 else
+-                    WARN("Failed to reset audio client, hr %#lx.\n", hr);
+-
+-                if (restart)
+                 {
+-                    restart_hr = audio_renderer_start_audio_client(renderer);
+-                    if (FAILED(restart_hr))
++                    if (restart)
++                        renderer->flags |= SAR_AUDIO_START_PENDING;
++
++                    if (SUCCEEDED(hr = reset_hr))
+                     {
+-                        WARN("Failed to restart audio client after flush, hr %#lx.\n", restart_hr);
+-                        if (SUCCEEDED(hr))
+-                            hr = restart_hr;
++                        renderer->position = 0;
++                        renderer->pts = 0;
++                    }
++                    else
++                        WARN("Failed to reset audio client, hr %#lx.\n", hr);
++
++                    if (restart)
++                    {
++                        restart_hr = audio_renderer_start_audio_client(renderer);
++                        if (FAILED(restart_hr))
++                        {
++                            WARN("Failed to restart audio client after flush, hr %#lx.\n", restart_hr);
++                            if (SUCCEEDED(hr))
++                                hr = restart_hr;
++                        }
+                     }
+                 }
+             }
++            else
++                hr = FAILED(stop_hr) ? stop_hr : reset_hr;
+         }
+     }
+     LeaveCriticalSection(&renderer->cs);
++    LeaveCriticalSection(&renderer->transition_cs);
+ 
+     return hr;
+ }
+@@ -1854,17 +2161,15 @@
+     return S_OK;
+ }
+ 
+-static HRESULT audio_renderer_create_audio_client(struct audio_renderer *renderer)
++static HRESULT audio_renderer_init_audio_objects(struct audio_renderer *renderer, struct audio_objects *objects,
++        unsigned int *frame_size, DWORD *sample_rate, UINT64 *frequency, unsigned int *max_frames)
+ {
+-    IMFAsyncResult *result;
+     unsigned int flags;
+     WAVEFORMATEX *wfx;
+     HRESULT hr;
++    DWORD start;
+ 
+-    audio_renderer_release_audio_client(renderer);
+-
+-    hr = IMMDevice_Activate(renderer->device, &IID_IAudioClient, CLSCTX_INPROC_SERVER, NULL,
+-            (void **)&renderer->audio_client);
++    hr = IMMDevice_Activate(renderer->device, &IID_IAudioClient, CLSCTX_INPROC_SERVER, NULL, (void **)&objects->client);
+     if (FAILED(hr))
+     {
+         WARN("Failed to create audio client, hr %#lx.\n", hr);
+@@ -1872,22 +2177,24 @@
+     }
+ 
+     /* FIXME: for now always use default format. */
+-    if (FAILED(hr = IAudioClient_GetMixFormat(renderer->audio_client, &wfx)))
++    if (FAILED(hr = IAudioClient_GetMixFormat(objects->client, &wfx)))
+     {
+         WARN("Failed to get audio format, hr %#lx.\n", hr);
+         return hr;
+     }
+ 
+-    renderer->frame_size = wfx->wBitsPerSample * wfx->nChannels / 8;
+-    renderer->sample_rate = wfx->nSamplesPerSec;
++    *frame_size = wfx->wBitsPerSample * wfx->nChannels / 8;
++    *sample_rate = wfx->nSamplesPerSec;
+ 
+     flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+     if (renderer->stream_config.flags & MF_AUDIO_RENDERER_ATTRIBUTE_FLAGS_CROSSPROCESS)
+         flags |= AUDCLNT_STREAMFLAGS_CROSSPROCESS;
+     if (renderer->stream_config.flags & MF_AUDIO_RENDERER_ATTRIBUTE_FLAGS_NOPERSIST)
+         flags |= AUDCLNT_STREAMFLAGS_NOPERSIST;
+-    hr = IAudioClient_Initialize(renderer->audio_client, AUDCLNT_SHAREMODE_SHARED, flags, 1000000, 0, wfx,
++    start = GetTickCount();
++    hr = IAudioClient_Initialize(objects->client, AUDCLNT_SHAREMODE_SHARED, flags, 1000000, 0, wfx,
+             &renderer->stream_config.session_id);
++    audio_renderer_call_done(renderer, "Initialize", start, hr);
+     CoTaskMemFree(wfx);
+     if (FAILED(hr))
+     {
+@@ -1895,51 +2202,95 @@
+         return hr;
+     }
+ 
+-    if (FAILED(hr = IAudioClient_GetService(renderer->audio_client, &IID_IAudioStreamVolume,
+-            (void **)&renderer->stream_volume)))
++    if (FAILED(hr = IAudioClient_GetService(objects->client, &IID_IAudioStreamVolume,
++            (void **)&objects->stream_volume)))
+     {
+         WARN("Failed to get stream volume control, hr %#lx.\n", hr);
+         return hr;
+     }
+ 
+-    if (FAILED(hr = IAudioClient_GetService(renderer->audio_client, &IID_ISimpleAudioVolume, (void **)&renderer->audio_volume)))
++    if (FAILED(hr = IAudioClient_GetService(objects->client, &IID_ISimpleAudioVolume, (void **)&objects->volume)))
+     {
+         WARN("Failed to get audio volume control, hr %#lx.\n", hr);
+         return hr;
+     }
+ 
+-    if (FAILED(hr = IAudioClient_GetService(renderer->audio_client, &IID_IAudioRenderClient,
+-            (void **)&renderer->audio_render_client)))
++    if (FAILED(hr = IAudioClient_GetService(objects->client, &IID_IAudioRenderClient,
++            (void **)&objects->render_client)))
+     {
+         WARN("Failed to get audio render client, hr %#lx.\n", hr);
+         return hr;
+     }
+ 
+-    if (FAILED(hr = IAudioClient_GetService(renderer->audio_client, &IID_IAudioClock,
+-            (void **)&renderer->audio_clock)))
++    if (FAILED(hr = IAudioClient_GetService(objects->client, &IID_IAudioClock, (void **)&objects->clock)))
+     {
+         WARN("Failed to get audio clock, hr %#lx.\n", hr);
+         return hr;
+     }
+ 
+-    if (FAILED(hr = IAudioClock_GetFrequency(renderer->audio_clock, &renderer->audio_clock_frequency)))
++    if (FAILED(hr = IAudioClock_GetFrequency(objects->clock, frequency)))
+     {
+         WARN("Failed to get audio clock frequency, hr %#lx.\n", hr);
+         return hr;
+     }
+ 
+-    if (FAILED(hr = IAudioClient_SetEventHandle(renderer->audio_client, renderer->buffer_ready_event)))
++    if (FAILED(hr = IAudioClient_SetEventHandle(objects->client, renderer->buffer_ready_event)))
+     {
+         WARN("Failed to set event handle, hr %#lx.\n", hr);
+         return hr;
+     }
+ 
+-    if (FAILED(hr = IAudioClient_GetBufferSize(renderer->audio_client, &renderer->max_frames)))
++    if (FAILED(hr = IAudioClient_GetBufferSize(objects->client, max_frames)))
+     {
+         WARN("Failed to get buffer size, hr %#lx.\n", hr);
+         return hr;
+     }
+ 
++    return S_OK;
++}
++
++/* Called with renderer->transition_cs and renderer->cs held. The old audio client is released and the new one is
++ * created without renderer->cs. */
++static HRESULT audio_renderer_create_audio_client(struct audio_renderer *renderer)
++{
++    unsigned int frame_size = renderer->frame_size, max_frames = renderer->max_frames, generation;
++    UINT64 frequency = renderer->audio_clock_frequency;
++    DWORD sample_rate = renderer->sample_rate;
++    struct audio_objects old, new = {0};
++    IMFAsyncResult *result;
++    HRESULT hr;
++
++    audio_renderer_detach_audio_client(renderer, &old);
++    generation = renderer->client_generation;
++    renderer->flags |= SAR_CLIENT_BUSY;
++    LeaveCriticalSection(&renderer->cs);
++    audio_renderer_destroy_audio_objects(renderer, &old);
++    hr = audio_renderer_init_audio_objects(renderer, &new, &frame_size, &sample_rate, &frequency, &max_frames);
++    EnterCriticalSection(&renderer->cs);
++    renderer->flags &= ~SAR_CLIENT_BUSY;
++
++    if ((renderer->flags & SAR_SHUT_DOWN) || generation != renderer->client_generation)
++    {
++        LeaveCriticalSection(&renderer->cs);
++        audio_renderer_destroy_audio_objects(renderer, &new);
++        EnterCriticalSection(&renderer->cs);
++        return SUCCEEDED(hr) ? MF_E_OPERATION_CANCELLED : hr;
++    }
++
++    /* As before, a client that could not be initialised completely stays in place with what was created of it. */
++    renderer->audio_client = new.client;
++    renderer->audio_render_client = new.render_client;
++    renderer->stream_volume = new.stream_volume;
++    renderer->audio_volume = new.volume;
++    renderer->audio_clock = new.clock;
++    renderer->frame_size = frame_size;
++    renderer->sample_rate = sample_rate;
++    renderer->audio_clock_frequency = frequency;
++    renderer->max_frames = max_frames;
++    ++renderer->client_generation;
++    if (FAILED(hr))
++        return hr;
++
+     if (SUCCEEDED(hr = MFCreateAsyncResult(NULL, &renderer->render_callback, NULL, &result)))
+     {
+         if (FAILED(hr = MFPutWaitingWorkItem(renderer->buffer_ready_event, 0, result, &renderer->buffer_ready_key)))
+@@ -1962,6 +2313,7 @@
+     if (!media_type)
+         return E_POINTER;
+ 
++    EnterCriticalSection(&renderer->transition_cs);
+     EnterCriticalSection(&renderer->cs);
+     if (SUCCEEDED(hr = check_media_type(media_type, renderer->media_type)))
+     {
+@@ -1984,6 +2336,7 @@
+     else
+         hr = MF_E_INVALIDMEDIATYPE;
+     LeaveCriticalSection(&renderer->cs);
++    LeaveCriticalSection(&renderer->transition_cs);
+ 
+     return hr;
+ }
+@@ -2139,6 +2492,15 @@
+     LONGLONG pts;
+     HRESULT hr;
+ 
++    if (!renderer->audio_client || (renderer->flags & SAR_CLIENT_BUSY))
++    {
++        /* A transition is driving the client, or it is being replaced, whose creation arms the wait itself. */
++        if (renderer->audio_client && FAILED(hr = MFPutWaitingWorkItem(renderer->buffer_ready_event, 0, result,
++                &renderer->buffer_ready_key)))
++            WARN("Failed to submit wait item, hr %#lx.\n", hr);
++        return;
++    }
++
+     LIST_FOR_EACH_ENTRY_SAFE(obj, obj2, &renderer->queue, struct queued_object, entry)
+     {
+         if (obj->type == OBJECT_TYPE_MARKER)
+@@ -2269,6 +2631,7 @@
+     renderer->rate = 1.0f;
+     renderer->refcount = 1;
+     InitializeCriticalSection(&renderer->cs);
++    InitializeCriticalSection(&renderer->transition_cs);
+     renderer->buffer_ready_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+     list_init(&renderer->queue);
+ 

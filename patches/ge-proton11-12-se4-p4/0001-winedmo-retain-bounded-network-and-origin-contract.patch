@@ -1,0 +1,1302 @@
+Subject: [SE4-P1] winedmo retain bounded network and origin contract
+
+Residual against GE-Proton11-9 after ge-video-rework.
+Source-reviewed only: not compiler or runtime qualification.
+Prior P19b2 patch ownership (some behavior is now upstream):
+  ge-master-20260913-se2-p8/0032-winedmo-classify-http-media-after-probing.patch
+  ge-proton11-6-a320/0017-winedmo-propagate-terminal-network-read-errors.patch
+  ge-proton11-6-a322-r2/0025-winedmo-normalize-hls-vod-timeline.patch
+  ge-proton11-6-a322/0005-winedmo-stream-progressive-http-vod.patch
+  ge-proton11-6/0001-winedmo-open-rtsp-over-tcp.patch
+  ge-proton11-6/0002-winedmo-interrupt-network-demux-and-report-live-seekability.patch
+  ge-proton11-6/0003-winedmo-use-destroy-params-for-wow64-demuxer.patch
+  ge-proton11-6/0004-winedmo-async-http-and-repair-vod-seeking.patch
+  ge-proton11-6/0006-winedmo-recover-interrupted-vod-seeks.patch
+  ge-proton11-6/0020-quiet-ge-media-diagnostics.patch
+  ge-proton11-7-se2-p19a/0068-sr2-preserve-leading-mp4-audio.patch
+  ge-proton11-7-se2-p19b/0031-winedmo-open-secure-rtsp-tcp-aliases.patch
+  ge-proton11-7-se2-p19b/0039-mf-report-terminal-direct-filter-errors.patch
+  ge-proton11-7-se2-p19b/0061-winedmo-preserve-demuxed-video-timestamps-v2.patch
+  ge-proton11-7-se2-p19b/0071-mfreadwrite-map-source-origin-metadata.patch
+  ge-proton11-7-se2-p19b/0073-winedmo-use-one-network-open-budget.patch
+  ge-proton11-7-se2-p19b2/0079-wine-register-presentation-origin-header.patch
+  proposed/0028-winedmo-bound-published-stream-access.patch
+  proposed/0029-winedmo-latch-asf-startup-timestamp-decision.patch
+  proposed/0030-winedmo-check-filter-initialization-failures.patch
+  proposed/0038-winedmo-describe-filter-eof-failures.patch
+  proposed/0041-winedmo-allow-supported-hls-audio-containers.patch
+
+P21 changes only ordinary seek serialization and removes unreachable
+reusable-cancellation repair; Shutdown remains interruptible.
+Clean component postimages only; no test observer is included.
+
+SE4-P1: every HTTP and HLS open gets GE's protocol list instead of one
+chosen by the playlist's scheme, so an https playlist can load http segments
+as on GE and Windows; local files stay excluded. The URLMon fallback for a
+failed plain HTTP open is removed: the open's own error reaches the caller.
+
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -23,14 +23,31 @@
+ #include "config.h"
+ #include "unix_private.h"
+ 
++#include <errno.h>
++#include <strings.h>
++
+ #include "wine/debug.h"
+ 
+ #ifdef HAVE_FFMPEG
+ 
+ #include <libavutil/avstring.h>
++#include <libavutil/common.h>
++#include <libavutil/time.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
+ 
++#define RTSP_OPEN_TIMEOUT_US INT64_C(30000000)
++#define RTSP_IO_TIMEOUT_US   INT64_C(15000000)
++#define HLS_IO_TIMEOUT_US    INT64_C(30000000)
++#define HTTP_OPEN_TIMEOUT_US INT64_C(30000000)
++#define HTTP_IO_TIMEOUT_US   INT64_C(15000000)
++/* Match the Windows Media Foundation HTTP client identity used by Proton-RTSP. */
++#define HTTP_USER_AGENT "NSPlayer/12.00.19041.4894 WMFSDK/12.00.19041.4894"
++
++/* GE's protocol list for HTTP and HLS. It has no file protocol, so a remote
++ * playlist cannot open local files. */
++#define HTTP_PROTOCOL_WHITELIST "http,https,tls,rtp,tcp,udp,crypto,httpproxy,data"
++
+ static inline const char *debugstr_averr( int err )
+ {
+     return wine_dbg_sprintf( "%d (%s)", err, av_err2str(err) );
+@@ -55,13 +72,21 @@
+     AVFormatContext *ctx;
+     struct stream_context *stream_context;
+     struct stream *streams;
++    UINT stream_count; /* allocated filters and published Windows streams */
+     INT64 duration;
+-    INT64 timestamp_base;
++    INT64 hls_timestamp_base;
++    struct wine_mf_presentation_origin origin;
+     BOOL direct_url;
+     BOOL nonseekable;
++    BOOL require_avio_seek;
++    INT64 io_timeout;
++    int cancelled;
++    INT64 deadline;
+ 
+     AVPacket *last_packet; /* last read packet */
+     struct stream *last_stream; /* last read packet stream */
++    UINT input_eofs;
++    UINT empty_input_packets;
+ };
+ 
+ static struct demuxer *get_demuxer( struct winedmo_demuxer demuxer )
+@@ -69,6 +94,32 @@
+     return (struct demuxer *)(UINT_PTR)demuxer.handle;
+ }
+ 
++static int demuxer_interrupt_callback( void *opaque )
++{
++    struct demuxer *demuxer = opaque;
++    INT64 deadline;
++
++    if (__atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )) return 1;
++    deadline = __atomic_load_n( &demuxer->deadline, __ATOMIC_RELAXED );
++    return deadline && av_gettime_relative() >= deadline;
++}
++
++static void demuxer_set_deadline( struct demuxer *demuxer, INT64 timeout )
++{
++    INT64 deadline = timeout ? av_gettime_relative() + timeout : 0;
++    __atomic_store_n( &demuxer->deadline, deadline, __ATOMIC_RELAXED );
++}
++
++static BOOL demuxer_is_seekable( const struct demuxer *demuxer )
++{
++    if (demuxer->nonseekable || (demuxer->ctx->ctx_flags & AVFMTCTX_UNSEEKABLE)) return FALSE;
++    if (demuxer->require_avio_seek)
++        return demuxer->ctx->pb && (demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL);
++    if (!demuxer->direct_url && demuxer->ctx->pb
++            && !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)) return FALSE;
++    return TRUE;
++}
++
+ static INT64 get_user_time( INT64 time, AVRational time_base )
+ {
+     static const AVRational USER_TIME_BASE_Q = {1, 10000000};
+@@ -193,8 +244,8 @@
+          * not hold video for the first second or more of the clip. */
+         if (base != INT64_MIN)
+         {
+-            /* A small first timestamp also finalizes the base. Do not rebase
+-             * later when normal playback crosses the startup threshold. */
++            /* A normal first timestamp is also a decision. Do not rebase
++             * later samples just because playback crosses the threshold. */
+             stream->timestamp_base = base > 2000000 ? base : 0;
+             stream->timestamp_base_set = TRUE;
+         }
+@@ -204,20 +255,20 @@
+         return;
+ 
+     if (sample->pts != AV_NOPTS_VALUE)
+-        sample->pts = max( 0, sample->pts - stream->timestamp_base );
++        sample->pts = max( 0, av_sat_sub64( sample->pts, stream->timestamp_base ) );
+     if (sample->dts != AV_NOPTS_VALUE)
+-        sample->dts = max( 0, sample->dts - stream->timestamp_base );
++        sample->dts = max( 0, av_sat_sub64( sample->dts, stream->timestamp_base ) );
+ }
+ 
+-static void normalize_demuxer_timestamps( const struct demuxer *demuxer, struct sample *sample )
++static void normalize_hls_timestamps( const struct demuxer *demuxer, struct sample *sample )
+ {
+-    if (demuxer->timestamp_base == AV_NOPTS_VALUE)
++    if (demuxer->hls_timestamp_base == AV_NOPTS_VALUE)
+         return;
+ 
+     if (sample->pts != AV_NOPTS_VALUE)
+-        sample->pts = max( 0, sample->pts - demuxer->timestamp_base );
++        sample->pts = max( 0, av_sat_sub64( sample->pts, demuxer->hls_timestamp_base ) );
+     if (sample->dts != AV_NOPTS_VALUE)
+-        sample->dts = max( 0, sample->dts - demuxer->timestamp_base );
++        sample->dts = max( 0, av_sat_sub64( sample->dts, demuxer->hls_timestamp_base ) );
+ }
+ 
+ static void fixup_asf_mpeg4_timestamps( const AVFormatContext *ctx, AVStream *avstream,
+@@ -497,6 +548,7 @@
+     UINT32 state = 0xffffffff;
+     unsigned int i;
+ 
++    if (demuxer->direct_url) return STATUS_NOT_SUPPORTED;
+     if (!demuxer->ctx->iformat || strcmp( demuxer->ctx->iformat->name, "mpegvideo" ))
+         return STATUS_NOT_SUPPORTED;
+     if (!context || context->length == (UINT64)-1 || demuxer->duration <= 0)
+@@ -597,20 +649,21 @@
+ 
+ }
+ 
+-static INT64 get_context_duration( const AVFormatContext *ctx )
++static INT64 get_context_duration( const AVFormatContext *ctx, BOOL custom_io )
+ {
+     INT64 i, max_duration = AV_NOPTS_VALUE, max_video_duration = AV_NOPTS_VALUE;
+     INT64 duration;
+ 
+     if (ctx->duration_estimation_method == AVFMT_DURATION_FROM_BITRATE)
+     {
+-        /* MPEG audio without a Xing/VBRI header has no duration other than the
+-         * bitrate estimate. Do not turn a finite, seekable file into a stream
+-         * with no duration or stop position. */
++        /* Finite MPEG audio without Xing/VBRI has only a bitrate estimate.
++         * A known resource size and seekable IO distinguish it from live input. */
+         if (ctx->iformat && !strcmp( ctx->iformat->name, "mp3" ) && ctx->pb &&
+                 (ctx->pb->seekable & AVIO_SEEKABLE_NORMAL) && ctx->duration > 0 && avio_size( ctx->pb ) > 0)
+             return get_user_time( ctx->duration, AV_TIME_BASE_Q );
+ 
++        if (!custom_io) return AV_NOPTS_VALUE;
++
+         duration = get_asf_header_duration( (AVFormatContext *)ctx );
+         if (duration != AV_NOPTS_VALUE)
+             return duration;
+@@ -681,7 +734,7 @@
+ {
+     UINT i;
+ 
+-    for (i = 0; i < demuxer->ctx->nb_streams; i++)
++    for (i = 0; i < demuxer->stream_count; i++)
+     {
+         AVCodecParameters *par = demuxer->ctx->streams[i]->codecpar;
+         struct stream *stream = demuxer->streams + i;
+@@ -699,7 +752,7 @@
+             else
+             {
+                 if (av_bsf_alloc( filter, &stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+-                avcodec_parameters_copy( stream->filter->par_in, par );
++                if (avcodec_parameters_copy( stream->filter->par_in, par ) < 0) return STATUS_UNSUCCESSFUL;
+                 if (av_bsf_init( stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+                 continue;
+             }
+@@ -714,7 +767,7 @@
+             else
+             {
+                 if (av_bsf_alloc( filter, &stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+-                avcodec_parameters_copy( stream->filter->par_in, par );
++                if (avcodec_parameters_copy( stream->filter->par_in, par ) < 0) return STATUS_UNSUCCESSFUL;
+                 if (av_bsf_init( stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+                 continue;
+             }
+@@ -723,14 +776,14 @@
+         {
+             /* WAVEFORMATEX does not contain endianness info, so this needs to be converted here. */
+             if (av_bsf_alloc( &ff_pcm_byte_order_reverse_bsf.p, &stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+-            avcodec_parameters_copy( stream->filter->par_in, par );
++            if (avcodec_parameters_copy( stream->filter->par_in, par ) < 0) return STATUS_UNSUCCESSFUL;
+             if (av_bsf_init( stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+             continue;
+         }
+ 
+-        av_bsf_get_null_filter( &stream->filter );
+-        avcodec_parameters_copy( stream->filter->par_in, demuxer->ctx->streams[i]->codecpar );
+-        avcodec_parameters_copy( stream->filter->par_out, demuxer->ctx->streams[i]->codecpar );
++        if (av_bsf_get_null_filter( &stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
++        if (avcodec_parameters_copy( stream->filter->par_in, par ) < 0) return STATUS_UNSUCCESSFUL;
++        if (avcodec_parameters_copy( stream->filter->par_out, par ) < 0) return STATUS_UNSUCCESSFUL;
+     }
+ 
+     return STATUS_SUCCESS;
+@@ -808,33 +861,89 @@
+ 
+ static BOOL is_http_url( const char *url )
+ {
+-    return url && (av_stristart( url, "http://", NULL ) || av_stristart( url, "https://", NULL ));
++    return url && (!strncasecmp( url, "http://", 7 ) || !strncasecmp( url, "https://", 8 ));
+ }
+ 
+ static BOOL is_http_hls_url( const char *url )
+ {
++    const char *cursor;
++
+     if (!is_http_url( url )) return FALSE;
+-    return !!strstr( url, ".m3u8" ) || !!strstr( url, "/hls_playlist/" );
++
++    cursor = url + (!strncasecmp( url, "http://", 7 ) ? 7 : 8);
++    while (*cursor && *cursor != '/' && *cursor != '?' && *cursor != '#') cursor++;
++    if (*cursor != '/') return FALSE;
++
++    for (; *cursor && *cursor != '?' && *cursor != '#'; cursor++)
++        if (!strncasecmp( cursor, ".m3u8", 5 ) || !strncasecmp( cursor, "/hls_playlist/", 14 )) return TRUE;
++
++    return FALSE;
+ }
+ 
+-static BOOL is_http_progressive_url( const char *url )
++enum direct_network_url
+ {
+-    if (!is_http_url( url )) return FALSE;
++    DIRECT_NETWORK_NONE,
++    DIRECT_NETWORK_RTSP,
++    DIRECT_NETWORK_RTSP_TCP,
++    DIRECT_NETWORK_RTSP_UDP,
++    DIRECT_NETWORK_RTSPS_TCP,
++};
+ 
+-    return !!strstr( url, ".googlevideo.com/videoplayback" ) || !!strstr( url, ".mp4" );
++static enum direct_network_url get_rtsp_url_kind( const char *url )
++{
++    if (!url) return DIRECT_NETWORK_NONE;
++    if (!strncasecmp( url, "rtsp://", 7 )) return DIRECT_NETWORK_RTSP;
++    if (!strncasecmp( url, "rtspt://", 8 )) return DIRECT_NETWORK_RTSP_TCP;
++    if (!strncasecmp( url, "rtspu://", 8 )) return DIRECT_NETWORK_RTSP_UDP;
++    if (!strncasecmp( url, "rtsps://", 8 )) return DIRECT_NETWORK_RTSPS_TCP;
++    if (!strncasecmp( url, "rtspst://", 9 )) return DIRECT_NETWORK_RTSPS_TCP;
++    return DIRECT_NETWORK_NONE;
+ }
+ 
+-static BOOL is_rtsp_url( const char *url )
++static char *normalize_rtsp_url( const char *url, enum direct_network_url kind )
+ {
+-    return url && (av_stristart( url, "rtsp://", NULL ) || av_stristart( url, "rtspt://", NULL )
+-            || av_stristart( url, "rtspu://", NULL ));
++    const char *suffix, *scheme = "rtsp";
++    char *ret;
++    size_t len, scheme_len;
++
++    switch (kind)
++    {
++    case DIRECT_NETWORK_RTSP:
++        suffix = url + 4; /* Preserve everything beginning with the colon. */
++        break;
++    case DIRECT_NETWORK_RTSP_TCP:
++    case DIRECT_NETWORK_RTSP_UDP:
++        suffix = url + 5;
++        break;
++    case DIRECT_NETWORK_RTSPS_TCP:
++        scheme = "rtsps";
++        suffix = url + (!strncasecmp( url, "rtspst://", 9 ) ? 6 : 5);
++        break;
++    default:
++        return NULL;
++    }
++
++    scheme_len = strlen( scheme );
++    len = scheme_len + strlen( suffix ) + 1;
++    if (!(ret = malloc( len ))) return NULL;
++    memcpy( ret, scheme, scheme_len );
++    memcpy( ret + scheme_len, suffix, len - scheme_len );
++    return ret;
+ }
+ 
+ static void demuxer_free_context( struct demuxer *demuxer )
+ {
++    av_packet_free( &demuxer->last_packet );
++    demuxer->last_stream = NULL;
+     if (!demuxer->ctx) return;
+ 
+-    if (demuxer->direct_url) avformat_close_input( &demuxer->ctx );
++    if (demuxer->direct_url)
++    {
++        /* Do not renew an expired open/probe deadline during failure cleanup. */
++        if (demuxer->io_timeout && !__atomic_load_n( &demuxer->deadline, __ATOMIC_RELAXED ))
++            demuxer_set_deadline( demuxer, demuxer->io_timeout );
++        avformat_close_input( &demuxer->ctx );
++    }
+     else
+     {
+         avio_context_free( &demuxer->ctx->pb );
+@@ -849,9 +958,14 @@
+     const char *ext = params->url ? strrchr( params->url, '.' ) : NULL;
+     const AVInputFormat *format;
+     struct demuxer *demuxer;
++    enum direct_network_url rtsp_kind;
++    AVDictionary *options = NULL;
++    char *direct_url = NULL, *p;
++    NTSTATUS failure_status = STATUS_UNSUCCESSFUL;
+     int i, ret;
+ 
+-    TRACE( "context %p, url %s, mime %s\n", params->context, debugstr_a(params->url), debugstr_a(params->mime_type) );
++    TRACE( "context %p, remote URL %s, mime %s\n", params->context,
++           params->url ? "present" : "absent", debugstr_a(params->mime_type) );
+ 
+     /* Persona 4 Arena Ultimax loads extensionless ASF assets; keep this
+      * non-NULL before the format-name MIME checks below. */
+@@ -862,73 +976,123 @@
+ 
+     if (!(demuxer = calloc( 1, sizeof(*demuxer) ))) return STATUS_NO_MEMORY;
+     demuxer->stream_context = params->context;
+-    demuxer->timestamp_base = AV_NOPTS_VALUE;
++    demuxer->hls_timestamp_base = AV_NOPTS_VALUE;
+ 
+     if (!(demuxer->ctx = avformat_alloc_context())) goto failed;
+-    if (is_http_url( params->url ) || is_rtsp_url( params->url ))
++    if (is_http_url( params->url ))
+     {
+-        BOOL hls = is_http_hls_url( params->url ), rtsp = is_rtsp_url( params->url );
+-        BOOL progressive = is_http_progressive_url( params->url );
+-        AVDictionary *options = NULL;
+-        const AVInputFormat *input_format = hls ? av_find_input_format( "hls" ) : NULL;
+-        char *url, *p;
+-
+-        /* Keep the URL as the base for playlists and let FFmpeg probe HTTP
+-         * media regardless of its extension, without waiting for HTTP EOF. */
++        BOOL hls_hint = is_http_hls_url( params->url ), detected_hls;
++        const AVInputFormat *hint = hls_hint ? av_find_input_format( "hls" ) : NULL;
++        BOOL progressive;
++
++        if (hls_hint && !hint) goto failed;
++        if (!(direct_url = strdup( params->url ))) goto failed;
++        for (p = direct_url; *p && *p != ':'; ++p) *p = av_tolower( *p );
++        TRACE( "media-route=direct-http-probe\n" );
++        /* Let FFmpeg recognize extensionless HLS by content and response MIME.
++         * Give every HTTP open GE's protocol list and verified TLS, so an
++         * auto-detected HLS playlist can use AES-128 and relative URLs too.
++         * This does not add a manifest parser or a second open/probe request. */
++        if (av_dict_set( &options, "protocol_whitelist", HTTP_PROTOCOL_WHITELIST, 0 ) < 0) goto failed;
++        /* The selected explicit identity supersedes GE's default-identity 403
++         * retry. Keep one bounded open, rather than adding a second request. */
++        if (av_dict_set( &options, "user_agent", HTTP_USER_AGENT, 0 ) < 0) goto failed;
++        if (av_dict_set_int( &options, "tls_verify", 1, 0 ) < 0) goto failed;
++        /* These two private options are consumed only if FFmpeg selects HLS.
++         * Constrain its child demuxers, not unrelated progressive containers. */
++        if (av_dict_set_int( &options, "extension_picky", 0, 0 ) < 0) goto failed;
++        if (av_dict_set( &options, "seg_format_options",
++                        "format_whitelist=mpegts,mov,aac,ac3,eac3,mp3,webvtt,wav,flac,ogg,matroska", 0 ) < 0) goto failed;
+         demuxer->direct_url = TRUE;
+-        if (!(url = strdup( params->url ))) goto failed;
+-        for (p = url; *p && *p != ':'; ++p) *p = av_tolower( *p );
+-        if (!strncmp( url, "rtspt://", 8 ) || !strncmp( url, "rtspu://", 8 ))
++        demuxer->require_avio_seek = TRUE;
++        demuxer->io_timeout = HTTP_IO_TIMEOUT_US;
++        demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
++        demuxer->ctx->interrupt_callback.opaque = demuxer;
++        demuxer_set_deadline( demuxer, HTTP_OPEN_TIMEOUT_US );
++        ret = avformat_open_input( &demuxer->ctx, direct_url, hint, &options );
++        if (ret < 0)
+         {
+-            av_dict_set( &options, "rtsp_transport", url[4] == 't' ? "tcp" : "udp", 0 );
+-            /* FFmpeg accepts rtsp:// plus an explicit transport option. */
+-            memmove( url + 4, url + 5, strlen( url + 5 ) + 1 );
++            WARN( "Failed to open HTTP media directly, error %s.\n", debugstr_averr(ret) );
++            goto failed;
+         }
+-        if (!rtsp)
++        detected_hls = !strcmp( demuxer->ctx->iformat->name, "hls" );
++        progressive = av_match_name( "mov", demuxer->ctx->iformat->name );
++        if (detected_hls)
+         {
+-            /* HTTP HLS segments need not have media filename extensions. Probe
+-             * their contents, but never allow remote playlists to open local files. */
+-            av_dict_set( &options, "protocol_whitelist", "http,https,tls,rtp,tcp,udp,crypto,httpproxy,data", 0 );
+-            av_dict_set( &options, "extension_picky", "0", 0 );
++            /* Playlist seeking is implemented by HLS, not Range on the root
++             * manifest. AVFMTCTX_UNSEEKABLE still overrides this for live HLS. */
++            demuxer->require_avio_seek = FALSE;
++            demuxer->io_timeout = HLS_IO_TIMEOUT_US;
++            TRACE( "media-route=direct-hls\n" );
+         }
+-        if (rtsp) av_dict_set( &options, "timeout", "15000000", 0 );
+-        else if (!hls) av_dict_set( &options, "rw_timeout", "15000000", 0 );
+-        if (progressive)
++        else
+         {
+-            /* Replayed byte-range requests can be reset before media EOF. */
+-            av_dict_set( &options, "reconnect", "1", 0 );
+-            av_dict_set( &options, "reconnect_streamed", "1", 0 );
+-            av_dict_set( &options, "reconnect_on_network_error", "1", 0 );
+-            av_dict_set( &options, "reconnect_delay_max", "5", 0 );
++            av_dict_set( &options, "extension_picky", NULL, 0 );
++            av_dict_set( &options, "seg_format_options", NULL, 0 );
++            TRACE( "media-route=direct-http-progressive-opened\n" );
+         }
+-
+-        ret = avformat_open_input( &demuxer->ctx, url, input_format, &options );
+-        if (!rtsp && ret == AVERROR_HTTP_FORBIDDEN && !av_dict_get( options, "user_agent", NULL, 0 ))
++        /* The HTTP protocol keeps chained options for redirects and range
++         * reopens.  A plaintext-only request leaves tls_verify in this outer
++         * dictionary even though a later HTTPS hop still consumes it. */
++        av_dict_set( &options, "tls_verify", NULL, 0 );
++        if (av_dict_count( options ))
+         {
+-            WARN( "HTTP source returned 403, retrying with the legacy media user agent.\n" );
+-            /* A failed open frees the context but preserves the input options.
+-             * HLS also forwards this user agent to playlists and segments. */
+-            if ((ret = av_dict_set( &options, "user_agent", "GStreamer souphttpsrc", 0 )) >= 0)
+-                ret = avformat_open_input( &demuxer->ctx, url, input_format, &options );
++            ERR( "FFmpeg left %d required HTTP option(s) unused.\n", av_dict_count( options ) );
++            goto failed;
+         }
+-        free( url );
++        /* Preserve GE's finite-resource test before probing can infer a live
++         * fragment's duration. MP4 track durations are valid at open even when
++         * AVFormatContext.duration is still unset. */
++        if (!detected_hls && progressive && (!demuxer->ctx->pb ||
++                !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL) ||
++                avio_size( demuxer->ctx->pb ) < 0 || get_context_duration( demuxer->ctx, FALSE ) <= 0))
++            demuxer->nonseekable = TRUE;
++        else if (!detected_hls && get_context_duration( demuxer->ctx, FALSE ) == AV_NOPTS_VALUE &&
++                demuxer->ctx->pb && !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL) &&
++                avio_size( demuxer->ctx->pb ) < 0)
++            demuxer->nonseekable = TRUE;
+         av_dict_free( &options );
+-        if (ret < 0)
++        free( direct_url );
++        direct_url = NULL;
++    }
++    else if ((rtsp_kind = get_rtsp_url_kind( params->url )))
++    {
++        const AVInputFormat *rtsp = av_find_input_format( "rtsp" );
++
++        if (!rtsp || !(direct_url = normalize_rtsp_url( params->url, rtsp_kind ))) goto failed;
++        if (av_dict_set_int( &options, "timeout", 15000000, 0 ) < 0) goto failed;
++        if ((rtsp_kind == DIRECT_NETWORK_RTSP_TCP || rtsp_kind == DIRECT_NETWORK_RTSPS_TCP) &&
++            av_dict_set( &options, "rtsp_transport", "tcp", 0 ) < 0) goto failed;
++        if (rtsp_kind == DIRECT_NETWORK_RTSP_UDP &&
++            av_dict_set( &options, "rtsp_transport", "udp", 0 ) < 0) goto failed;
++        /* Keep the secure scheme intact: FFmpeg selects TLS, the secure default
++         * port and a secure control URI. Its RTSP TLS options reach both the
++         * certificate-chain and per-connection hostname checks. Never retry a
++         * failed secure source through the cleartext route. */
++        if (rtsp_kind == DIRECT_NETWORK_RTSPS_TCP &&
++            av_dict_set_int( &options, "tls_verify", 1, 0 ) < 0) goto failed;
++
++        demuxer->direct_url = TRUE;
++        demuxer->io_timeout = RTSP_IO_TIMEOUT_US;
++        demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
++        demuxer->ctx->interrupt_callback.opaque = demuxer;
++        demuxer_set_deadline( demuxer, RTSP_OPEN_TIMEOUT_US );
++        if ((ret = avformat_open_input( &demuxer->ctx, direct_url, rtsp, &options )) < 0)
+         {
+-            ERR( "Failed to open remote URL, error %s.\n", debugstr_averr(ret) );
++            ERR( "Failed to open RTSP input, error %s.\n", debugstr_averr(ret) );
+             goto failed;
+         }
+-        /* MP4 track durations are available at open, but the aggregate duration
+-         * is only populated by avformat_find_stream_info(). Do not discard the
+-         * track durations of finite files, or trust a live fragment's duration. */
+-        if (progressive && (!demuxer->ctx->pb ||
+-                !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL) ||
+-                avio_size( demuxer->ctx->pb ) < 0 || get_context_duration( demuxer->ctx ) <= 0))
+-            demuxer->nonseekable = TRUE;
+-        else if (!hls && get_context_duration( demuxer->ctx ) == AV_NOPTS_VALUE && (rtsp ||
+-                (demuxer->ctx->pb && !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)
+-                && avio_size( demuxer->ctx->pb ) < 0)))
++        if (av_dict_count( options ))
++        {
++            ERR( "FFmpeg left %d required RTSP option(s) unused.\n", av_dict_count( options ) );
++            goto failed;
++        }
++
++        if (get_context_duration( demuxer->ctx, FALSE ) == AV_NOPTS_VALUE)
+             demuxer->nonseekable = TRUE;
++        av_dict_free( &options );
++        free( direct_url );
++        direct_url = NULL;
+     }
+     else
+     {
+@@ -944,32 +1108,48 @@
+         }
+     }
+     format = demuxer->ctx->iformat;
+-    if ((params->duration = get_context_duration( demuxer->ctx )) == AV_NOPTS_VALUE ||
+-        strstr( format->name, "mp3" ) || strstr( format->name, "mpeg" ) ||
++    if ((params->duration = get_context_duration( demuxer->ctx, !demuxer->direct_url )) == AV_NOPTS_VALUE ||
++        strstr( format->name, "mp3" ) || strstr( format->name, "mpeg" ) || strstr( format->name, "hls" ) ||
+         context_has_video_missing_frame_rate( demuxer->ctx ) ||
+         (strstr( format->name, "mp4" ) && context_has_h264_codec_aligned_dimensions( demuxer->ctx )))
+     {
++        /* Opening and probing share one absolute network deadline. */
+         if ((ret = avformat_find_stream_info( demuxer->ctx, NULL )) < 0)
+         {
+             ERR( "Failed to find stream info, error %s.\n", debugstr_averr(ret) );
+             goto failed;
+         }
+-        params->duration = get_context_duration( demuxer->ctx );
++        params->duration = get_context_duration( demuxer->ctx, !demuxer->direct_url );
+     }
+     if (demuxer->nonseekable) params->duration = AV_NOPTS_VALUE;
+     demuxer->duration = params->duration;
++    /* MF positions and samples share a zero-based HLS presentation timeline. */
+     if (demuxer->ctx->start_time != AV_NOPTS_VALUE &&
+-        (strstr( format->name, "hls" ) || demuxer->nonseekable))
++        strstr( format->name, "hls" ))
++    {
++        demuxer->hls_timestamp_base = get_user_time( demuxer->ctx->start_time, AV_TIME_BASE_Q );
++    }
++    /* Snapshot only timing established by the existing open/probe.  This is
++     * metadata, not a new source-wide rebase or a reason to probe/read further.
++     * ASF already applies per-stream normalization, so a container origin would
++     * describe the wrong coordinates there.  Keep its current reader fallback. */
++    demuxer->origin.origin = AV_NOPTS_VALUE;
++    if (!strstr( format->name, "asf" ) && demuxer->ctx->start_time != AV_NOPTS_VALUE
++            && demuxer->ctx->start_time >= INT64_MIN / 10
++            && demuxer->ctx->start_time <= INT64_MAX / 10)
+     {
+-        /* Finite HLS has the same transport timestamp origin as live HLS.
+-         * Use one origin for all streams to retain their relative offsets. */
+-        demuxer->timestamp_base = get_user_time( demuxer->ctx->start_time, AV_TIME_BASE_Q );
++        demuxer->origin.origin = demuxer->ctx->start_time * 10;
++        demuxer->origin.valid = TRUE;
++        demuxer->origin.coordinates = demuxer->hls_timestamp_base != AV_NOPTS_VALUE
++                ? WINE_MF_ORIGIN_NORMALIZED : WINE_MF_ORIGIN_NATIVE;
+     }
+-    if (!(demuxer->streams = calloc( demuxer->ctx->nb_streams, sizeof(*demuxer->streams) ))) goto failed;
++    demuxer->stream_count = demuxer->ctx->nb_streams;
++    if (!(demuxer->streams = calloc( demuxer->stream_count, sizeof(*demuxer->streams) ))) goto failed;
+     if (demuxer_create_streams( demuxer )) goto failed;
+ 
++    if (demuxer->direct_url && demuxer_interrupt_callback( demuxer )) goto failed;
+     params->demuxer.handle = (UINT_PTR)demuxer;
+-    params->stream_count = demuxer->ctx->nb_streams;
++    params->stream_count = demuxer->stream_count;
+     if (strstr( format->name, "mp4" )) strcpy( params->mime_type, "video/mp4" );
+     else if (strstr( format->name, "avi" )) strcpy( params->mime_type, "video/avi" );
+     else if (strstr( format->name, "mpeg" )) strcpy( params->mime_type, "video/mpeg" );
+@@ -989,16 +1169,25 @@
+     }
+     else
+     {
+-        FIXME( "Unknown MIME type for format %s, url %s\n", debugstr_a(format->name), debugstr_a(params->url) );
++        FIXME( "Unknown MIME type for format %s (remote URL omitted)\n", debugstr_a(format->name) );
+         strcpy( params->mime_type, "video/x-application" );
+     }
+ 
++    /* parse_mp4_streams_metadata() operates on Wine's custom stream_context.
++     * A direct URL owns an FFmpeg network AVIO context instead. */
+     if (!demuxer->direct_url && strstr( format->name, "mp4" )) parse_mp4_streams_metadata( demuxer );
++    demuxer_set_deadline( demuxer, 0 );
+     return STATUS_SUCCESS;
+ 
+ failed:
+-    i = demuxer->ctx ? demuxer->ctx->nb_streams : 0;
++    av_dict_free( &options );
++    free( direct_url );
++    i = demuxer->stream_count;
+     demuxer_free_context( demuxer );
++    /* Report a cancellation or timeout, including one hit during cleanup. */
++    if (demuxer->direct_url && demuxer_interrupt_callback( demuxer ))
++        failure_status = __atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )
++                ? STATUS_CANCELLED : STATUS_IO_TIMEOUT;
+     if (demuxer->streams)
+     {
+         for (UINT j = 0; j < i; j++)
+@@ -1010,7 +1199,7 @@
+     free( demuxer );
+ 
+     mediaconv_demuxer_exit();
+-    return STATUS_UNSUCCESSFUL;
++    return failure_status;
+ }
+ 
+ NTSTATUS demuxer_destroy( void *arg )
+@@ -1022,7 +1211,7 @@
+     TRACE( "demuxer %p\n", demuxer );
+ 
+     params->context = demuxer->stream_context;
+-    for (i = 0; i < demuxer->ctx->nb_streams; i++)
++    for (i = 0; i < demuxer->stream_count; i++)
+     {
+         av_bsf_free( &demuxer->streams[i].filter );
+     }
+@@ -1034,13 +1223,42 @@
+     return STATUS_SUCCESS;
+ }
+ 
++NTSTATUS demuxer_set_cancelled( void *arg )
++{
++    struct demuxer_set_cancelled_params *params = arg;
++    struct demuxer *demuxer = get_demuxer( params->demuxer );
++
++    if (!demuxer) return STATUS_INVALID_HANDLE;
++    __atomic_store_n( &demuxer->cancelled, !!params->cancelled, __ATOMIC_RELEASE );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS demuxer_get_flags( void *arg )
++{
++    struct demuxer_get_flags_params *params = arg;
++    struct demuxer *demuxer = get_demuxer( params->demuxer );
++
++    if (!demuxer || !demuxer->ctx) return STATUS_INVALID_HANDLE;
++    params->flags = demuxer_is_seekable( demuxer ) ? WINEDMO_DEMUXER_FLAG_SEEKABLE : 0;
++    params->origin = demuxer->origin;
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packet )
+ {
++    INT64 read_deadline = 0;
+     struct stream *stream;
++    BOOL input_error;
+     int i, ret;
+ 
+     do
+     {
++        /* One budget for the complete packet request, including ignored tracks
++         * and EAGAIN. Cached input may not invoke FFmpeg's interrupt callback. */
++        if (__atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )) return STATUS_CANCELLED;
++        if (read_deadline && av_gettime_relative() >= read_deadline) return STATUS_IO_TIMEOUT;
++
++        input_error = FALSE;
+         if ((*packet = demuxer->last_packet)) return STATUS_SUCCESS;
+         if (!(*packet = av_packet_alloc())) return STATUS_NO_MEMORY;
+ 
+@@ -1054,25 +1272,66 @@
+             stream = demuxer->last_stream = NULL;
+         }
+ 
+-        if (!ret && !(ret = av_read_frame( demuxer->ctx, *packet )))
++        if (!ret)
+         {
+-            if (demuxer->ctx->iformat && strstr( demuxer->ctx->iformat->name, "mp4" ) &&
+-                    ((*packet)->flags & AV_PKT_FLAG_DISCARD))
++            if (demuxer->io_timeout)
+             {
+-                av_packet_free( packet );
+-                continue;
++                if (!read_deadline)
++                {
++                    demuxer_set_deadline( demuxer, demuxer->io_timeout );
++                    read_deadline = __atomic_load_n( &demuxer->deadline, __ATOMIC_RELAXED );
++                }
++                else __atomic_store_n( &demuxer->deadline, read_deadline, __ATOMIC_RELAXED );
++            }
++            ret = av_read_frame( demuxer->ctx, *packet );
++            if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
++            if (ret == AVERROR_EOF && demuxer->input_eofs != ~0u) ++demuxer->input_eofs;
++            if (!ret && !(*packet)->data && !(*packet)->side_data_elems
++                    && demuxer->empty_input_packets != ~0u)
++                ++demuxer->empty_input_packets;
++            input_error = ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN);
++            if (!ret)
++            {
++                if (demuxer->ctx->iformat && strstr( demuxer->ctx->iformat->name, "mp4" ) &&
++                        ((*packet)->flags & AV_PKT_FLAG_DISCARD))
++                {
++                    av_packet_free( packet );
++                    continue;
++                }
++
++                if ((unsigned int)(*packet)->stream_index >= demuxer->ctx->nb_streams)
++                {
++                    ret = AVERROR_INVALIDDATA;
++                    input_error = TRUE;
++                }
++                else if ((unsigned int)(*packet)->stream_index >= demuxer->stream_count)
++                {
++                    /* A valid late track has no Windows descriptor or filter.
++                     * Leave it unselected without stopping the original tracks. */
++                    av_packet_free( packet );
++                    continue;
++                }
++            }
++            if (!ret)
++            {
++                stream = demuxer->streams + (*packet)->stream_index;
++                ret = av_bsf_send_packet( stream->filter, (*packet) );
++                input_error = FALSE;
++                if (ret < 0) WARN( "Failed to send packet to filter, error %s; stream=%u eos=%u "
++                        "size=%d side_data=%d input_eofs=%u empty_inputs=%u avio_error=%d cancelled=%u.\n",
++                        debugstr_averr( ret ), (unsigned int)(stream - demuxer->streams), !!stream->eos,
++                        (*packet)->size, (*packet)->side_data_elems,
++                        demuxer->input_eofs, demuxer->empty_input_packets,
++                        demuxer->ctx->pb ? demuxer->ctx->pb->error : 0,
++                        !!__atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE ) );
++                else demuxer->last_stream = stream;
+             }
+-
+-            stream = demuxer->streams + (*packet)->stream_index;
+-            ret = av_bsf_send_packet( stream->filter, (*packet) );
+-            if (ret < 0) WARN( "Failed to send packet to filter, error %s.\n", debugstr_averr( ret ) );
+-            else demuxer->last_stream = stream;
+         }
+         av_packet_free( packet );
+ 
+         if (ret == AVERROR_EOF)
+         {
+-            for (i = 0; ret == AVERROR_EOF && i < demuxer->ctx->nb_streams; i++)
++            for (i = 0; ret == AVERROR_EOF && i < demuxer->stream_count; i++)
+             {
+                 if (demuxer->streams[i].eos) continue;
+                 stream = demuxer->streams + i;
+@@ -1086,7 +1345,14 @@
+     } while (!ret || ret == AVERROR(EAGAIN));
+ 
+     ERR( "Failed to read packet from demuxer %p, error %s.\n", demuxer, debugstr_averr( ret ) );
+-    return STATUS_END_OF_FILE;
++
++    /* Preserve the legacy local-bytestream behavior while keeping terminal
++     * failures on direct HTTP, HLS, and RTSP inputs distinct from clean EOF. */
++    if (!demuxer->direct_url) return STATUS_END_OF_FILE;
++    if (!input_error) return ret == AVERROR(ENOMEM) ? STATUS_NO_MEMORY : STATUS_DATA_ERROR;
++    if (__atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )) return STATUS_CANCELLED;
++    if (ret == AVERROR_EXIT || ret == AVERROR(ETIMEDOUT)) return STATUS_IO_TIMEOUT;
++    return STATUS_CONNECTION_DISCONNECTED;
+ }
+ 
+ NTSTATUS demuxer_read( void *arg )
+@@ -1127,7 +1393,7 @@
+     sample->pts = get_stream_time( stream, packet->pts );
+     sample->dts = get_stream_time( stream, packet->dts );
+     sample->duration = get_stream_time( stream, packet->duration );
+-    normalize_demuxer_timestamps( demuxer, sample );
++    normalize_hls_timestamps( demuxer, sample );
+     fixup_asf_mpeg4_timestamps( demuxer->ctx, stream, demuxer_stream, sample );
+     if (demuxer->ctx->iformat && strstr( demuxer->ctx->iformat->name, "asf" ))
+         normalize_stream_timestamps( demuxer_stream, sample );
+@@ -1156,45 +1422,93 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static int demuxer_seek_anchor( const struct demuxer *demuxer, int64_t timestamp )
++{
++    AVFormatContext *ctx = demuxer->ctx;
++    AVStream *stream, *other;
++    int original, best;
++    unsigned int i;
++
++    /* MOV aligns other streams to the default stream's found sample. Before
++     * a delayed video's first frame, that skips valid leading audio. Choose
++     * an earlier media epoch only in this case; keep normal seeks unchanged. */
++    if (!ctx->iformat || !strstr( ctx->iformat->name, "mp4" )) return -1;
++    if ((original = best = av_find_default_stream_index( ctx )) < 0) return -1;
++    stream = ctx->streams[best];
++    if (stream->start_time == AV_NOPTS_VALUE ||
++        av_compare_ts( stream->start_time, stream->time_base, timestamp, AV_TIME_BASE_Q ) <= 0)
++        return -1;
++
++    for (i = 0; i < demuxer->stream_count; ++i)
++    {
++        other = ctx->streams[i];
++        if ((other->codecpar->codec_type != AVMEDIA_TYPE_AUDIO && other->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) ||
++            other->start_time == AV_NOPTS_VALUE || other->discard == AVDISCARD_ALL ||
++            (other->disposition & AV_DISPOSITION_ATTACHED_PIC)) continue;
++        if (av_compare_ts( other->start_time, other->time_base, stream->start_time, stream->time_base ) < 0)
++        {
++            stream = other;
++            best = i;
++        }
++    }
++    return best == original ? -1 : best;
++}
++
+ NTSTATUS demuxer_seek( void *arg )
+ {
+     struct demuxer_seek_params *params = arg;
+     struct demuxer *demuxer = get_demuxer( params->demuxer );
+-    int64_t timestamp = params->timestamp;
++    int64_t timestamp = av_rescale( params->timestamp, AV_TIME_BASE, 10000000 );
+     NTSTATUS status;
+-    int i, ret;
++    int i, ret, anchor;
+ 
+     TRACE( "demuxer %p, timestamp 0x%s\n", demuxer, wine_dbgstr_longlong( params->timestamp ) );
+ 
+-    if (demuxer->nonseekable)
+-    {
+-        TRACE( "Ignoring seek on non-seekable remote stream.\n" );
+-        return STATUS_SUCCESS;
+-    }
++    if (!demuxer_is_seekable( demuxer )) return STATUS_NOT_SUPPORTED;
++
++    /* avformat_seek_file expects source timestamps, not MF-relative positions. */
++    if (demuxer->hls_timestamp_base != AV_NOPTS_VALUE)
++        timestamp = av_sat_add64( timestamp, av_rescale( demuxer->hls_timestamp_base, AV_TIME_BASE, 10000000 ) );
+ 
+     if (!(status = raw_mpegvideo_seek( demuxer, params->timestamp )))
+         goto done;
+     if (status != STATUS_NOT_SUPPORTED)
+         return status;
+ 
+-    /* Convert the presentation position back to the container's timeline. */
+-    if (demuxer->timestamp_base != AV_NOPTS_VALUE)
+-        timestamp += demuxer->timestamp_base;
+-    timestamp = av_rescale_q( timestamp, (AVRational){1, 10000000}, AV_TIME_BASE_Q );
+-
+-    if ((ret = avformat_seek_file( demuxer->ctx, -1, INT64_MIN, timestamp, timestamp, AVSEEK_FLAG_BACKWARD )) < 0)
++    anchor = demuxer_seek_anchor( demuxer, timestamp );
++    if (anchor >= 0) timestamp = av_rescale_q( timestamp, AV_TIME_BASE_Q, demuxer->ctx->streams[anchor]->time_base );
++    if (demuxer->io_timeout) demuxer_set_deadline( demuxer, demuxer->io_timeout );
++    ret = avformat_seek_file( demuxer->ctx, anchor, INT64_MIN, timestamp, timestamp, AVSEEK_FLAG_BACKWARD );
++    if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
++    if (ret == AVERROR_EOF && demuxer->direct_url && demuxer->require_avio_seek)
++        goto done;
++    if (ret < 0)
+     {
+         ERR( "Failed to seek demuxer %p, error %s.\n", demuxer, debugstr_averr(ret) );
++        if (demuxer->direct_url && demuxer->require_avio_seek)
++        {
++            if (__atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE ))
++                return STATUS_CANCELLED;
++            if (ret == AVERROR_EXIT || ret == AVERROR(ETIMEDOUT))
++                return STATUS_IO_TIMEOUT;
++            return STATUS_CONNECTION_DISCONNECTED;
++        }
+         return STATUS_UNSUCCESSFUL;
+     }
+-
+ done:
+-    for (i = 0; i < demuxer->ctx->nb_streams; i++)
++    demuxer->input_eofs = 0;
++    demuxer->empty_input_packets = 0;
++    for (i = 0; i < demuxer->stream_count; i++)
+     {
+         av_bsf_flush( demuxer->streams[i].filter );
+         demuxer->streams[i].eos = FALSE;
+-        demuxer->streams[i].timestamp_base = 0;
+-        demuxer->streams[i].timestamp_base_set = FALSE;
++        /* An established identity mapping stays valid after seek. Preserve
++         * the existing reset policy for a nonzero startup correction. */
++        if (demuxer->streams[i].timestamp_base)
++        {
++            demuxer->streams[i].timestamp_base = 0;
++            demuxer->streams[i].timestamp_base_set = FALSE;
++        }
+         demuxer->streams[i].last_pts = INT64_MIN;
+         demuxer->streams[i].next_pts = INT64_MIN;
+         demuxer->streams[i].final_last_pts = INT64_MIN;
+@@ -1204,6 +1518,27 @@
+     av_packet_free( &demuxer->last_packet );
+     demuxer->last_stream = NULL;
+ 
++    /* MOV defers the HTTP Range reopen until its first packet read.  Validate
++     * that read before reporting a completed seek and retain the packet for
++     * the normal demux path.  A seek to the known end remains ordinary EOS. */
++    if (demuxer->require_avio_seek
++            && (demuxer->duration <= 0 || params->timestamp < demuxer->duration))
++    {
++        AVPacket *packet = NULL;
++
++        if ((status = demuxer_filter_packet( demuxer, &packet )))
++        {
++            /* An unknown-duration seek may legitimately land at EOF.  Let the
++             * normal read path publish EOS instead of making Start fail. A
++             * known-duration premature EOF is a truncated network response. */
++            if (status == STATUS_END_OF_FILE)
++                return demuxer->duration <= 0 ? STATUS_SUCCESS
++                        : STATUS_CONNECTION_DISCONNECTED;
++            return status;
++        }
++        demuxer->last_packet = packet;
++    }
++
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1211,11 +1546,14 @@
+ {
+     struct demuxer_stream_lang_params *params = arg;
+     struct demuxer *demuxer = get_demuxer( params->demuxer );
+-    AVStream *stream = demuxer->ctx->streams[params->stream];
++    AVStream *stream;
+     AVDictionaryEntry *tag;
+ 
+     TRACE( "demuxer %p, stream %u\n", demuxer, params->stream );
+ 
++    if (params->stream >= demuxer->stream_count) return STATUS_INVALID_PARAMETER;
++    stream = demuxer->ctx->streams[params->stream];
++
+     if (!(tag = av_dict_get( stream->metadata, "language", NULL, 0 )))
+         return STATUS_NOT_FOUND;
+ 
+@@ -1228,11 +1566,14 @@
+ {
+     struct demuxer_stream_name_params *params = arg;
+     struct demuxer *demuxer = get_demuxer( params->demuxer );
+-    AVStream *stream = demuxer->ctx->streams[params->stream];
++    AVStream *stream;
+     AVDictionaryEntry *tag;
+ 
+     TRACE( "demuxer %p, stream %u\n", demuxer, params->stream );
+ 
++    if (params->stream >= demuxer->stream_count) return STATUS_INVALID_PARAMETER;
++    stream = demuxer->ctx->streams[params->stream];
++
+     if (!(tag = av_dict_get( stream->metadata, "title", NULL, AV_DICT_IGNORE_SUFFIX )) &&
+         !(tag = av_dict_get( stream->metadata, "name", NULL, AV_DICT_IGNORE_SUFFIX )))
+         return STATUS_NOT_FOUND;
+@@ -1245,10 +1586,14 @@
+ {
+     struct demuxer_stream_type_params *params = arg;
+     struct demuxer *demuxer = get_demuxer( params->demuxer );
+-    AVStream *stream = demuxer->ctx->streams[params->stream];
+-    AVCodecParameters *par = demuxer->streams[params->stream].filter->par_out;
++    AVStream *stream;
++    AVCodecParameters *par;
+     AVRational fps;
+ 
++    if (params->stream >= demuxer->stream_count) return STATUS_INVALID_PARAMETER;
++    stream = demuxer->ctx->streams[params->stream];
++    par = demuxer->streams[params->stream].filter->par_out;
++
+     TRACE( "demuxer %p, stream %u, stream %p, index %u\n", demuxer, params->stream, stream, stream->index );
+     if (par->codec_type == AVMEDIA_TYPE_VIDEO)
+     {
+diff --git a/dlls/winedmo/unix_private.h b/dlls/winedmo/unix_private.h
+--- a/dlls/winedmo/unix_private.h
++++ b/dlls/winedmo/unix_private.h
+@@ -74,6 +74,8 @@
+ extern NTSTATUS demuxer_check( void * );
+ extern NTSTATUS demuxer_create( void * );
+ extern NTSTATUS demuxer_destroy( void * );
++extern NTSTATUS demuxer_set_cancelled( void * );
++extern NTSTATUS demuxer_get_flags( void * );
+ extern NTSTATUS demuxer_read( void * );
+ extern NTSTATUS demuxer_seek( void * );
+ extern NTSTATUS demuxer_stream_lang( void * );
+diff --git a/dlls/winedmo/unixlib.c b/dlls/winedmo/unixlib.c
+--- a/dlls/winedmo/unixlib.c
++++ b/dlls/winedmo/unixlib.c
+@@ -38,15 +38,32 @@
+ {
+     struct seek_callback_params params = {.dispatch = {.callback = seek_callback}, .context = (UINT_PTR)opaque};
+     struct stream_context *context = opaque;
++    UINT64 base = 0;
+     void *ret_ptr;
+     ULONG ret_len;
+     int status;
+ 
+     TRACE( "opaque %p, offset %#"PRIx64", whence %#x\n", opaque, offset, whence );
+ 
+-    if (whence == AVSEEK_SIZE) return context->length;
+-    if (whence == SEEK_END) offset += context->length;
+-    if (whence == SEEK_CUR) offset += context->position;
++    whence &= ~AVSEEK_FORCE;
++    if (whence == AVSEEK_SIZE)
++        return context->length <= INT64_MAX ? context->length : AVERROR( EINVAL );
++    if (whence == SEEK_END)
++        base = context->length;
++    else if (whence == SEEK_CUR)
++        base = context->position;
++    else if (whence != SEEK_SET)
++        return AVERROR( EINVAL );
++
++    if (base > INT64_MAX) return AVERROR( EINVAL );
++    if (offset < -(int64_t)base)
++        offset = 0;
++    else if (offset > INT64_MAX - (int64_t)base)
++        offset = INT64_MAX;
++    else
++        offset += base;
++
++    if (offset < 0) offset = 0;
+     if ((UINT64)offset > context->length) offset = context->length;
+ 
+     if (offset / context->capacity != context->position / context->capacity)
+@@ -116,6 +133,8 @@
+     char *p;
+     int prefix = 1;
+ 
++    if (level > av_log_get_level()) return;
++
+     if (level <= AV_LOG_ERROR) dbcl = __WINE_DBCL_ERR;
+     else if (level <= AV_LOG_WARNING) dbcl = __WINE_DBCL_WARN;
+ 
+@@ -170,6 +189,8 @@
+     X( demuxer_check ),
+     X( demuxer_create ),
+     X( demuxer_destroy ),
++    X( demuxer_set_cancelled ),
++    X( demuxer_get_flags ),
+     X( demuxer_read ),
+     X( demuxer_seek ),
+     X( demuxer_stream_lang ),
+@@ -250,6 +271,8 @@
+     X( demuxer_check ),
+     X64( demuxer_create ),
+     X64( demuxer_destroy ),
++    X( demuxer_set_cancelled ),
++    X( demuxer_get_flags ),
+     X( demuxer_read ),
+     X( demuxer_seek ),
+     X( demuxer_stream_lang ),
+diff --git a/dlls/winedmo/unixlib.h b/dlls/winedmo/unixlib.h
+--- a/dlls/winedmo/unixlib.h
++++ b/dlls/winedmo/unixlib.h
+@@ -31,6 +31,7 @@
+ 
+ #include "wine/unixlib.h"
+ #include "wine/winedmo.h"
++#include "wine/mforigin.h"
+ 
+ struct process_attach_params
+ {
+@@ -119,6 +120,23 @@
+     struct stream_context *context;
+ };
+ 
++struct demuxer_set_cancelled_params
++{
++    struct winedmo_demuxer demuxer;
++    UINT32 cancelled;
++};
++
++struct demuxer_get_flags_params
++{
++    struct winedmo_demuxer demuxer;
++    UINT32 flags;
++    UINT32 reserved;
++    struct wine_mf_presentation_origin origin;
++};
++
++C_ASSERT(offsetof(struct demuxer_get_flags_params, origin) == 16);
++C_ASSERT(sizeof(struct demuxer_get_flags_params) == 32);
++
+ struct demuxer_read_params
+ {
+     struct winedmo_demuxer demuxer;
+@@ -271,6 +289,8 @@
+     unix_demuxer_check,
+     unix_demuxer_create,
+     unix_demuxer_destroy,
++    unix_demuxer_set_cancelled,
++    unix_demuxer_get_flags,
+     unix_demuxer_read,
+     unix_demuxer_seek,
+     unix_demuxer_stream_lang,
+diff --git a/dlls/winedmo/main.c b/dlls/winedmo/main.c
+--- a/dlls/winedmo/main.c
++++ b/dlls/winedmo/main.c
+@@ -498,11 +498,55 @@
+     return status;
+ }
+ 
+-NTSTATUS CDECL winedmo_demuxer_read( struct winedmo_demuxer demuxer, UINT *stream, DMO_OUTPUT_DATA_BUFFER *buffer, UINT *buffer_size )
++NTSTATUS CDECL winedmo_demuxer_set_cancelled( struct winedmo_demuxer demuxer, BOOL cancelled )
++{
++    struct demuxer_set_cancelled_params params = {.demuxer = demuxer, .cancelled = !!cancelled};
++    NTSTATUS status;
++
++    if (!demuxer.handle) return STATUS_SUCCESS;
++    if ((status = UNIX_CALL( demuxer_set_cancelled, &params )))
++        WARN( "demuxer_set_cancelled failed, status %#lx\n", status );
++    return status;
++}
++
++NTSTATUS CDECL winedmo_demuxer_get_flags( struct winedmo_demuxer demuxer, UINT32 *flags )
++{
++    struct demuxer_get_flags_params params = {.demuxer = demuxer};
++    NTSTATUS status;
++
++    if (!flags) return STATUS_INVALID_PARAMETER;
++    *flags = 0;
++    if (!demuxer.handle) return STATUS_INVALID_HANDLE;
++    if ((status = UNIX_CALL( demuxer_get_flags, &params )))
++        WARN( "demuxer_get_flags failed, status %#lx\n", status );
++    else
++        *flags = params.flags;
++    return status;
++}
++
++NTSTATUS CDECL winedmo_demuxer_get_origin( struct winedmo_demuxer demuxer,
++        struct wine_mf_presentation_origin *origin )
++{
++    struct demuxer_get_flags_params params = {.demuxer = demuxer};
++    NTSTATUS status;
++
++    if (!origin) return STATUS_INVALID_PARAMETER;
++    memset( origin, 0, sizeof(*origin) );
++    if (!demuxer.handle) return STATUS_INVALID_HANDLE;
++    if (!(status = UNIX_CALL( demuxer_get_flags, &params )))
++        *origin = params.origin;
++    return status;
++}
++
++NTSTATUS winedmo_demuxer_read_timed( struct winedmo_demuxer demuxer, UINT *stream,
++        DMO_OUTPUT_DATA_BUFFER *buffer, UINT *buffer_size, INT64 *pts, INT64 *dts )
+ {
+     struct demuxer_read_params params = {.demuxer = demuxer};
+     NTSTATUS status;
+     DWORD capacity = 0;
++
++    if (pts) *pts = INT64_MIN;
++    if (dts) *dts = INT64_MIN;
+ 
+     TRACE( "demuxer %#I64x, stream %p, buffer %p, buffer_size %p\n", demuxer.handle, stream, buffer, buffer_size );
+ 
+@@ -527,8 +571,18 @@
+         return status;
+     }
+ 
++    /* Do not recover these from rtTimestamp: legacy DMO uses min(PTS,DTS),
++     * which loses the presentation order of compressed B-frame packets. */
++    if (pts) *pts = params.sample.pts;
++    if (dts) *dts = params.sample.dts;
+     TRACE( "Got buffer %p, buffer_size %#x on stream %u\n", buffer->pBuffer, *buffer_size, *stream );
+     return status;
++}
++
++NTSTATUS CDECL winedmo_demuxer_read( struct winedmo_demuxer demuxer, UINT *stream,
++        DMO_OUTPUT_DATA_BUFFER *buffer, UINT *buffer_size )
++{
++    return winedmo_demuxer_read_timed( demuxer, stream, buffer, buffer_size, NULL, NULL );
+ }
+ 
+ NTSTATUS CDECL winedmo_demuxer_seek( struct winedmo_demuxer demuxer, INT64 timestamp )
+diff --git a/dlls/winedmo/winedmo_private.h b/dlls/winedmo/winedmo_private.h
+--- a/dlls/winedmo/winedmo_private.h
++++ b/dlls/winedmo/winedmo_private.h
+@@ -36,6 +36,7 @@
+ #include "wine/debug.h"
+ #include "wine/strmbase.h"
+ #include "wine/mfinternal.h"
++#include "wine/mforigin.h"
+ 
+ #include "media_format.h"
+ 
+@@ -113,6 +114,11 @@
+ 
+ HRESULT winedmo_byte_stream_handler_create(REFIID riid, void **obj);
+ 
++struct winedmo_demuxer;
++/* Internal MF route; the exported DMO read keeps its single legacy timestamp. */
++NTSTATUS winedmo_demuxer_read_timed(struct winedmo_demuxer demuxer, UINT *stream,
++        DMO_OUTPUT_DATA_BUFFER *buffer, UINT *buffer_size, INT64 *pts, INT64 *dts);
++
+ unsigned int winedmo_format_get_stride(const struct winedmo_codec_format *format);
+ 
+ bool winedmo_video_format_is_rgb(enum winedmo_video_format format);
+diff --git a/dlls/winedmo/winedmo.spec b/dlls/winedmo/winedmo.spec
+--- a/dlls/winedmo/winedmo.spec
++++ b/dlls/winedmo/winedmo.spec
+@@ -5,6 +5,8 @@
+ @ cdecl winedmo_demuxer_check(str)
+ @ cdecl winedmo_demuxer_create(wstr ptr int64 ptr ptr ptr ptr)
+ @ cdecl winedmo_demuxer_destroy(ptr)
++@ cdecl winedmo_demuxer_set_cancelled(int64 long)
++@ cdecl winedmo_demuxer_get_flags(int64 ptr)
+ @ cdecl winedmo_demuxer_read(int64 ptr ptr ptr)
+ @ cdecl winedmo_demuxer_seek(int64 int64)
+ @ cdecl winedmo_demuxer_stream_lang(int64 long ptr long)
+@@ -30,3 +32,4 @@
+ @ stdcall winedmo_create_wm_sync_reader(ptr ptr)
+ @ stdcall winedmo_create_video_decoder(ptr)
+ @ stdcall winedmo_create_wma_decoder(ptr ptr)
++@ cdecl winedmo_demuxer_get_origin(int64 ptr)
+diff --git a/include/wine/winedmo.h b/include/wine/winedmo.h
+--- a/include/wine/winedmo.h
++++ b/include/wine/winedmo.h
+@@ -43,6 +43,9 @@
+ struct winedmo_demuxer   { UINT64 handle; };
+ struct winedmo_muxer     { UINT64 handle; };
+ struct winedmo_transform { UINT64 handle; };
++struct wine_mf_presentation_origin;
++
++#define WINEDMO_DEMUXER_FLAG_SEEKABLE 0x00000001
+ 
+ /* Flags for winedmo_transform_push_input */
+ #define WINEDMO_SAMPLE_FLAG_SYNC_POINT      0x01
+@@ -65,6 +68,10 @@
+ NTSTATUS CDECL winedmo_demuxer_create( const WCHAR *url, struct winedmo_stream *stream, UINT64 stream_size, INT64 *duration,
+                                        UINT *stream_count, WCHAR *mime_type, struct winedmo_demuxer *demuxer );
+ NTSTATUS CDECL winedmo_demuxer_destroy( struct winedmo_demuxer *demuxer );
++NTSTATUS CDECL winedmo_demuxer_set_cancelled( struct winedmo_demuxer demuxer, BOOL cancelled );
++NTSTATUS CDECL winedmo_demuxer_get_flags( struct winedmo_demuxer demuxer, UINT32 *flags );
++NTSTATUS CDECL winedmo_demuxer_get_origin( struct winedmo_demuxer demuxer,
++                                           struct wine_mf_presentation_origin *origin );
+ NTSTATUS CDECL winedmo_demuxer_read( struct winedmo_demuxer demuxer, UINT *stream, DMO_OUTPUT_DATA_BUFFER *buffer, UINT *buffer_size );
+ NTSTATUS CDECL winedmo_demuxer_seek( struct winedmo_demuxer demuxer, INT64 timestamp );
+ NTSTATUS CDECL winedmo_demuxer_stream_lang( struct winedmo_demuxer demuxer, UINT stream, WCHAR *buffer, UINT len );
+diff --git a/include/wine/mforigin.h b/include/wine/mforigin.h
+new file mode 100644
+--- /dev/null
++++ b/include/wine/mforigin.h
+@@ -0,0 +1,29 @@
++/* Private WineDMO / SourceReader presentation-coordinate contract. */
++#ifndef __WINE_MFORIGIN_H
++#define __WINE_MFORIGIN_H
++
++#include <stdint.h>
++#include "windef.h"
++#include "guiddef.h"
++
++/* Versioned by this GUID and the exact blob size, never a public MF attribute. */
++DEFINE_GUID(MF_WINE_PD_PRESENTATION_ORIGIN, 0xf5604b90, 0xe493, 0x48ba,
++        0x94, 0x9c, 0x72, 0x3f, 0xb1, 0x3a, 0x5e, 0x2d);
++
++enum wine_mf_origin_coordinates
++{
++    WINE_MF_ORIGIN_UNKNOWN,
++    WINE_MF_ORIGIN_NATIVE,
++    WINE_MF_ORIGIN_NORMALIZED,
++};
++
++struct wine_mf_presentation_origin
++{
++    INT64 origin; /* signed 100ns source origin; zero is a valid origin */
++    UINT32 valid;
++    UINT32 coordinates; /* whether source samples / seeks already subtract origin */
++};
++
++C_ASSERT(sizeof(struct wine_mf_presentation_origin) == 16);
++
++#endif
+diff --git a/include/Makefile.in b/include/Makefile.in
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -981,6 +981,7 @@
+ 	wine/itss.idl \
+ 	wine/list.h \
+ 	wine/mfinternal.idl \
++	wine/mforigin.h \
+ 	wine/mmsystem16.h \
+ 	wine/mscvpdb.h \
+ 	wine/mssign.h \
+diff --git a/dlls/winedmo/winedmo.rgs b/dlls/winedmo/winedmo.rgs
+--- a/dlls/winedmo/winedmo.rgs
++++ b/dlls/winedmo/winedmo.rgs
+@@ -70,6 +70,14 @@
+                     {
+                         val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'winedmo Scheme Handler'
+                     }
++                    'rtsps:'
++                    {
++                        val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'winedmo Scheme Handler'
++                    }
++                    'rtspst:'
++                    {
++                        val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'winedmo Scheme Handler'
++                    }
+                 }
+             }
+         }

@@ -237,6 +237,8 @@ for key in \
       == "$(pinned_ge_state_value "$PREPARED_STATE" "$key")" ]] \
     || pinned_ge_fail "artifact invocation media provenance differs for $key"
 done
+pinned_ge_require_ge_skip_state "$INVOCATION" "$STATE_DIR/protonprep-valve-staging.generated.sh"
+pinned_ge_require_ge_skip_state "$PREPARED_STATE" "$STATE_DIR/protonprep-valve-staging.generated.sh"
 [[ "$(pinned_ge_state_value "$INVOCATION" ge_media_cleanup_manifest_sha256)" \
     == "$PIN_GE_MEDIA_CLEANUP_MANIFEST_SHA256" ]] \
   || pinned_ge_fail "artifact invocation used a different media-cleanup manifest"
@@ -620,8 +622,21 @@ fi
 if [[ -n "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" ]]; then
   provenance_lines+=("FFmpeg HTTP-filesize companion SHA-256: $PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256")
 fi
+if [[ -n "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" ]]; then
+  provenance_lines+=("FFmpeg HTTP-chunked-end module SHA-256: $PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256")
+fi
 if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" ]]; then
   provenance_lines+=("FFmpeg HLS-early-seek companion SHA-256: $PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256")
+fi
+if [[ -n "${PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256:-}" ]]; then
+  provenance_lines+=("FFmpeg HLS-init-config companion SHA-256: $PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256")
+fi
+if [[ -n "${PIN_GE_SKIP_PATCHES:-}" ]]; then
+  provenance_lines+=("GE patches skipped by the pin (path:SHA-256): $PIN_GE_SKIP_PATCHES")
+  skip_forms="$(pinned_ge_ge_skip_forms_value "$STATE_DIR/protonprep-valve-staging.generated.sh")"
+  if [[ -n "$skip_forms" ]]; then
+    provenance_lines+=("GE patch skip forms (path=form): $skip_forms")
+  fi
 fi
 if [[ "$PINNED_GE_HAS_PATCH_OVERLAP" == 1 ]]; then
   provenance_lines+=(

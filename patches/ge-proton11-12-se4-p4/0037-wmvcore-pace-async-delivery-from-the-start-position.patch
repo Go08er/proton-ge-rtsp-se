@@ -1,0 +1,24 @@
+Subject: [SE3-P4] wmvcore: pace asynchronous delivery from the start position
+
+When the async WM reader paces delivery itself (no user-provided clock, as
+qasf's WM ASF Reader uses it under a graph clock), it compared each
+sample's stream time with the time elapsed since the reader started. After
+a start or seek to position P it therefore waited P seconds before
+delivering the first sample: a seek to 5 s showed nothing for 5 s, and
+DirectShow playback after a mid-file seek appeared frozen or skipped. The
+clock starts at the start position; add it. Playback from 0 is unchanged.
+
+---
+diff --git a/dlls/wmvcore/async_reader.c b/dlls/wmvcore/async_reader.c
+--- a/dlls/wmvcore/async_reader.c
++++ b/dlls/wmvcore/async_reader.c
+@@ -265,7 +265,8 @@
+ 
+     if (!reader->user_clock)
+     {
+-        current_time = get_current_time(reader) - reader->clock_start;
++        /* Sample times are stream times; the clock starts at the start position. */
++        current_time = get_current_time(reader) - reader->clock_start + reader->active_start;
+         timeout = (pts - current_time) / 10000;
+     }
+ 

@@ -1,0 +1,44 @@
+Subject: [SE4-P1] winedmo: let the WM reader's own seek read while flushing
+
+reinit_stream() seeks the demuxer while read_flushing is set, and the read
+callback returns EOF for every read during a flush, including the seek's own
+index/header reads. Non-zero IWMSyncReader::SetRange() targets (and WM ASF
+Reader / AMStream seeks) therefore restart from the beginning; a seek to 0
+works by accident. Allow the seeking thread's reads, and have the demux
+thread re-check read_flushing under demuxer_cs before reading, so a read
+that raced the flush cannot publish a fake EOF after the seek.
+
+SE4-P1: GE-Proton11-12's ge-video-rework 0103 already lets reinit_stream's
+seek read while flushing (read_seeking). This patch now only adds the demux
+thread's re-check of read_flushing under demuxer_cs and an error message
+when the seek fails.
+
+---
+diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
+--- a/dlls/winedmo/wm_reader.c
++++ b/dlls/winedmo/wm_reader.c
+@@ -1090,6 +1090,14 @@
+         needed_size = buffer_size;
+ 
+         EnterCriticalSection(&reader->demuxer_cs);
++        /* A read between the seek and the end of reinit_stream would see a
++         * flushing EOF and leave the demuxer at EOF. */
++        if (reader->read_flushing)
++        {
++            LeaveCriticalSection(&reader->demuxer_cs);
++            IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
++            continue;
++        }
+         status = winedmo_demuxer_read(reader->demuxer, &stream_idx, &output, &needed_size);
+         LeaveCriticalSection(&reader->demuxer_cs);
+ 
+@@ -2403,7 +2411,8 @@
+      * frames), let those reads through. */
+     EnterCriticalSection(&reader->demuxer_cs);
+     reader->read_seeking = true;
+-    winedmo_demuxer_seek(reader->demuxer, reader->start_time);
++    if (winedmo_demuxer_seek(reader->demuxer, reader->start_time))
++        ERR("Failed to seek WM reader %p to %s.\n", reader, debugstr_time(reader->start_time));
+     reader->read_seeking = false;
+     LeaveCriticalSection(&reader->demuxer_cs);
+ 

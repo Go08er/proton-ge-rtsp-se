@@ -1,0 +1,30 @@
+From: RTSP-on-GE contributors
+Subject: [PATCH] avformat/http: a completed chunked response is not premature
+
+A keep-alive response with Transfer-Encoding: chunked has no known length, so
+its file size stays at the maximum value. When such a response ends with its
+last chunk, the following read reports end of file and the reconnect loop
+treats the stream as cut short, then resumes at the end offset. The server
+answers from the start of the resource and the reader retries with growing
+delays, which stalls Twitch live streams that serve their newest HLS segments
+this way.
+
+Treat a response whose last chunk has been received as complete. Truncated
+chunked responses, responses with a Content-Length, and reconnect_at_eof
+behave as before.
+
+diff --git a/libavformat/http.c b/libavformat/http.c
+index d7e5793..ff99262 100644
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -1845,7 +1845,9 @@ retry:
+     read_ret = http_buf_read(h, buf, size);
+     while (read_ret < 0) {
+         uint64_t target = h->is_streamed ? 0 : s->off;
+-        bool is_premature = s->filesize > 0 && s->off < s->filesize;
++        /* A chunked response of unknown size that ended with its last chunk
++         * is complete, not premature. */
++        bool is_premature = s->filesize > 0 && s->off < s->filesize && !s->chunkend;
+ 
+         if (read_ret == AVERROR_EXIT)
+             break;

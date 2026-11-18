@@ -1,0 +1,158 @@
+Subject: [SE4-P3] winedmo: continue the live HLS timeline across discontinuities
+
+A live HLS stream that restarts its timestamps below the presentation origin
+froze video for the length of the restart. Twitch stitches ad pods into a
+live playlist behind an EXT-X-DISCONTINUITY, and the ad's timestamps restart
+near 0. When playback joined in live and the ad restarts less than 60 s
+below the join timestamp (FFmpeg lifts anything further below by 2^33
+ticks), every ad sample mapped to max(0, pts - origin) = 0. The audio
+renderer re-anchors its clock to 0 minus its queued audio on each sample,
+so the clock never reached the video frames, which were also at 0, and
+video stalled until live timestamps returned. SE3, SE4-P1, SE4-P2 and stock
+GE-Proton11-12 all do this; it is not a 0043 regression.
+
+normalize_hls_timestamps() now keeps a per-stream offset. When a stream's
+decode time would land more than 1 s before its own last output, its
+timeline continues from that output. The first stream to step sets a shared
+offset, and the other stream adopts it at its own step if that places it no
+more than 1 s before its own last output, otherwise it sets a new one. The
+streams keep their relative timing, and packets of the previous run that
+arrive late keep the previous offset. A sparse stream (Twitch's timed-ID3
+stream has one packet per segment) that steps first can place audio and
+video at most 1 s before their own last output. The start-up clamp and
+forward steps are unchanged, and seeks reset the new state.
+
+Live HLS only: the new branch needs an HLS demuxer (hls_timestamp_base),
+no duration, and AVFMTCTX_UNSEEKABLE, which hls.c sets for a playlist that
+is neither finished nor EVENT and re-evaluates at every reload. Everything
+else (VOD and EVENT HLS, progressive HTTP, RTSP, local files) keeps a zero
+offset, so its output is bit-identical to SE4-P2.
+
+Limits. A forward jump at a restart, or at the return to live after the
+continued ad, still jumps forward, as it does today (the W and F fixtures
+play through those). A stream that steps back by less than 1 s is not
+re-anchored, so when the two streams of one restart straddle that threshold
+the second keeps its old offset, up to about 1 s off. A step in one stream
+only shifts that stream alone. A live playlist with a known duration (for
+example fMP4 with track durations) keeps today's clamp.
+
+Replay-checked and compile-checked only: the function was extracted verbatim
+from this file and replayed on the host over the packet sequences of the ten
+freeze fixtures and fifteen synthetic ones (a restart without a tag, steps
+near 1 s, boundary skew, a sparse data stream); the file compiles with the
+SE4-P1 build's per-file commands (x86_64 and i386, -Werror). Not
+runtime-qualified.
+
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -73,6 +73,11 @@
+     INT64 final_last_pts;
+     INT64 final_next_pts;
+     UINT final_repeated_pts;
++    /* Live HLS re-anchoring, see normalize_hls_timestamps(). */
++    INT64 hls_offset;
++    UINT hls_epoch;
++    INT64 hls_last_out;
++    BOOL hls_last_set;
+ };
+ 
+ struct demuxer
+@@ -83,6 +88,8 @@
+     UINT stream_count; /* allocated filters and published Windows streams */
+     INT64 duration;
+     INT64 hls_timestamp_base;
++    INT64 hls_offset; /* live HLS: shared offset of the latest re-anchoring */
++    UINT hls_epoch; /* counts the re-anchorings */
+     struct wine_mf_presentation_origin origin;
+     BOOL direct_url;
+     BOOL nonseekable;
+@@ -273,15 +280,62 @@
+         sample->dts = max( 0, av_sat_sub64( sample->dts, stream->timestamp_base ) );
+ }
+ 
+-static void normalize_hls_timestamps( const struct demuxer *demuxer, struct sample *sample )
++/* A decode time that lands more than this (1 s, in 100 ns units) before the stream's
++ * last output starts a new timestamp run: within a run decode times do not step back. */
++#define HLS_LIVE_BACKSTEP 10000000
++
++static void normalize_hls_timestamps( struct demuxer *demuxer, struct stream *stream, struct sample *sample )
+ {
++    INT64 ref, rel, out;
++
+     if (demuxer->hls_timestamp_base == AV_NOPTS_VALUE)
+         return;
+ 
++    /* Live HLS only: no duration, and FFmpeg marks the playlist unseekable, so no seek or
++     * position maps through the origin. After an EXT-X-DISCONTINUITY a stitched ad may restart
++     * below the origin taken at open. Every sample then clamped to 0, the audio clock stayed
++     * pinned there and video stalled for the whole ad. When a stream's decode time would land
++     * more than HLS_LIVE_BACKSTEP before its own last output, continue its timeline from that
++     * output instead. The first stream to step sets a shared offset; each other stream adopts
++     * it at its own step if that lands it no more than HLS_LIVE_BACKSTEP before its own last
++     * output, else it sets a new one. The streams keep their relative timing, and late packets
++     * of the previous run keep the previous offset. Forward steps, and the clamp of the first
++     * decode times at start-up, are unchanged. */
++    ref = sample->dts != AV_NOPTS_VALUE ? sample->dts : sample->pts;
++    if (ref != AV_NOPTS_VALUE && stream->hls_last_set && demuxer->duration == AV_NOPTS_VALUE
++            && (demuxer->ctx->ctx_flags & AVFMTCTX_UNSEEKABLE))
++    {
++        rel = av_sat_sub64( ref, demuxer->hls_timestamp_base );
++        out = av_sat_add64( rel, stream->hls_offset );
++        if (out < av_sat_sub64( stream->hls_last_out, HLS_LIVE_BACKSTEP ))
++        {
++            out = av_sat_add64( rel, demuxer->hls_offset );
++            if (stream->hls_epoch == demuxer->hls_epoch
++                    || out < av_sat_sub64( stream->hls_last_out, HLS_LIVE_BACKSTEP ))
++            {
++                INT64 next = av_sat_add64( stream->hls_last_out, sample->duration > 0 ? sample->duration : 0 );
++
++                demuxer->hls_offset = av_sat_sub64( next, rel );
++                demuxer->hls_epoch++;
++                TRACE( "live HLS decode time stepped back to %s; continuing at %s, offset %s.\n",
++                        wine_dbgstr_longlong( av_sat_add64( rel, stream->hls_offset ) ),
++                        wine_dbgstr_longlong( next ), wine_dbgstr_longlong( demuxer->hls_offset ) );
++            }
++            stream->hls_offset = demuxer->hls_offset;
++            stream->hls_epoch = demuxer->hls_epoch;
++        }
++    }
++
+     if (sample->pts != AV_NOPTS_VALUE)
+-        sample->pts = max( 0, av_sat_sub64( sample->pts, demuxer->hls_timestamp_base ) );
++        sample->pts = max( 0, av_sat_add64( av_sat_sub64( sample->pts, demuxer->hls_timestamp_base ), stream->hls_offset ) );
+     if (sample->dts != AV_NOPTS_VALUE)
+-        sample->dts = max( 0, av_sat_sub64( sample->dts, demuxer->hls_timestamp_base ) );
++        sample->dts = max( 0, av_sat_add64( av_sat_sub64( sample->dts, demuxer->hls_timestamp_base ), stream->hls_offset ) );
++    if (ref != AV_NOPTS_VALUE)
++    {
++        out = sample->dts != AV_NOPTS_VALUE ? sample->dts : sample->pts;
++        if (!stream->hls_last_set || out > stream->hls_last_out) stream->hls_last_out = out;
++        stream->hls_last_set = TRUE;
++    }
+ }
+ 
+ static void fixup_asf_mpeg4_timestamps( const AVFormatContext *ctx, AVStream *avstream,
+@@ -1505,7 +1559,7 @@
+     sample->pts = get_stream_time( stream, packet->pts );
+     sample->dts = get_stream_time( stream, packet->dts );
+     sample->duration = get_stream_time( stream, packet->duration );
+-    normalize_hls_timestamps( demuxer, sample );
++    normalize_hls_timestamps( demuxer, demuxer_stream, sample );
+     fixup_asf_mpeg4_timestamps( demuxer->ctx, stream, demuxer_stream, sample );
+     if (demuxer->ctx->iformat && strstr( demuxer->ctx->iformat->name, "asf" ))
+         normalize_stream_timestamps( demuxer_stream, sample );
+@@ -1648,7 +1702,12 @@
+         demuxer->streams[i].final_last_pts = INT64_MIN;
+         demuxer->streams[i].final_next_pts = INT64_MIN;
+         demuxer->streams[i].final_repeated_pts = 0;
++        demuxer->streams[i].hls_offset = 0;
++        demuxer->streams[i].hls_epoch = 0;
++        demuxer->streams[i].hls_last_set = FALSE;
+     }
++    demuxer->hls_offset = 0;
++    demuxer->hls_epoch = 0;
+     av_packet_free( &demuxer->last_packet );
+     demuxer->last_stream = NULL;
+ 

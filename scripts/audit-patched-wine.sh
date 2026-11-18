@@ -129,6 +129,16 @@ HLS_PROBE_SERIES=0
 LIVE_BUFFER_SERIES=0
 EOS_DRAIN_SERIES=0
 NATIVE_AUDIO_TIMELINE_SERIES=0
+# SE4-P1 network contract: GE's protocol list for every HTTP(S)/HLS open and no
+# URLMon/cache fallback or nested-request io_open hook. Selected only by a series
+# that references the ge-proton11-12-se4-p1/ patch directory (the trailing slash
+# keeps ge-proton11-12-se4-p1-r2 style names from matching by prefix).
+SE4_NETWORK_CONTRACT=0
+# SE4-P6 (2026-11-14): 0046 (mfmediaengine lock helpers) and 0048 (SAR driver calls outside the renderer lock)
+# respell what some assertions below check. Both are derived from the series content; with a flag off every
+# assertion runs exactly as before.
+ENGINE_LOCK_HELPERS=0
+SAR_UNLOCKED_DRIVER=0
 if [[ "$SERIES_SPECIFIC" == 1 ]]; then
   [[ -n "$PATCH_SERIES" ]] \
     || fail "--series is required for a series-specific audit"
@@ -185,6 +195,11 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-11-se3-p7/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
       -e 'ge-proton11-11-se3-p8/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
       -e 'ge-proton11-11-se3-p9/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-12-se4-p1/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-12-se4-p2/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-12-se4-p3/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-12-se4-p4/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-12-se4-p6/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
       -e 'ge-proton11-9-se2-p21/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
       -e 'ge-proton11-9-se2-p20/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' "$PATCH_SERIES"; then
     IMMEDIATE_SEEK_SERIES=1
@@ -206,6 +221,11 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-11-se3-p7/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
       -e 'ge-proton11-11-se3-p8/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
       -e 'ge-proton11-11-se3-p9/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-12-se4-p1/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-12-se4-p2/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-12-se4-p3/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-12-se4-p4/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-12-se4-p6/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
       -e 'ge-proton11-9-se2-p21/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
       -e 'ge-proton11-9-se2-p20/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' "$PATCH_SERIES"; then
     LIVE_BUFFER_SERIES=1
@@ -224,6 +244,11 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-11-se3-p7/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
       -e 'ge-proton11-11-se3-p8/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
       -e 'ge-proton11-11-se3-p9/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-12-se4-p1/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-12-se4-p2/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-12-se4-p3/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-12-se4-p4/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-12-se4-p6/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
       -e 'ge-proton11-9-se2-p21/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
       -e 'ge-proton11-9-se2-p20/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' "$PATCH_SERIES"; then
     EOS_DRAIN_SERIES=1
@@ -242,6 +267,11 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-11-se3-p7/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
       -e 'ge-proton11-11-se3-p8/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
       -e 'ge-proton11-11-se3-p9/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-12-se4-p1/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-12-se4-p2/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-12-se4-p3/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-12-se4-p4/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-12-se4-p6/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
       -e 'ge-proton11-9-se2-p21/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
       -e 'ge-proton11-9-se2-p20/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' "$PATCH_SERIES"; then
     NATIVE_AUDIO_TIMELINE_SERIES=1
@@ -339,6 +369,11 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-11-se3-p7/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
       -e 'ge-proton11-11-se3-p8/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
       -e 'ge-proton11-11-se3-p9/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-12-se4-p1/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-12-se4-p2/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-12-se4-p3/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-12-se4-p4/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-12-se4-p6/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
       -e 'ge-proton11-9-se2-p21/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
       -e 'ge-proton11-9-se2-p20/0009-mfmediaengine-retain-render-clock-frame-demand.patch' "$PATCH_SERIES"; then
     A320_SERIES=1
@@ -348,6 +383,40 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
     python3 "$ROOT_DIR/tests/network-terminal-error/test_seek_failure.py" --wine-tree "$WINE_TREE" >/dev/null
     fact a320_seek_frame_source_contracts passed
   fi
+  if grep -q '^ge-proton11-12-se4-p1/' "$PATCH_SERIES"; then
+    SE4_NETWORK_CONTRACT=1
+  fi
+  # SE4-P2 (2026-11-10): the same network contract for the SE4-P2 patch directory (SE4-P1 + 0043).
+  if grep -q '^ge-proton11-12-se4-p2/' "$PATCH_SERIES"; then
+    SE4_NETWORK_CONTRACT=1
+  fi
+  # SE4-P3 (2026-11-11): the same network contract for the SE4-P3 patch directory (SE4-P2 + 0044).
+  if grep -q '^ge-proton11-12-se4-p3/' "$PATCH_SERIES"; then
+    SE4_NETWORK_CONTRACT=1
+  fi
+  # SE4-P4 (2026-11-12): the same network contract for the SE4-P4 patch directory (Wine series = SE4-P3's).
+  if grep -q '^ge-proton11-12-se4-p4/' "$PATCH_SERIES"; then
+    SE4_NETWORK_CONTRACT=1
+  fi
+  # SE4-P6 (2026-11-14): the same network contract for the SE4-P6 patch directory (Wine series = SE4-P4's + 0046 + 0048).
+  if grep -q '^ge-proton11-12-se4-p6/' "$PATCH_SERIES"; then
+    SE4_NETWORK_CONTRACT=1
+  fi
+  if grep -Eq '(^|/)0046-mfmediaengine-never-call-the-application-with-the-engine-lock-held\.patch$' "$PATCH_SERIES"; then
+    ENGINE_LOCK_HELPERS=1
+  fi
+  if grep -Eq '(^|/)0048-mf-never-hold-the-audio-renderer-lock-across-audio-driver-calls\.patch$' "$PATCH_SERIES"; then
+    SAR_UNLOCKED_DRIVER=1
+  fi
+  # The tests/*/audit.py scripts derive the same switch from the tree (0046's helper definitions in main.c);
+  # the two must agree, so that the series flag and the tree detection can never diverge.
+  engine_helpers_in_tree=0
+  if grep -Fq 'static void media_engine_lock_common(' "$WINE_TREE/dlls/mfmediaengine/main.c" \
+      && grep -Fq 'static void media_engine_deliver_event(' "$WINE_TREE/dlls/mfmediaengine/main.c"; then
+    engine_helpers_in_tree=1
+  fi
+  [[ "$engine_helpers_in_tree" == "$ENGINE_LOCK_HELPERS" ]] \
+    || fail "the series (0046 declared: $ENGINE_LOCK_HELPERS) and the prepared mfmediaengine source (lock helpers present: $engine_helpers_in_tree) disagree"
   if rg -q '^ge-proton11-6-a32[12]/0005-winedmo-stream-progressive-http-vod\.patch$' "$PATCH_SERIES"; then
     python3 "$ROOT_DIR/tests/progressive-http-vod/test_http_user_agent.py" --wine-tree "$WINE_TREE" >/dev/null
     fact a321_http_user_agent_source_contract passed
@@ -471,8 +540,21 @@ bool_fact deferred_duplicate_seek_collapse \
   "$WINE_TREE/dlls/mfmediaengine/main.c"
 bool_fact demux_stream_index_mapping 'media_source_find_stream' \
   "$WINE_TREE/dlls/winedmo/media_source.c"
+if [[ "$SE4_NETWORK_CONTRACT" == 1 ]]; then
+  # SE4-P1: every HTTP(S)/HLS URL goes straight to the direct FFmpeg open; the
+  # URLMon fallback is gone, so HLS bypasses URLMon when none of its markers remain.
+  if has_pattern 'FAILED\(hr = media_source_create\(context, \(IMFMediaSource \*\*\)&object\)\)' \
+        "$WINE_TREE/dlls/winedmo/media_source.c" \
+      && ! has_pattern 'URLOpenBlockingStreamW|cache_http_url|urlmon|media-route=urlmon-cache-fallback' \
+        "$WINE_TREE/dlls/winedmo/media_source.c"; then
+    fact hls_urlmon_bypass yes
+  else
+    fact hls_urlmon_bypass no
+  fi
+else
 bool_fact hls_urlmon_bypass '!is_http_hls_url\(context->url\)' \
   "$WINE_TREE/dlls/winedmo/media_source.c"
+fi
 bool_fact case_insensitive_hls_classification 'strncasecmp.*[.]m3u8' \
   "$WINE_TREE/dlls/winedmo/unix_demuxer.c"
 bool_fact hardened_custom_seek_origin 'whence &= ~AVSEEK_FORCE' \
@@ -507,7 +589,7 @@ if python3 - "$WINE_TREE/dlls/winedmo/media_source.c" \
     "$REQUIRE_A311_SERIES" \
     "$REQUIRE_A312_SERIES" \
     "$RTSP_DRAIN_SERIES" "$A320_SERIES" "$IMMEDIATE_SEEK_SERIES" "$HLS_PROBE_SERIES" \
-    "$LIVE_BUFFER_SERIES" "$EOS_DRAIN_SERIES" <<'PY'
+    "$LIVE_BUFFER_SERIES" "$EOS_DRAIN_SERIES" "$SE4_NETWORK_CONTRACT" "$ENGINE_LOCK_HELPERS" <<'PY'
 from pathlib import Path
 import sys
 
@@ -524,6 +606,8 @@ immediate_seek = sys.argv[12] == "1"
 hls_probe = sys.argv[13] == "1"
 live_buffer = sys.argv[14] == "1"
 eos_drain = sys.argv[15] == "1"
+se4_network = sys.argv[16] == "1"
+engine_lock_helpers = sys.argv[17] == "1"
 
 def region(text, start, end):
     begin = text.index(start)
@@ -534,11 +618,44 @@ def require_order(body, *needles):
     positions = [body.index(needle) for needle in needles]
     assert positions == sorted(positions)
 
+def require_order_alt(body, *needles):
+    # A needle may be a tuple of alternatives; its position is the earliest occurrence of any of them
+    # (body.index's first-occurrence semantics). Used only with engine_lock_helpers.
+    positions = []
+    for needle in needles:
+        alts = (needle,) if isinstance(needle, str) else needle
+        found = [body.index(alt) for alt in alts if alt in body]
+        assert found, alts
+        positions.append(min(found))
+    assert positions == sorted(positions)
+
+# 0046 acquire/release spellings accepted with engine_lock_helpers (see the helper proofs below).
+LOCK_ACQ = ("EnterCriticalSection(&engine->cs)", "media_engine_lock_wq(engine,", "media_engine_lock(engine,")
+LOCK_REL = ("LeaveCriticalSection(&engine->cs)", "media_engine_unlock(engine)")
+if engine_lock_helpers:
+    # The helpers are what they claim: the acquire helpers enter the engine CS through media_engine_lock_common,
+    # media_engine_unlock leaves it, and drop/retake are built on them.
+    lock_common = region(engine, "static void media_engine_lock_common(", "static void media_engine_lock(")
+    # (TryEnterCriticalSection alone is not an acquire: it contains the same text.)
+    assert "EnterCriticalSection(&engine->cs)" in lock_common.replace("TryEnterCriticalSection", "")
+    lock_app = region(engine, "static void media_engine_lock(", "static void media_engine_lock_wq(")
+    assert "media_engine_lock_common(engine, site" in lock_app
+    lock_wq = region(engine, "static void media_engine_lock_wq(", "static void media_engine_check_app_call(")
+    assert "media_engine_lock_common(engine, site" in lock_wq
+    unlock_body = region(engine, "static void media_engine_unlock(", "static BOOL media_engine_drop_lock(")
+    assert "LeaveCriticalSection(&engine->cs)" in unlock_body
+    drop_lock = region(engine, "static BOOL media_engine_drop_lock(", "static void media_engine_retake_lock(")
+    assert "lock_depth != 1" in drop_lock and "media_engine_unlock(engine)" in drop_lock
+    retake_lock = region(engine, "static void media_engine_retake_lock(", "/* Raises a notification")
+    assert "media_engine_lock_common(engine, site" in retake_lock
+
 begin = region(source, "static HRESULT WINAPI scheme_handler_BeginCreateObject",\
         "static HRESULT WINAPI scheme_handler_EndCreateObject")
 callback = region(source, "static HRESULT WINAPI scheme_handler_callback_Invoke",\
         "static const IMFAsyncCallbackVtbl scheme_handler_callback_vtbl")
-cache_http = region(source, "static HRESULT cache_http_url",\
+# SE4-P1 removes the URLMon cache fallback (cache_http_url) and media_source.c's
+# own HLS classifier; their SE3-era assertions below are replaced, not weakened.
+cache_http = None if se4_network else region(source, "static HRESULT cache_http_url",\
         "static HRESULT WINAPI scheme_handler_callback_Invoke")
 queues = region(source, "static BOOL media_source_stream_queues_full",\
         "/* ========================================================================\n * source_async_command")
@@ -615,7 +732,7 @@ session_source_state = region(session, "static void session_set_source_object_st
         "static void session_set_sink_stream_state")
 session_request = region(session, "static void session_request_sample(struct media_session *session, IMFStreamSink *sink_stream)\n{",\
         "static void session_deliver_sample")
-hls_wide = region(source, "static BOOL is_http_hls_url",\
+hls_wide = None if se4_network else region(source, "static BOOL is_http_hls_url",\
         "static HRESULT WINAPI scheme_handler_callback_Invoke")
 hls_unix = region(demux, "static BOOL is_http_hls_url",\
         "enum direct_network_url")
@@ -623,14 +740,21 @@ hls_unix = region(demux, "static BOOL is_http_hls_url",\
 assert "URLOpenBlockingStreamW" not in begin
 assert "CreateStreamOnHGlobal" in begin
 assert "IMFByteStream_Release(bytestream)" in begin
-assert cache_http.count("URLOpenBlockingStreamW") == 1
-assert "cache_http_url(context)" in callback
+if se4_network:
+    for gone in ("cache_http_url", "URLOpenBlockingStreamW", "urlmon", "media-route=urlmon-cache-fallback",
+                 "is_http_hls_url", "get_http_bytestream_url_hint"):
+        assert gone not in source, gone
+    assert callback.count("media_source_create(context") == 1
+else:
+    assert cache_http.count("URLOpenBlockingStreamW") == 1
+    assert "cache_http_url(context)" in callback
 assert "MFASYNC_CALLBACK_QUEUE_IO" in source
-assert "IMFByteStream_GetLength" in cache_http
-assert "IMFByteStream_GetCurrentPosition" in cache_http
-assert "context->file_size = file_size" in cache_http
-assert "context->stream_offset = stream_offset" in cache_http
-assert "!is_http_hls_url(context->url)" in callback
+if not se4_network:
+    assert "IMFByteStream_GetLength" in cache_http
+    assert "IMFByteStream_GetCurrentPosition" in cache_http
+    assert "context->file_size = file_size" in cache_http
+    assert "context->stream_offset = stream_offset" in cache_http
+    assert "!is_http_hls_url(context->url)" in callback
 assert "url && !tmp_url" in source
 assert "SIZE_MAX - header_size" in source
 require_order(read_callback, "IMFByteStream_EndRead", "SetEvent(cb->event)")
@@ -638,10 +762,15 @@ assert "IMFAsyncResult_AddRef" not in read_callback
 assert "IMFByteStream_BeginRead(stream, cb->buffer" in read_helper
 assert "memcpy(buffer, cb->buffer, cb->read_size)" in read_helper
 assert "HRESULT_FROM_WIN32(ERROR_TIMEOUT)" in read_helper
-assert "wcsnicmp" in hls_wide
 assert "strncasecmp" in hls_unix
-assert hls_wide.count(".m3u8") == hls_unix.count(".m3u8") == 1
-assert hls_wide.count("/hls_playlist/") == hls_unix.count("/hls_playlist/") == (0 if hls_probe else 1)
+if se4_network:
+    # The Windows-side classifier is gone with the URLMon fallback; the Unix one stays.
+    assert hls_unix.count(".m3u8") == 1
+    assert hls_unix.count("/hls_playlist/") == (0 if hls_probe else 1)
+else:
+    assert "wcsnicmp" in hls_wide
+    assert hls_wide.count(".m3u8") == hls_unix.count(".m3u8") == 1
+    assert hls_wide.count("/hls_playlist/") == hls_unix.count("/hls_playlist/") == (0 if hls_probe else 1)
 assert "queued_packets += stream->queued_packets" in queues
 assert "queued_bytes += stream->queued_bytes" in queues
 assert "queued_packets >= MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS" in queues
@@ -742,11 +871,18 @@ assert "MEDIA_ENGINE_LOAD_EXTENSION" in load_end
 assert "IMFMediaEngineExtension_EndCreateObject" in load_end
 assert "IMFSourceResolver_EndCreateObjectFromURL" in load_end
 assert "IMFSourceResolver_EndCreateObjectFromByteStream" in load_end
-require_order(load_invoke, "media_engine_end_source_load(engine, context, result, &object)",
-        "generation = context->generation", "IUnknown_Release(state)",
-        "EnterCriticalSection(&engine->cs)",
-        "!media_engine_source_is_current(engine, generation)",
-        "media_engine_discard_source_object(object)")
+if engine_lock_helpers:
+    require_order_alt(load_invoke, "media_engine_end_source_load(engine, context, result, &object)",
+            "generation = context->generation", "IUnknown_Release(state)",
+            LOCK_ACQ,
+            "!media_engine_source_is_current(engine, generation)",
+            "media_engine_discard_source_object(object)")
+else:
+    require_order(load_invoke, "media_engine_end_source_load(engine, context, result, &object)",
+            "generation = context->generation", "IUnknown_Release(state)",
+            "EnterCriticalSection(&engine->cs)",
+            "!media_engine_source_is_current(engine, generation)",
+            "media_engine_discard_source_object(object)")
 assert load_invoke.count("media_engine_source_is_current(engine, generation)") >= 4
 require_order(load_invoke, "media_engine_create_topology(engine, source, generation)",
         "start_playback = engine->playback_requested",
@@ -762,13 +898,22 @@ assert engine.count("engine->playback_requested = FALSE") >= 2
 assert "media_source_find_stream(source, id, &source_index)" in source
 assert "media_source_find_stream(source, stream_idx, NULL)" in source
 if require_a39_series:
-    require_order(clear_presentation,
-            "IMFMediaSource *source = engine->presentation.source",
-            "engine->presentation.source = NULL",
-            "engine->presentation.pd = NULL",
-            "engine->presentation.frame_sink = NULL",
-            "LeaveCriticalSection(&engine->cs)",
-            "IMFMediaSource_Shutdown(source)", "IMFMediaSource_Release(source)")
+    if engine_lock_helpers:
+        require_order_alt(clear_presentation,
+                "IMFMediaSource *source = engine->presentation.source",
+                "engine->presentation.source = NULL",
+                "engine->presentation.pd = NULL",
+                "engine->presentation.frame_sink = NULL",
+                ("LeaveCriticalSection(&engine->cs)", "media_engine_drop_lock(engine"),
+                "IMFMediaSource_Shutdown(source)", "IMFMediaSource_Release(source)")
+    else:
+        require_order(clear_presentation,
+                "IMFMediaSource *source = engine->presentation.source",
+                "engine->presentation.source = NULL",
+                "engine->presentation.pd = NULL",
+                "engine->presentation.frame_sink = NULL",
+                "LeaveCriticalSection(&engine->cs)",
+                "IMFMediaSource_Shutdown(source)", "IMFMediaSource_Release(source)")
     assert "memset(&engine->presentation" not in clear_presentation
     assert "engine->presentation.start_position =" not in clear_presentation
     assert "engine->presentation.start_position.vt =" not in clear_presentation
@@ -777,12 +922,20 @@ else:
             "IMFMediaSource *source = engine->presentation.source",
             "memset(&engine->presentation", "LeaveCriticalSection(&engine->cs)",
             "IMFMediaSource_Shutdown(source)", "IMFMediaSource_Release(source)")
-require_order(free_engine, "EnterCriticalSection(&engine->cs)",
-        "shutdown_session = !(engine->flags & FLAGS_ENGINE_SHUT_DOWN)",
-        "media_engine_clear_presentation(engine)", "LeaveCriticalSection(&engine->cs)",
-        "if (shutdown_session && engine->session)",
-        "IMFMediaSession_Shutdown(engine->session)",
-        "IMFMediaSession_Release(engine->session)")
+if engine_lock_helpers:
+    require_order_alt(free_engine, LOCK_ACQ,
+            "shutdown_session = !(engine->flags & FLAGS_ENGINE_SHUT_DOWN)",
+            "media_engine_clear_presentation(engine)", LOCK_REL,
+            "if (shutdown_session && engine->session)",
+            "IMFMediaSession_Shutdown(engine->session)",
+            "IMFMediaSession_Release(engine->session)")
+else:
+    require_order(free_engine, "EnterCriticalSection(&engine->cs)",
+            "shutdown_session = !(engine->flags & FLAGS_ENGINE_SHUT_DOWN)",
+            "media_engine_clear_presentation(engine)", "LeaveCriticalSection(&engine->cs)",
+            "if (shutdown_session && engine->session)",
+            "IMFMediaSession_Shutdown(engine->session)",
+            "IMFMediaSession_Release(engine->session)")
 assert topology.count("media_engine_source_is_current(engine, generation)") >= 3
 require_order(topology_after_clear, "media_engine_clear_presentation(engine)",
         "if (!media_engine_source_is_current(engine, generation))",
@@ -793,9 +946,18 @@ if immediate_seek:
     assert "media_engine_set_current_time(engine, seektime)" in set_time_ex
     session_events = region(engine, "static HRESULT WINAPI media_engine_session_events_Invoke",
             "static const IMFAsyncCallbackVtbl media_engine_session_events_vtbl")
-    require_order(session_events, "double next_seek = engine->next_seek", "engine->current_seek = NAN",
-            "engine->next_seek = NAN", "if (isfinite(next_seek) &&",
-            "media_engine_set_current_time(engine, next_seek)")
+    if engine_lock_helpers:
+        # 0046 declares the variables first and reads the pending seek only after the notifications were
+        # flushed (a newer seek must not be replaced by an older request); the read, the clear and the
+        # consumption keep their order.
+        require_order_alt(session_events, ("double next_seek = engine->next_seek", "next_seek = engine->next_seek"),
+                "engine->current_seek = NAN",
+                "engine->next_seek = NAN", "if (isfinite(next_seek) &&",
+                "media_engine_set_current_time(engine, next_seek)")
+    else:
+        require_order(session_events, "double next_seek = engine->next_seek", "engine->current_seek = NAN",
+                "engine->next_seek = NAN", "if (isfinite(next_seek) &&",
+                "media_engine_set_current_time(engine, next_seek)")
 else:
     assert "media_engine_defer_current_time(engine, seektime)" in set_time_ex
     assert "media_engine_set_current_time(engine, seektime)" not in set_time_ex
@@ -853,8 +1015,12 @@ require_order(session_source_state,
 shutdown_engine = region(engine, "static HRESULT WINAPI media_engine_Shutdown",\
         "static void set_rect")
 if immediate_seek:
-    require_order(shutdown_engine, "FLAGS_ENGINE_SHUT_DOWN, TRUE", "LeaveCriticalSection(&engine->cs)",
-            "IMFMediaSession_Shutdown(engine->session)")
+    if engine_lock_helpers:
+        require_order_alt(shutdown_engine, "FLAGS_ENGINE_SHUT_DOWN, TRUE", LOCK_REL,
+                "IMFMediaSession_Shutdown(engine->session)")
+    else:
+        require_order(shutdown_engine, "FLAGS_ENGINE_SHUT_DOWN, TRUE", "LeaveCriticalSection(&engine->cs)",
+                "IMFMediaSession_Shutdown(engine->session)")
     set_time = region(engine, "static HRESULT WINAPI media_engine_SetCurrentTime(",
             "static double WINAPI media_engine_GetStartTime")
     assert "media_engine_set_current_time(engine, time)" in set_time
@@ -933,11 +1099,12 @@ else
 fi
 fact audio_seek_timeline_preserved "$AUDIO_SEEK_TIMELINE"
 
-if python3 - "$WINE_TREE/dlls/mf/sar.c" <<'PY'
+if python3 - "$WINE_TREE/dlls/mf/sar.c" "$SAR_UNLOCKED_DRIVER" <<'PY'
 from pathlib import Path
 import sys
 
 sar = Path(sys.argv[1]).read_text()
+sar_unlocked_driver = sys.argv[2] == "1"
 
 def region(text, start, end):
     begin = text.index(start)
@@ -963,8 +1130,16 @@ assert "renderer->flags |= SAR_AUDIO_START_PENDING" in start_client
 assert "renderer->flags &= ~SAR_AUDIO_START_PENDING" in start_client
 assert "renderer->flags & SAR_AUDIO_START_PENDING" in clock_start
 assert "renderer->flags & SAR_AUDIO_START_PENDING" in clock_restart
-require_order(flush, "IAudioClient_Stop", "IAudioClient_Reset",\
-        "audio_renderer_start_audio_client")
+if sar_unlocked_driver:
+    # 0048 moves the driver calls into audio_renderer_stop_reset(); prove that the helper does the raw calls,
+    # Stop before Reset, and that Flush runs it before restarting the client.
+    stop_reset = region(sar, "static BOOL audio_renderer_stop_reset(",
+            "static HRESULT WINAPI audio_renderer_clock_sink_QueryInterface")
+    require_order(stop_reset, "IAudioClient_Stop", "IAudioClient_Reset")
+    require_order(flush, "audio_renderer_stop_reset(", "audio_renderer_start_audio_client")
+else:
+    require_order(flush, "IAudioClient_Stop", "IAudioClient_Reset",\
+            "audio_renderer_start_audio_client")
 assert "renderer->flags |= SAR_AUDIO_START_PENDING" in flush
 PY
 then
@@ -1091,9 +1266,21 @@ if [[ "$REQUIRE_ALPHA_SERIES" == 1 ]]; then
   require_alpha_pattern 'cb->status = IMFByteStream_EndRead' \
     "late asynchronous byte-stream completion is not owned safely" \
     "$WINE_TREE/dlls/winedmo/media_source.c"
+  if [[ "$SE4_NETWORK_CONTRACT" == 1 ]]; then
+    # SE4-P1: HTTP(S) and HLS go straight to the direct FFmpeg open; no URLMon fallback exists.
+    require_alpha_pattern 'FAILED\(hr = media_source_create\(context, \(IMFMediaSource \*\*\)&object\)\)' \
+      "scheme callback does not create the media source directly" \
+      "$WINE_TREE/dlls/winedmo/media_source.c"
+    for forbidden in URLOpenBlockingStreamW cache_http_url urlmon media-route=urlmon-cache-fallback; do
+      if grep -Fq -e "$forbidden" "$WINE_TREE/dlls/winedmo/media_source.c"; then
+        fail "SE4-P1 network contract: media_source.c still contains the URLMon fallback marker $forbidden"
+      fi
+    done
+  else
   require_alpha_pattern '!is_http_hls_url\(context->url\)' \
     "direct HLS still takes the redundant URLMon path" \
     "$WINE_TREE/dlls/winedmo/media_source.c"
+  fi
   require_alpha_pattern 'source_generation' \
     "MediaEngine source-load generation tracking is absent" \
     "$WINE_TREE/dlls/mfmediaengine/main.c"
@@ -1118,8 +1305,10 @@ if [[ "$REQUIRE_ALPHA_SERIES" == 1 ]]; then
     || fail "asynchronous HTTP open and VOD seek regression repairs are incomplete"
   [[ "$AUDIO_SEEK_TIMELINE" == yes ]] \
     || fail "decoder flush resets the established audio presentation timeline"
+  # shellcheck disable=SC2046 # the optional flag must vanish when unset
   python3 "$ROOT_DIR/tests/progressive-http-vod/audit.py" \
-    --wine-tree "$WINE_TREE" >/dev/null \
+    --wine-tree "$WINE_TREE" \
+    $([[ "$SE4_NETWORK_CONTRACT" == 1 ]] && printf '%s' --se4-network-contract) >/dev/null \
     || fail "progressive direct-HTTP source contract is incomplete"
   fact progressive_http_vod_audit passed
   python3 "$ROOT_DIR/tests/vod-control/test_model.py" >/dev/null \

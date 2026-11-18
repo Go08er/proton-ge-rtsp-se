@@ -1,0 +1,66 @@
+# SE4-P4 = SE4-P3 (below, byte-identical, 34 patches). Wine series identical to SE4-P3; SE4-P4 adds the FFmpeg companion E6, see the pin
+# (patches/proposed/ffmpeg-hls-announce-changed-init-codec-config.patch, libavformat/hls.c only).
+# --- SE4-P3 series header, unchanged:
+# SE4-P3 = SE4-P2 (below, byte-identical, 33 patches) plus one new patch, 0044 (winedmo's live-HLS timestamp
+# clamp froze video through a Twitch stitched ad): a backward timestamp step at a discontinuity is now
+# continued on the same timeline instead of being clamped. Touches only dlls/winedmo/unix_demuxer.c.
+# Same base and rules as SE4-P2: apply strictly after GE ge-video-rework, to the GE-Proton11-12 pre-series
+# Wine tree (cd3186c1); every patch applies at zero offset and zero fuzz.
+# --- SE4-P2 series header, unchanged:
+# SE4-P2 = SE4-P1 (below, byte-identical, 32 patches) plus one new patch, 0043 (finding F1 of the SE4-P1
+# install review): a presentation descriptor created before the first Start, or after Stop, selected no
+# stream, because GE-Proton11-12's base filters the descriptor's selection on 'active' and 0002 keeps
+# streams inactive until Start. 0043 reports the selection from its own per-stream field instead.
+# Same base and rules as SE4-P1: apply strictly after GE ge-video-rework, to the GE-Proton11-12 pre-series
+# Wine tree (cd3186c1); every patch applies at zero offset and zero fuzz.
+# --- SE4-P1 series header, unchanged:
+# SE4-P1 = the SE3 Wine series (34 patches) rebased onto GE-Proton11-12 (32 patches), with the
+# maintainer-approved SE4-P1 policy decisions (SE3-P2-DEV.md, 2026-11-08).
+# Apply strictly after GE ge-video-rework, to the GE-Proton11-12 pre-series Wine tree; every patch
+# applies at zero offset and zero fuzz. SE3 file numbering is kept.
+# Dropped: 0012 (identical to GE's post-series hotfix winewayland-advertise-openvr-openxr-device-extensions)
+# and 0040 (HLS segment retry spacing and seg_max_retry).
+# Modified ([SE4-P1] in the subject): 0001/0002 (GE's protocol list for every HTTP/HLS open, URLMon
+# fallback removed, IS_LIVE = network source without a duration), 0008 (WAITING/PLAYING on rebuffer only
+# for a source that is not live), 0024 (403 retry without the fallback's variable), 0026/0027 (reduced to
+# what GE 0103/0100 lack), 0032 (no forced reconnect for HLS segment, key and playlist requests).
+# Refreshed context only: 0003 0004 0005 0006 0021 0022 0023 0028 0031 0033 0034 0035 0041; the other
+# twelve are byte-identical copies of patches/ge-proton11-11-se3-p9/.
+# 0025 is kept over GE's post-series hotfix rtworkq-dont-hold-queues-section-during-system-queue-shutdown,
+# which the build tooling must skip.
+# The AAC parser change is outside this series: the pinned FFmpeg build module
+# patches/proposed/ffmpeg-enable-aac-parser.patch (--enable-parser=aac in Makefile.in), bound in the pin.
+ge-proton11-12-se4-p4/0001-winedmo-retain-bounded-network-and-origin-contract.patch
+ge-proton11-12-se4-p4/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch
+ge-proton11-12-se4-p4/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch
+ge-proton11-12-se4-p4/0004-winedmo-retain-codec-admission-and-format-validation.patch
+ge-proton11-12-se4-p4/0005-mfreadwrite-retain-reader-error-layout-and-origin-contract.patch
+ge-proton11-12-se4-p4/0006-mf-retain-session-lifecycle-and-demand-accounting.patch
+ge-proton11-12-se4-p4/0007-mf-retain-sar-flush-demand-and-marker-ownership.patch
+ge-proton11-12-se4-p4/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch
+ge-proton11-12-se4-p4/0009-mfmediaengine-retain-render-clock-frame-demand.patch
+ge-proton11-12-se4-p4/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch
+ge-proton11-12-se4-p4/0011-mfplat-retain-failed-async-result-status.patch
+ge-proton11-12-se4-p4/0013-mf-tests-retain-held-marker-context.patch
+ge-proton11-12-se4-p4/0021-mf-stop-clock-after-terminal-start-error.patch
+ge-proton11-12-se4-p4/0022-winedmo-defer-read-ahead-data-errors.patch
+ge-proton11-12-se4-p4/0023-winedmo-interrupt-stalled-read-on-seek.patch
+ge-proton11-12-se4-p4/0024-winedmo-adopt-ge-http-reconnect.patch
+ge-proton11-12-se4-p4/0025-rtworkq-shut-down-system-queues-without-holding-the-lock.patch
+ge-proton11-12-se4-p4/0026-winedmo-let-wm-reader-seek-read-while-flushing.patch
+ge-proton11-12-se4-p4/0027-winedmo-serialise-quartz-parser-seeks-and-rewind-on-restart.patch
+ge-proton11-12-se4-p4/0028-winedmo-activate-selected-streams-before-start.patch
+ge-proton11-12-se4-p4/0029-winedmo-default-raw-flac-bits-per-sample.patch
+ge-proton11-12-se4-p4/0030-winedmo-map-mpeg4-and-msmpeg4-fourcc-aliases.patch
+ge-proton11-12-se4-p4/0031-mfmediaengine-report-unplayable-topology-as-src-not-supported.patch
+ge-proton11-12-se4-p4/0032-winedmo-reconnect-every-direct-http-source-and-retry-5xx-at-open.patch
+ge-proton11-12-se4-p4/0033-winedmo-report-live-rtsp-end-as-network-error.patch
+ge-proton11-12-se4-p4/0034-winedmo-timestamp-multipart-mjpeg-by-arrival.patch
+ge-proton11-12-se4-p4/0035-winedmo-probe-audio-streams-missing-format.patch
+ge-proton11-12-se4-p4/0036-qasf-flush-every-stream-when-seeking.patch
+ge-proton11-12-se4-p4/0037-wmvcore-pace-async-delivery-from-the-start-position.patch
+ge-proton11-12-se4-p4/0038-mfplat-close-the-category-key-after-enumerating-transforms.patch
+ge-proton11-12-se4-p4/0041-winedmo-give-up-on-a-silent-http-server-sooner.patch
+ge-proton11-12-se4-p4/0042-winedmo-ignore-empty-input-samples.patch
+ge-proton11-12-se4-p4/0043-winedmo-decouple-the-descriptor-selection-from-active-streams.patch
+ge-proton11-12-se4-p4/0044-winedmo-continue-live-hls-timeline-across-discontinuities.patch

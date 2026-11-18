@@ -141,13 +141,17 @@ for output in "$GENERATED_DRIVER" "$PATCH_LOG" "$PATCH_AUDIT" \
 done
 
 python3 - "$SOURCE_DIR/patches/protonprep-valve-staging.sh" \
-  "$GENERATED_DRIVER" "$PINNED_GE_HAS_PATCH_OVERLAP" <<'PY'
+  "$GENERATED_DRIVER" "$PINNED_GE_HAS_PATCH_OVERLAP" \
+  "${PIN_GE_SKIP_PATCHES:-}" <<'PY'
 from pathlib import Path
+import hashlib
+import re
 import sys
 
 source = Path(sys.argv[1])
 output = Path(sys.argv[2])
 has_patch_overlap = sys.argv[3] == "1"
+skip_patches = sys.argv[4]
 text = source.read_text()
 
 if output.is_symlink():
@@ -158,6 +162,94 @@ if output.exists():
 if not text.startswith("#!/bin/bash\n"):
     raise SystemExit("unexpected GE patch-driver interpreter line")
 text = text.replace("#!/bin/bash\n", "#!/usr/bin/env bash\nset -euo pipefail\n", 1)
+
+# Optional pinned deviation: omit named GE patch applications. Each patch file
+# must have the pinned digest. Two exact forms are supported, so a changed
+# driver or patch fails instead of drifting:
+#  - line form: the application occurs exactly once as a whole driver line
+#    (`apply_patch "../<path>"`); the line is replaced by a visible log line;
+#  - dir-member form: the patch is a direct member of a directory that the
+#    driver applies exactly once through `apply_all_in_dir "../<dir>/"`; the
+#    copied `apply_all_in_dir` function (exact GE text required) skips exactly
+#    the listed members, logging the same visible line, and logs every other
+#    member it applies. The call site and GE's own scripts stay untouched.
+# The skip log line text is the one the build re-checks.
+ge_apply_all_in_dir = (
+    'apply_all_in_dir() {\n'
+    '    local dir="$1"\n'
+    '    for patch in "$dir"/*.patch; do\n'
+    '        apply_patch "$patch"\n'
+    '    done\n'
+    '}\n')
+dir_skips = []
+if skip_patches:
+    source_root = source.parent.parent
+    for entry in skip_patches.split(","):
+        match = re.fullmatch(r"(patches/[A-Za-z0-9._+/-]+\.patch):([0-9a-f]{64})", entry)
+        if match is None:
+            raise SystemExit("malformed GE skipped-patch entry")
+        skip_path, skip_sha256 = match.groups()
+        skip_file = source_root / skip_path
+        if skip_file.is_symlink() or not skip_file.is_file():
+            raise SystemExit("skipped GE patch is absent or unsafe: " + skip_path)
+        if hashlib.sha256(skip_file.read_bytes()).hexdigest() != skip_sha256:
+            raise SystemExit("skipped GE patch digest differs from the pin: " + skip_path)
+        skip_apply = re.compile(
+            r'^([ \t]*)apply_patch "\.\./' + re.escape(skip_path) + r'"[ \t]*$',
+            re.MULTILINE)
+        skip_dir = skip_path.rsplit("/", 1)[0]
+        if len(skip_apply.findall(text)) == 0:
+            # Dir-member form: exactly one whole-line application of the directory.
+            dir_call = re.compile(
+                r'^[ \t]*apply_all_in_dir "\.\./' + re.escape(skip_dir) + r'/"[ \t]*$',
+                re.MULTILINE)
+            wholesale = re.findall(r'apply_all_in_dir\s+"[^"]*' + re.escape(skip_dir) + r'/?"', text)
+            if (len(dir_call.findall(text)) != 1 or len(wholesale) != 1
+                    or text.count("../" + skip_dir + "/") != 1):
+                raise SystemExit("expected exactly one GE driver application of skipped patch: " + skip_path)
+            if text.count(skip_path) != 0 or (source_root / skip_dir).is_symlink() \
+                    or not (source_root / skip_dir).is_dir():
+                raise SystemExit("skipped GE patch is referenced elsewhere in the driver: " + skip_path)
+            if skip_file.parent != source_root / skip_dir:
+                raise SystemExit("skipped GE patch is not a direct member of its directory: " + skip_path)
+            dir_skips.append((skip_path, skip_dir))
+            continue
+        if len(skip_apply.findall(text)) != 1:
+            raise SystemExit("expected exactly one GE driver application of skipped patch: " + skip_path)
+        if text.count(skip_path) != 1:
+            raise SystemExit("skipped GE patch is referenced elsewhere in the driver: " + skip_path)
+        if re.search(r'apply_all_in_dir\s+"[^"]*' + re.escape(skip_dir) + r'/?"', text):
+            raise SystemExit("skipped GE patch directory is also applied wholesale: " + skip_path)
+        text = skip_apply.sub(
+            lambda m: m.group(1) + 'echo "WINE: -RTSP- skipping GE patch (pinned deviation): '
+            + skip_path + '"', text, count=1)
+    if dir_skips:
+        if text.count(ge_apply_all_in_dir) != 1 or text.count("apply_all_in_dir() {") != 1:
+            raise SystemExit("GE apply_all_in_dir definition differs from the expected text")
+        cases = ""
+        for skip_path, skip_dir in dir_skips:
+            cases += (
+                '            "../' + skip_dir + '//' + skip_path.rsplit("/", 1)[1] + '")\n'
+                '                echo "WINE: -RTSP- skipping GE patch (pinned deviation): '
+                + skip_path + '"\n'
+                '                continue\n'
+                '                ;;\n')
+        for skip_dir in sorted({d for _, d in dir_skips}):
+            cases += (
+                '            "../' + skip_dir + '//"*)\n'
+                '                echo "WINE: -RTSP- applying GE patch (skip-aware directory): '
+                + skip_dir + '/${patch##*/}"\n'
+                '                ;;\n')
+        skip_aware = (
+            'apply_all_in_dir() {\n'
+            '    local dir="$1"\n'
+            '    for patch in "$dir"/*.patch; do\n'
+            '        case "$patch" in\n' + cases +
+            '        esac\n'
+            '        apply_patch "$patch"\n'
+            '    done\n'
+            '}\n')
+        text = text.replace(ge_apply_all_in_dir, skip_aware, 1)
 
 patch_call = "patch -Np1 <"
 if text.count(patch_call) != 2:
@@ -472,6 +564,7 @@ source_realpath="$(cd "$SOURCE_DIR" && pwd -P)"
   printf 'package_release\t%s\n' "$PIN_PACKAGE_RELEASE"
   printf 'upstream_patch_driver_sha256\t%s\n' "$PIN_PATCH_DRIVER_SHA256"
   printf 'generated_patch_driver_sha256\t%s\n' "$generated_driver_sha256"
+  pinned_ge_ge_skip_records "$GENERATED_DRIVER"
   printf 'patch_series_digest\t%s\n' "$series_digest"
   printf 'proton_launcher_patch\t%s\n' \
     "$(pinned_ge_launcher_patch_record)"

@@ -41,6 +41,32 @@ def require_order(body: str, *needles: str) -> None:
         fail(str(exc))
 
 
+def engine_lock_helpers(engine: str) -> bool:
+    # SE4-P6 (2026-11-14): 0046 puts the engine lock behind helpers and delivers notifications outside it. Detected
+    # from the tree (the helper definitions), as audit-patched-wine.sh does from the series; the two must agree.
+    return ("static void media_engine_lock_common(" in engine
+            and "static void media_engine_deliver_event(" in engine)
+
+
+def require_engine_notifications_outside_lock(engine: str, accepted_error: str) -> None:
+    # SE4-P6 (0046). The old check asserted that the application was notified before the engine lock was released,
+    # i.e. with it held, which is the design 0046 removes. The property it protects is that an accepted error
+    # records its state and raises ERROR atomically with respect to other engine calls: with 0046 the ERROR is
+    # raised (queued) in the locked section, after the state is recorded and before the release, and is delivered
+    # by media_engine_unlock() through the single delivery function, outside the lock.
+    require_order(accepted_error, "media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_ERROR",
+                  "media_engine_unlock(engine);")
+    # One delivery path: the only call of the application callback is inside media_engine_deliver_event().
+    if engine.count("IMFMediaEngineNotify_EventNotify") != 1:
+        fail("the application notification is called outside the one delivery function")
+    deliver = region(engine, "static void media_engine_deliver_event(", "\n}\n")
+    require(deliver, "IMFMediaEngineNotify_EventNotify(engine->callback,",
+            "the one application notification call is not in media_engine_deliver_event")
+    # media_engine_unlock() reaches the delivery: it takes the events and delivers them.
+    unlock = region(engine, "static void media_engine_unlock(", "static BOOL media_engine_drop_lock(")
+    require_order(unlock, "media_engine_take_events(", "media_engine_deliver_event(")
+
+
 def read(root: Path, relative: str) -> str:
     path = root / relative
     if not path.is_file():
@@ -375,11 +401,14 @@ def main() -> None:
         "engine->error_code = error_code;",
         "PropVariantClear(&source);",
     )
-    require_order(
-        accepted_error,
-        "MFMediaEngineNotify_EventNotify",
-        "LeaveCriticalSection(&engine->cs);",
-    )
+    if engine_lock_helpers(engine):
+        require_engine_notifications_outside_lock(engine, accepted_error)
+    else:
+        require_order(
+            accepted_error,
+            "MFMediaEngineNotify_EventNotify",
+            "LeaveCriticalSection(&engine->cs);",
+        )
     forbid(
         error_case,
         "MF_MEDIA_ENGINE_EVENT_ENDED",

@@ -1,0 +1,181 @@
+Subject: [P20 review] mf retain sar flush demand and marker ownership
+
+Residual against GE-Proton11-9 after ge-video-rework.
+Source-reviewed only: not compiler or runtime qualification.
+Prior P19b2 patch ownership (some behavior is now upstream):
+  ge-proton11-6/0009-mf-sar-preserve-running-state-across-flush.patch
+  ge-proton11-7-se2-p19b/0043-mf-rearm-audio-sample-demand-after-flush.patch
+  proposed/0044-mf-initialize-sar-marker-entry-before-copy.patch
+
+---
+diff --git a/dlls/mf/sar.c b/dlls/mf/sar.c
+--- a/dlls/mf/sar.c
++++ b/dlls/mf/sar.c
+@@ -38,6 +38,8 @@
+     SAR_SEEKING = 0x8,
+     SAR_REPORT_SEEK_TIME = 0x10,
+     SAR_ADDING_SILENCE = 0x20,
++    SAR_AUDIO_START_PENDING = 0x40,
++    SAR_END_OF_SEGMENT_RECEIVED = 0x80,
+ };
+ 
+ enum queued_object_type
+@@ -632,6 +634,23 @@
+     audio_renderer_events_QueueEvent,
+ };
+ 
++static HRESULT audio_renderer_start_audio_client(struct audio_renderer *renderer)
++{
++    HRESULT hr = S_OK;
++
++    if (renderer->rate != 0.0f)
++    {
++        if (FAILED(hr = IAudioClient_Start(renderer->audio_client)))
++            renderer->flags |= SAR_AUDIO_START_PENDING;
++        else
++            renderer->flags &= ~SAR_AUDIO_START_PENDING;
++    }
++    else
++        renderer->flags &= ~SAR_AUDIO_START_PENDING;
++
++    return hr;
++}
++
+ static HRESULT WINAPI audio_renderer_clock_sink_QueryInterface(IMFClockStateSink *iface, REFIID riid, void **obj)
+ {
+     struct audio_renderer *renderer = impl_from_IMFClockStateSink(iface);
+@@ -665,9 +684,10 @@
+             renderer->seek_pts = offset;
+             renderer->flags |= (SAR_SEEKING | SAR_REPORT_SEEK_TIME);
+         }
+-        if (renderer->clock_state != MFCLOCK_STATE_RUNNING)
++        if (renderer->clock_state != MFCLOCK_STATE_RUNNING
++                || (renderer->flags & SAR_AUDIO_START_PENDING))
+         {
+-            if (renderer->rate != 0.0f && FAILED(hr = IAudioClient_Start(renderer->audio_client)))
++            if (FAILED(hr = audio_renderer_start_audio_client(renderer)))
+                 WARN("Failed to start audio client, hr %#lx.\n", hr);
+             renderer->clock_state = MFCLOCK_STATE_RUNNING;
+         }
+@@ -699,6 +719,7 @@
+         {
+             if (SUCCEEDED(hr = IAudioClient_Stop(renderer->audio_client)))
+             {
++                renderer->flags &= ~SAR_AUDIO_START_PENDING;
+                 if (SUCCEEDED(hr = IAudioClient_Reset(renderer->audio_client)))
+                 {
+                     renderer->position = 0;
+@@ -735,9 +756,14 @@
+         if (renderer->audio_client)
+         {
+             if (FAILED(hr = IAudioClient_Stop(renderer->audio_client)))
++            {
+                 WARN("Failed to stop audio client, hr %#lx.\n", hr);
++            }
+             else
++            {
++                renderer->flags &= ~SAR_AUDIO_START_PENDING;
+                 hr = S_OK;
++            }
+             renderer->clock_state = MFCLOCK_STATE_PAUSED;
+         }
+         else
+@@ -763,9 +789,10 @@
+     EnterCriticalSection(&renderer->cs);
+     if (renderer->audio_client)
+     {
+-        if ((preroll = (renderer->clock_state != MFCLOCK_STATE_RUNNING)))
++        preroll = renderer->clock_state != MFCLOCK_STATE_RUNNING;
++        if (preroll || (renderer->flags & SAR_AUDIO_START_PENDING))
+         {
+-            if (renderer->rate != 0.0f && FAILED(hr = IAudioClient_Start(renderer->audio_client)))
++            if (FAILED(hr = audio_renderer_start_audio_client(renderer)))
+                 WARN("Failed to start audio client, hr %#lx.\n", hr);
+             renderer->clock_state = MFCLOCK_STATE_RUNNING;
+         }
+@@ -1585,7 +1612,7 @@
+     {
+         if (renderer->clock_state == MFCLOCK_STATE_RUNNING)
+             hr = stream_queue_sample(renderer, sample);
+-        renderer->flags &= ~SAR_SAMPLE_REQUESTED;
++        renderer->flags &= ~(SAR_SAMPLE_REQUESTED | SAR_END_OF_SEGMENT_RECEIVED);
+ 
+         if (renderer->queued_frames < renderer->max_frames && renderer->clock_state == MFCLOCK_STATE_RUNNING)
+         {
+@@ -1609,6 +1636,7 @@
+     if (!(marker = calloc(1, sizeof(*marker))))
+         return E_OUTOFMEMORY;
+ 
++    list_init(&marker->entry);
+     marker->type = OBJECT_TYPE_MARKER;
+     marker->u.marker.type = marker_type;
+     PropVariantInit(&marker->u.marker.context);
+@@ -1635,7 +1663,11 @@
+     if (renderer->flags & SAR_SHUT_DOWN)
+         hr = MF_E_STREAMSINK_REMOVED;
+     else
++    {
+         hr = stream_place_marker(renderer, marker_type, context_value);
++        if (SUCCEEDED(hr) && marker_type == MFSTREAMSINK_MARKER_ENDOFSEGMENT)
++            renderer->flags |= SAR_END_OF_SEGMENT_RECEIVED;
++    }
+ 
+     LeaveCriticalSection(&renderer->cs);
+ 
+@@ -1646,7 +1678,8 @@
+ {
+     struct audio_renderer *renderer = impl_from_IMFStreamSink(iface);
+     struct queued_object *obj, *obj2;
+-    HRESULT hr = S_OK;
++    BOOL restart;
++    HRESULT hr = S_OK, restart_hr;
+ 
+     TRACE("%p.\n", iface);
+ 
+@@ -1664,16 +1697,42 @@
+             }
+             release_pending_object(obj);
+         }
++        /* A marker can fulfill the last request without ProcessSample.
++         * Rearm that demand once; preserve ordinary outstanding requests. */
++        if (renderer->flags & SAR_END_OF_SEGMENT_RECEIVED)
++            renderer->flags &= ~(SAR_SAMPLE_REQUESTED | SAR_END_OF_SEGMENT_RECEIVED);
+         renderer->queued_frames = 0;
+         if (renderer->audio_client)
+         {
+-            if (SUCCEEDED(hr = IAudioClient_Reset(renderer->audio_client)))
++            restart = renderer->clock_state == MFCLOCK_STATE_RUNNING && renderer->rate != 0.0f;
++            if (restart && FAILED(hr = IAudioClient_Stop(renderer->audio_client)))
+             {
+-                renderer->position = 0;
+-                renderer->pts = 0;
++                WARN("Failed to stop audio client for flush, hr %#lx.\n", hr);
+             }
+             else
+-                WARN("Failed to reset audio client, hr %#lx.\n", hr);
++            {
++                if (restart)
++                    renderer->flags |= SAR_AUDIO_START_PENDING;
++
++                if (SUCCEEDED(hr = IAudioClient_Reset(renderer->audio_client)))
++                {
++                    renderer->position = 0;
++                    renderer->pts = 0;
++                }
++                else
++                    WARN("Failed to reset audio client, hr %#lx.\n", hr);
++
++                if (restart)
++                {
++                    restart_hr = audio_renderer_start_audio_client(renderer);
++                    if (FAILED(restart_hr))
++                    {
++                        WARN("Failed to restart audio client after flush, hr %#lx.\n", restart_hr);
++                        if (SUCCEEDED(hr))
++                            hr = restart_hr;
++                    }
++                }
++            }
+         }
+     }
+     LeaveCriticalSection(&renderer->cs);

@@ -48,6 +48,27 @@ class P19bProfileTests(unittest.TestCase):
                                              else line for line in original) + '\n')
                     self.assertNotEqual(check(pin, self.series).returncode, 0, field)
 
+    def test_se4p4_init_config_companion_pair_rejected_when_changed_or_absent(self):
+        # SE4-P4 adds the HLS init-config companion (E6); the p19b pin above has none.
+        pin = ROOT / 'config/ge-proton11-12-se4-p4.env'
+        series = ROOT / 'patches/series-ge-proton11-12-se4-p4'
+        self.assertEqual(check(pin, series).returncode, 0)
+        original = pin.read_text().splitlines()
+        with tempfile.TemporaryDirectory(prefix='rtsp-se4p4-pin-') as directory:
+            scratch = Path(directory) / 'candidate.env'
+            for field in ('PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256',
+                          'PIN_FFMPEG_HLS_INIT_CONFIG_HLS_BLOB'):
+                for value in ('', '0' * (64 if field.endswith('SHA256') else 40)):
+                    scratch.write_text('\n'.join(field + '=' + value if line.startswith(field + '=')
+                                                 else line for line in original) + '\n')
+                    self.assertNotEqual(check(scratch, series).returncode, 0, field)
+            # the pair without the early-seek pair is invalid
+            for field in ('PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256',
+                          'PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB'):
+                scratch.write_text('\n'.join(line for line in original
+                                             if not line.startswith(field + '=')) + '\n')
+                self.assertNotEqual(check(scratch, series).returncode, 0, field)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

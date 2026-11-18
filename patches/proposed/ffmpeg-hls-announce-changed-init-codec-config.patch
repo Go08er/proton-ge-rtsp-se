@@ -1,0 +1,312 @@
+From: RTSP-on-GE development <noreply@localhost>
+Subject: [PATCH E6] avformat/hls: announce a changed init section's codec configuration
+
+A playlist may switch to a different Media Initialization Section
+(EXT-X-MAP) in the middle of a stream. This is what CMAF live streams
+with stitched advertisements do: the ad segments come with an init
+section whose avcC differs from the main content's, and their samples
+carry no in-band SPS/PPS.
+
+hls.c feeds every init section into the same sub-demuxer. The mov
+demuxer parses only the first moov and skips later ones as duplicates
+("Found duplicated MOOV Atom"), so the stream keeps the codec
+configuration of the first init section. A decoder that gets the packets
+of the other segments has no parameter sets for them and outputs no
+frames, while audio keeps playing.
+
+Scan every init section that is loaded for the avcC/hvcC of the first
+sample entry of each video track (moov/trak/mdia/minf/stbl/stsd). The
+first configuration seen for a track is the one the sub-demuxer has, and
+is only remembered. If a later init section carries a different one for
+the same track_ID, attach it to the next packet of that track as
+AV_PKT_DATA_NEW_EXTRADATA, once. Re-loading an init section with the
+same configuration, as happens after a seek or a playlist reload,
+announces nothing. A change is only announced if the sub-demuxer's
+stream has the same track_ID and a codec that matches the sample entry
+(H.264 for avc1/avc3, HEVC for hvc1/hev1). The h264_mp4toannexb
+bitstream filter and the H.264 and HEVC decoders already handle that
+side data.
+
+The box parser only accepts boxes whose size fits into their parent; a
+size of 0 or 1 ends the scan of that level. The codec configuration is
+searched only inside the sample entry's own size, and at most four
+tracks are tracked per playlist.
+
+Limitations: only the codec configuration is announced. If the time
+scale of the track differs as well, that is not corrected and only
+logged as a warning when the configuration is announced, since it would
+need the timestamps of the following packets to be rescaled. Audio
+(esds) is left alone; stitched ads keep the same AAC configuration.
+mov.c is not touched.
+
+--- a/libavformat/hls.c
++++ b/libavformat/hls.c
+@@ -94,6 +94,21 @@ enum PlaylistType {
+     PLS_TYPE_VOD
+ };
+ 
++#define MAX_INIT_CONFIGS 4
++
++/*
++ * Codec configuration (avcC or hvcC) of one video track, as found in the
++ * Media Initialization Sections of a playlist.
++ */
++struct init_codec_config {
++    int track_id;
++    enum AVCodecID codec_id;
++    uint32_t timescale;     /* mdhd timescale, 0 if unknown */
++    uint8_t *data;          /* last configuration seen for this track */
++    int size;
++    int pending;            /* data is not yet announced to the user */
++};
++
+ /*
+  * Each playlist has its own demuxer. If it currently is active,
+  * it has an open AVIOContext too, and potentially an AVPacket
+@@ -140,6 +155,8 @@ struct playlist {
+     unsigned int init_sec_buf_size;
+     unsigned int init_sec_data_len;
+     unsigned int init_sec_buf_read_offset;
++    int n_init_configs;
++    struct init_codec_config init_configs[MAX_INIT_CONFIGS];
+ 
+     char key_url[MAX_URL_SIZE];
+     uint8_t key[16];
+@@ -264,6 +281,13 @@ static void free_init_section_list(struct playlist *pls)
+     pls->n_init_sections = 0;
+ }
+ 
++static void free_init_configs(struct playlist *pls)
++{
++    for (int i = 0; i < pls->n_init_configs; i++)
++        av_freep(&pls->init_configs[i].data);
++    pls->n_init_configs = 0;
++}
++
+ static void free_playlist_list(HLSContext *c)
+ {
+     int i;
+@@ -277,6 +301,7 @@ static void free_playlist_list(HLSContext *c)
+         av_dict_free(&pls->id3_initial);
+         ff_id3v2_free_extra_meta(&pls->id3_deferred_extra);
+         av_freep(&pls->init_sec_buf);
++        free_init_configs(pls);
+         av_packet_free(&pls->pkt);
+         av_freep(&pls->pb.pub.buffer);
+         ff_format_io_close(c->ctx, &pls->input);
+@@ -1451,6 +1476,163 @@ cleanup:
+     return ret;
+ }
+ 
++/* Return the next ISO BMFF box of [*pp, end) and advance *pp. Boxes that do not
++ * fit, and boxes with a size of 0 (extends to the end) or 1 (64-bit size),
++ * which are not supported here, end the iteration. */
++static int hls_next_box(const uint8_t **pp, const uint8_t *end, uint32_t *type,
++                        const uint8_t **payload, const uint8_t **payload_end)
++{
++    const uint8_t *p = *pp;
++    uint32_t size;
++
++    if (end - p < 8)
++        return 0;
++    size = AV_RB32(p);
++    if (size < 8 || size > end - p)
++        return 0;
++    *type        = AV_RL32(p + 4);
++    *payload     = p + 8;
++    *payload_end = p + size;
++    *pp          = p + size;
++    return 1;
++}
++
++static int hls_find_box(const uint8_t *p, const uint8_t *end, uint32_t tag,
++                        const uint8_t **payload, const uint8_t **payload_end)
++{
++    uint32_t type;
++
++    while (hls_next_box(&p, end, &type, payload, payload_end))
++        if (type == tag)
++            return 1;
++    return 0;
++}
++
++/* Read the 32-bit field at offset 12 (version 0) or 20 (version 1) of the
++ * payload of a tkhd or mdhd box (track_ID, timescale). */
++static int hls_read_full_box_field(const uint8_t *p, const uint8_t *end, uint32_t *val)
++{
++    int off;
++
++    if (end - p < 1)
++        return 0;
++    off = p[0] == 0 ? 12 : p[0] == 1 ? 20 : 0;
++    if (!off || end - p < off + 4)
++        return 0;
++    *val = AV_RB32(p + off);
++    return 1;
++}
++
++static void hls_update_init_config(struct playlist *pls, int track_id,
++                                   enum AVCodecID codec_id, uint32_t timescale,
++                                   const uint8_t *data, int size)
++{
++    struct init_codec_config *cfg = NULL;
++    uint8_t *copy;
++
++    for (int i = 0; i < pls->n_init_configs; i++) {
++        if (pls->init_configs[i].track_id == track_id) {
++            cfg = &pls->init_configs[i];
++            break;
++        }
++    }
++    if (cfg && cfg->size == size && !memcmp(cfg->data, data, size))
++        return;
++    if (!cfg && pls->n_init_configs >= MAX_INIT_CONFIGS)
++        return;
++    copy = av_memdup(data, size);
++    if (!copy)
++        return;
++    if (cfg) {
++        av_free(cfg->data);
++        cfg->pending = 1;
++        av_log(pls->parent, AV_LOG_VERBOSE,
++               "Media Initialization Section of playlist %d changed the codec configuration of track %d\n",
++               pls->index, track_id);
++    } else {
++        /* the first configuration is the one the sub-demuxer has parsed */
++        cfg = &pls->init_configs[pls->n_init_configs++];
++        cfg->track_id = track_id;
++        cfg->pending  = 0;
++    }
++    cfg->codec_id  = codec_id;
++    cfg->timescale = timescale;
++    cfg->data      = copy;
++    cfg->size      = size;
++}
++
++static void hls_scan_trak(struct playlist *pls, const uint8_t *trak,
++                          const uint8_t *trak_end)
++{
++    const uint8_t *p, *end, *tkhd, *mdia, *mdhd, *minf, *stbl, *stsd, *entry, *cfg;
++    uint32_t track_id, timescale = 0, tag, cfg_tag;
++    enum AVCodecID codec_id;
++    int min_size;
++
++    if (!hls_find_box(trak, trak_end, MKTAG('t','k','h','d'), &tkhd, &end) ||
++        !hls_read_full_box_field(tkhd, end, &track_id) || track_id > INT_MAX)
++        return;
++    if (!hls_find_box(trak, trak_end, MKTAG('m','d','i','a'), &mdia, &end))
++        return;
++    if (hls_find_box(mdia, end, MKTAG('m','d','h','d'), &mdhd, &p))
++        if (!hls_read_full_box_field(mdhd, p, &timescale))
++            timescale = 0;
++    if (!hls_find_box(mdia, end, MKTAG('m','i','n','f'), &minf, &end) ||
++        !hls_find_box(minf, end, MKTAG('s','t','b','l'), &stbl, &end) ||
++        !hls_find_box(stbl, end, MKTAG('s','t','s','d'), &stsd, &end))
++        return;
++
++    /* version, flags, entry count; only the first sample entry is looked at */
++    if (end - stsd < 8 || !AV_RB32(stsd + 4))
++        return;
++    p = stsd + 8;
++    if (!hls_next_box(&p, end, &tag, &entry, &end))
++        return;
++    switch (tag) {
++    case MKTAG('a','v','c','1'):
++    case MKTAG('a','v','c','3'):
++        codec_id = AV_CODEC_ID_H264;
++        cfg_tag  = MKTAG('a','v','c','C');
++        min_size = 7;
++        break;
++    case MKTAG('h','v','c','1'):
++    case MKTAG('h','e','v','1'):
++        codec_id = AV_CODEC_ID_HEVC;
++        cfg_tag  = MKTAG('h','v','c','C');
++        min_size = 23;
++        break;
++    default:
++        return;
++    }
++    /* VisualSampleEntry: 78 bytes of fields, then the child boxes. */
++    if (end - entry < 78 ||
++        !hls_find_box(entry + 78, end, cfg_tag, &cfg, &end) ||
++        end - cfg < min_size || cfg[0] != 1)
++        return;
++    hls_update_init_config(pls, track_id, codec_id, timescale, cfg, end - cfg);
++}
++
++/* Record the codec configuration of the video tracks of the Media
++ * Initialization Section that was just loaded. The sub-demuxer parses only the
++ * first moov it sees and skips later ones, so a different configuration is
++ * kept to be announced to the user, see hls_announce_codec_config(). */
++static void hls_scan_init_section(struct playlist *pls)
++{
++    const uint8_t *buf = pls->init_sec_buf, *end;
++    const uint8_t *p, *moov, *moov_end, *trak, *trak_end;
++    uint32_t type;
++
++    if (!buf || !pls->init_sec_data_len)
++        return;
++    end = buf + pls->init_sec_data_len;
++    if (!hls_find_box(buf, end, MKTAG('m','o','o','v'), &moov, &moov_end))
++        return;
++    p = moov;
++    while (hls_next_box(&p, moov_end, &type, &trak, &trak_end))
++        if (type == MKTAG('t','r','a','k'))
++            hls_scan_trak(pls, trak, trak_end);
++}
++
+ static int update_init_section(struct playlist *pls, struct segment *seg)
+ {
+     static const int max_init_section_size = 1024*1024;
+@@ -1500,6 +1682,7 @@ static int update_init_section(struct playlist *pls, struct segment *seg)
+     pls->cur_init_section = seg->init_section;
+     pls->init_sec_data_len = ret;
+     pls->init_sec_buf_read_offset = 0;
++    hls_scan_init_section(pls);
+ 
+     /* spec says audio elementary streams do not have media initialization
+      * sections, so there should be no ID3 timestamps */
+@@ -2518,6 +2701,35 @@ static int compare_ts_with_wrapdetect(int64_t ts_a, struct playlist *pls_a,
+     return av_compare_mod(scaled_ts_a, scaled_ts_b, 1LL << 33);
+ }
+ 
++/* Attach the codec configuration of a changed Media Initialization Section to
++ * the next packet of its track as AV_PKT_DATA_NEW_EXTRADATA. Timestamps are not
++ * adjusted: a changed time scale only gets a warning. */
++static void hls_announce_codec_config(struct playlist *pls, const AVStream *ist,
++                                      AVPacket *pkt)
++{
++    for (int i = 0; i < pls->n_init_configs; i++) {
++        struct init_codec_config *cfg = &pls->init_configs[i];
++        uint8_t *sd;
++
++        if (!cfg->pending || cfg->track_id != ist->id)
++            continue;
++        if (cfg->codec_id != ist->codecpar->codec_id) {
++            cfg->pending = 0;
++            continue;
++        }
++        sd = av_packet_new_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA, cfg->size);
++        if (!sd)
++            continue;   /* stays pending for the next packet */
++        memcpy(sd, cfg->data, cfg->size);
++        cfg->pending = 0;
++        if (cfg->timescale &&
++            (ist->time_base.num != 1 || (uint32_t)ist->time_base.den != cfg->timescale))
++            av_log(pls->parent, AV_LOG_WARNING,
++                   "Time scale of track %d changed from %d to %"PRIu32", timestamps are not corrected\n",
++                   cfg->track_id, ist->time_base.den, cfg->timescale);
++    }
++}
++
+ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
+ {
+     HLSContext *c = s->priv_data;
+@@ -2646,6 +2858,7 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
+ 
+         av_packet_move_ref(pkt, pls->pkt);
+         pkt->stream_index = st->index;
++        hls_announce_codec_config(pls, ist, pkt);
+ 
+         if (pkt->dts != AV_NOPTS_VALUE)
+             c->cur_timestamp = av_rescale_q(pkt->dts,

@@ -37,6 +37,24 @@ def require_order(body: str, *needles: str) -> None:
         position = next_position
 
 
+def engine_lock_helpers(engine: str) -> bool:
+    # SE4-P6 (2026-11-14): 0046 puts the engine lock behind helpers and delivers notifications outside it. Detected
+    # from the tree (the helper definitions), as audit-patched-wine.sh does from the series; the two must agree.
+    return ("static void media_engine_lock_common(" in engine
+            and "static void media_engine_deliver_event(" in engine)
+
+
+def require_order_alt(body: str, *needles) -> None:
+    # Like require_order; a needle may be a tuple of alternatives, taken at the earliest one found after the previous.
+    position = -1
+    for needle in needles:
+        alts = (needle,) if isinstance(needle, str) else needle
+        found = [p for p in (body.find(alt, position + 1) for alt in alts) if p >= 0]
+        if not found:
+            fail(f"required ordering term is absent: {alts[0]}")
+        position = min(found)
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit(f"usage: {Path(sys.argv[0]).name} /path/to/src-wine")
@@ -67,18 +85,33 @@ def main() -> None:
 
     require(presentation, "Pending MediaSession start state; always VT_EMPTY or VT_I8.",
             "pending start-position ownership is undocumented")
-    require_order(
-        clear,
-        "IMFPresentationDescriptor *pd = engine->presentation.pd;",
-        "struct video_frame_sink *frame_sink = engine->presentation.frame_sink;",
-        "IMFMediaSource *source = engine->presentation.source;",
-        "engine->presentation.source = NULL;",
-        "engine->presentation.pd = NULL;",
-        "engine->presentation.frame_sink = NULL;",
-        "LeaveCriticalSection(&engine->cs);",
-        "IMFMediaSource_Shutdown(source);",
-        "EnterCriticalSection(&engine->cs);",
-    )
+    if engine_lock_helpers(engine):
+        # 0046: the lock is dropped and retaken through helpers (the drop is conditional on the lock depth).
+        require_order_alt(
+            clear,
+            "IMFPresentationDescriptor *pd = engine->presentation.pd;",
+            "struct video_frame_sink *frame_sink = engine->presentation.frame_sink;",
+            "IMFMediaSource *source = engine->presentation.source;",
+            "engine->presentation.source = NULL;",
+            "engine->presentation.pd = NULL;",
+            "engine->presentation.frame_sink = NULL;",
+            ("LeaveCriticalSection(&engine->cs);", "media_engine_drop_lock(engine,"),
+            "IMFMediaSource_Shutdown(source);",
+            ("EnterCriticalSection(&engine->cs);", "media_engine_retake_lock(engine,"),
+        )
+    else:
+        require_order(
+            clear,
+            "IMFPresentationDescriptor *pd = engine->presentation.pd;",
+            "struct video_frame_sink *frame_sink = engine->presentation.frame_sink;",
+            "IMFMediaSource *source = engine->presentation.source;",
+            "engine->presentation.source = NULL;",
+            "engine->presentation.pd = NULL;",
+            "engine->presentation.frame_sink = NULL;",
+            "LeaveCriticalSection(&engine->cs);",
+            "IMFMediaSource_Shutdown(source);",
+            "EnterCriticalSection(&engine->cs);",
+        )
     if "memset(&engine->presentation" in clear:
         fail("presentation cleanup still erases pending value state")
     if "start_position =" in clear or "start_position.vt =" in clear:

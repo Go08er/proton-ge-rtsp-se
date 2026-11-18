@@ -70,7 +70,10 @@ class HlsTimelineTests(unittest.TestCase):
                       self.create)
 
     def test_both_sample_times_use_the_same_origin(self):
-        self.assertIn('normalize_hls_timestamps( demuxer, sample );', self.text)
+        # Trees up to SE4-P2 call the two-argument form; 0044 (SE4-P3) also passes the stream.
+        self.assertTrue(any(call in self.text for call in (
+            'normalize_hls_timestamps( demuxer, sample );',
+            'normalize_hls_timestamps( demuxer, demuxer_stream, sample );')))
         for field in ('pts', 'dts'):
             self.assertIn(f'if (sample->{field} != AV_NOPTS_VALUE)', self.text)
             self.assertIn(f'av_sat_sub64( sample->{field}, demuxer->hls_timestamp_base )', self.text)

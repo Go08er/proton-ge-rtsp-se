@@ -281,6 +281,7 @@ require_state ninja_job_source make-variable-NINJA_JOBS
   || pinned_ge_fail "generated fail-fast patch driver is absent"
 require_state generated_patch_driver_sha256 \
   "$(pinned_ge_sha256 "$GENERATED_DRIVER")"
+pinned_ge_require_ge_skip_state "$STATE_FILE" "$GENERATED_DRIVER" "$PATCH_LOG" "$SOURCE_DIR"
 [[ -f "$PATCH_AUDIT" && ! -L "$PATCH_AUDIT" ]] \
   || pinned_ge_fail "strict patch audit is absent"
 require_state patch_audit_sha256 "$(pinned_ge_sha256 "$PATCH_AUDIT")"
@@ -546,6 +547,7 @@ write_build_invocation() {
       "$PIN_GE_MEDIA_CLEANUP_MANIFEST_SHA256"
     printf 'ge_media_cleanup_normalization_digest\t%s\n' "$ge_media_cleanup_digest"
     printf 'ge_media_cleanup_audit_sha256\t%s\n' "$ge_media_cleanup_audit_sha256"
+    pinned_ge_ge_skip_records "$GENERATED_DRIVER"
     if [[ "$PINNED_GE_HAS_PATCH_OVERLAP" == 1 ]]; then
       printf 'ge_patch_overlap_mode\tstock-effective-exact-skip\n'
       printf 'ge_patch_overlap_manifest_sha256\t%s\n' \
@@ -1213,8 +1215,21 @@ write_artifact_provenance() {
     if [[ -n "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" ]]; then
       printf 'FFmpeg HTTP-filesize companion SHA-256: %s\n' "$PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256"
     fi
+    if [[ -n "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" ]]; then
+      printf 'FFmpeg HTTP-chunked-end module SHA-256: %s\n' "$PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256"
+    fi
     if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" ]]; then
       printf 'FFmpeg HLS-early-seek companion SHA-256: %s\n' "$PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256"
+    fi
+    if [[ -n "${PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256:-}" ]]; then
+      printf 'FFmpeg HLS-init-config companion SHA-256: %s\n' "$PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256"
+    fi
+    if [[ -n "${PIN_GE_SKIP_PATCHES:-}" ]]; then
+      printf 'GE patches skipped by the pin (path:SHA-256): %s\n' "$PIN_GE_SKIP_PATCHES"
+      skip_forms="$(pinned_ge_ge_skip_forms_value "$GENERATED_DRIVER")"
+      if [[ -n "$skip_forms" ]]; then
+        printf 'GE patch skip forms (path=form): %s\n' "$skip_forms"
+      fi
     fi
     if [[ "$PINNED_GE_HAS_PATCH_OVERLAP" == 1 ]]; then
       printf 'GE inherited patch-overlap policy: stock-effective-exact-skip\n'

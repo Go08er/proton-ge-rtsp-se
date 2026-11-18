@@ -853,6 +853,260 @@ case "$PIN_ID" in
       || fail "SE3 requires its exact AAC parser build module after the MPEGVIDEO module"
     pinned_ge_aac_parser_build_patch >/dev/null
     ;;
+  ge-proton11-12-se4-p1)
+    # SE4-P1: GE-Proton11-12 + the reworked project Wine series + the SE3 FFmpeg
+    # modules + the HTTP chunked-end module; skips GE's rtworkq post-series hotfix
+    # in favor of the project's own patch 0025. Bind every pin field.
+    SELECTED_PROFILE=se4p1
+    selected_pin_sha256=d307ef1efa6074d748782148134c0a4d73d866ef838cdc7812d880e3c07b2e8d
+    # Series digest of patches/series-ge-proton11-12-se4-p1 (pinned_ge_series_digest).
+    selected_residual_digest=db18182cf259b0c25401361ec0604ae34edc2ef77f413533792998305963ef7f
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-12-rtsp-se4-p1 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-12 \
+        && "$PIN_SOURCE_COMMIT" == f85547f0ea51ac356ab42b4de57b927b0044cc85 \
+        && "$PIN_SOURCE_TREE" == b8286f4c76ec63a6b2096ab111d04d410bba19de \
+        && "$PIN_WINE_COMMIT" == fda79a585939fb7512dc220a11249f9ffe825fcf \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == f0d6510f75de69d17a6fb6278fe308541a4e1ef6 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-12 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_http_chunkend_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" == b170e0eea6e4b364fc5b4616f22e1a2b464662c19ef71f89b0592c806f1250db \
+        && "${PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB:-}" == ff99262dec1124c133f1a832b04845e7bf06c020 ]] \
+      || fail "SE4-P1 requires its exact HTTP chunked-end module"
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == fcf554c93afb1e3f13173909d74273cfee58ee19 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 6da863e55ba90e9e5dc816a796594f1d8cea6c28 \
+        && "$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB" == bd0333dcc2207809189d535729c74f6a3a4f33ba ]] \
+      || fail "SE4-P1 requires its exact crypto/MPEGVIDEO/AAC Makefile.in build modules for GE-Proton11-12"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    [[ "${PIN_GE_SKIP_PATCHES:-}" == patches/wine-hotfixes/pending/rtworkq-dont-hold-queues-section-during-system-queue-shutdown.patch:fa65977bda168c863cffea3faa0643f21c0f990524e7e90fe1105794e501bc7d ]] \
+      || fail "SE4-P1 must skip exactly GE's rtworkq post-series hotfix"
+    ;;
+  ge-proton11-12-se4-p1-r2)
+    # SE4-P1 r2: the draft arm's pin plus a second GE deviation (protonfixes 0003,
+    # already present byte-identically in the pinned protonfixes). Same series,
+    # same GE11-12 fields, same build name; the draft pin and arm stay as the record.
+    SELECTED_PROFILE=se4p1
+    selected_pin_sha256=0d0900fdfc8db9c923a86f1ea3f56840a57b68c10fc8728aa728dc9f8bdbc3b0
+    # Series digest of patches/series-ge-proton11-12-se4-p1 (pinned_ge_series_digest).
+    selected_residual_digest=db18182cf259b0c25401361ec0604ae34edc2ef77f413533792998305963ef7f
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-12-rtsp-se4-p1 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-12 \
+        && "$PIN_SOURCE_COMMIT" == f85547f0ea51ac356ab42b4de57b927b0044cc85 \
+        && "$PIN_SOURCE_TREE" == b8286f4c76ec63a6b2096ab111d04d410bba19de \
+        && "$PIN_WINE_COMMIT" == fda79a585939fb7512dc220a11249f9ffe825fcf \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == f0d6510f75de69d17a6fb6278fe308541a4e1ef6 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-12 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_http_chunkend_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" == b170e0eea6e4b364fc5b4616f22e1a2b464662c19ef71f89b0592c806f1250db \
+        && "${PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB:-}" == ff99262dec1124c133f1a832b04845e7bf06c020 ]] \
+      || fail "SE4-P1 requires its exact HTTP chunked-end module"
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == fcf554c93afb1e3f13173909d74273cfee58ee19 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 6da863e55ba90e9e5dc816a796594f1d8cea6c28 \
+        && "$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB" == bd0333dcc2207809189d535729c74f6a3a4f33ba ]] \
+      || fail "SE4-P1 requires its exact crypto/MPEGVIDEO/AAC Makefile.in build modules for GE-Proton11-12"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    [[ "${PIN_GE_SKIP_PATCHES:-}" == patches/wine-hotfixes/pending/rtworkq-dont-hold-queues-section-during-system-queue-shutdown.patch:fa65977bda168c863cffea3faa0643f21c0f990524e7e90fe1105794e501bc7d,patches/protonfixes/0003-gamefix-kingdoms-of-amalur-re-reckoning-d3dcompiler.patch:30f6b9b5bd427eadeb114a748fa4ed6666d11f26e26447f6492daa31d0e17311 ]] \
+      || fail "SE4-P1 r2 must skip exactly GE's rtworkq post-series hotfix and protonfixes 0003"
+    ;;
+  ge-proton11-12-se4-p2)
+    # SE4-P2 (2026-11-10): the SE4-P1 r2 pin with only PIN_ID and PIN_BUILD_NAME
+    # changed, and the SE4-P2 series (SE4-P1 + 0043, finding F1). Same GE11-12
+    # fields, FFmpeg modules and skips; the SE4-P1 profile token is reused.
+    SELECTED_PROFILE=se4p1
+    selected_pin_sha256=7e2472f58543970d1c698f03d71ac32c10491e6378221347453308c59c610d4d
+    # Series digest of patches/series-ge-proton11-12-se4-p2 (pinned_ge_series_digest).
+    selected_residual_digest=ea31439bd4c3e2ee79091d593647a7961fe145f940672b4ecad62ea24608c34f
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-12-rtsp-se4-p2 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-12 \
+        && "$PIN_SOURCE_COMMIT" == f85547f0ea51ac356ab42b4de57b927b0044cc85 \
+        && "$PIN_SOURCE_TREE" == b8286f4c76ec63a6b2096ab111d04d410bba19de \
+        && "$PIN_WINE_COMMIT" == fda79a585939fb7512dc220a11249f9ffe825fcf \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == f0d6510f75de69d17a6fb6278fe308541a4e1ef6 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-12 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_http_chunkend_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" == b170e0eea6e4b364fc5b4616f22e1a2b464662c19ef71f89b0592c806f1250db \
+        && "${PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB:-}" == ff99262dec1124c133f1a832b04845e7bf06c020 ]] \
+      || fail "SE4-P1 requires its exact HTTP chunked-end module"
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == fcf554c93afb1e3f13173909d74273cfee58ee19 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 6da863e55ba90e9e5dc816a796594f1d8cea6c28 \
+        && "$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB" == bd0333dcc2207809189d535729c74f6a3a4f33ba ]] \
+      || fail "SE4-P1 requires its exact crypto/MPEGVIDEO/AAC Makefile.in build modules for GE-Proton11-12"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    [[ "${PIN_GE_SKIP_PATCHES:-}" == patches/wine-hotfixes/pending/rtworkq-dont-hold-queues-section-during-system-queue-shutdown.patch:fa65977bda168c863cffea3faa0643f21c0f990524e7e90fe1105794e501bc7d,patches/protonfixes/0003-gamefix-kingdoms-of-amalur-re-reckoning-d3dcompiler.patch:30f6b9b5bd427eadeb114a748fa4ed6666d11f26e26447f6492daa31d0e17311 ]] \
+      || fail "SE4-P2 must skip exactly GE's rtworkq post-series hotfix and protonfixes 0003"
+    ;;
+  ge-proton11-12-se4-p3)
+    # SE4-P3 (2026-11-11): the SE4-P2 pin with only PIN_ID and PIN_BUILD_NAME
+    # changed, and the SE4-P3 series (SE4-P2 + 0044, live-HLS discontinuity timeline).
+    # Same GE11-12 fields, FFmpeg modules and skips; the SE4-P1 profile token is reused.
+    SELECTED_PROFILE=se4p1
+    selected_pin_sha256=72daed54d3b1b2e71a45c97ef3d4ee22fa09870522cb52dfe19377b9d7a8b75f
+    # Series digest of patches/series-ge-proton11-12-se4-p3 (pinned_ge_series_digest).
+    selected_residual_digest=bbb660243f6c6758176b983bb74a714710c7baaedb48f89936c536886b6bba71
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-12-rtsp-se4-p3 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-12 \
+        && "$PIN_SOURCE_COMMIT" == f85547f0ea51ac356ab42b4de57b927b0044cc85 \
+        && "$PIN_SOURCE_TREE" == b8286f4c76ec63a6b2096ab111d04d410bba19de \
+        && "$PIN_WINE_COMMIT" == fda79a585939fb7512dc220a11249f9ffe825fcf \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == f0d6510f75de69d17a6fb6278fe308541a4e1ef6 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-12 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_http_chunkend_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    [[ "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" == b170e0eea6e4b364fc5b4616f22e1a2b464662c19ef71f89b0592c806f1250db \
+        && "${PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB:-}" == ff99262dec1124c133f1a832b04845e7bf06c020 ]] \
+      || fail "SE4-P1 requires its exact HTTP chunked-end module"
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == fcf554c93afb1e3f13173909d74273cfee58ee19 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 6da863e55ba90e9e5dc816a796594f1d8cea6c28 \
+        && "$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB" == bd0333dcc2207809189d535729c74f6a3a4f33ba ]] \
+      || fail "SE4-P1 requires its exact crypto/MPEGVIDEO/AAC Makefile.in build modules for GE-Proton11-12"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    [[ "${PIN_GE_SKIP_PATCHES:-}" == patches/wine-hotfixes/pending/rtworkq-dont-hold-queues-section-during-system-queue-shutdown.patch:fa65977bda168c863cffea3faa0643f21c0f990524e7e90fe1105794e501bc7d,patches/protonfixes/0003-gamefix-kingdoms-of-amalur-re-reckoning-d3dcompiler.patch:30f6b9b5bd427eadeb114a748fa4ed6666d11f26e26447f6492daa31d0e17311 ]] \
+      || fail "SE4-P3 must skip exactly GE's rtworkq post-series hotfix and protonfixes 0003"
+    ;;
+  ge-proton11-12-se4-p4)
+    # SE4-P4 (2026-11-12): the SE4-P3 pin with PIN_ID and PIN_BUILD_NAME changed and the FFmpeg
+    # HLS init-config companion (E6) added; the Wine series is SE4-P3's. Same GE11-12 fields,
+    # other FFmpeg modules and skips; the SE4-P1 profile token is reused.
+    SELECTED_PROFILE=se4p1
+    selected_pin_sha256=c8609d7ee29006ac718c9251a639e30a62a9204005081df186c85e30bcbfb8f3
+    # Series digest of patches/series-ge-proton11-12-se4-p4 (pinned_ge_series_digest).
+    selected_residual_digest=ae1ee5a108dc861e3de3159ea77c2fc1c0e4931081b722fa59507e1bf69110d9
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-12-rtsp-se4-p4 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-12 \
+        && "$PIN_SOURCE_COMMIT" == f85547f0ea51ac356ab42b4de57b927b0044cc85 \
+        && "$PIN_SOURCE_TREE" == b8286f4c76ec63a6b2096ab111d04d410bba19de \
+        && "$PIN_WINE_COMMIT" == fda79a585939fb7512dc220a11249f9ffe825fcf \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == f0d6510f75de69d17a6fb6278fe308541a4e1ef6 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-12 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_http_chunkend_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    pinned_ge_hls_init_config_patch >/dev/null
+    [[ "${PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256:-}" == 64e51d21420282a3b25379544a689338ff01ae6435cccd867f258469d0929430 \
+        && "${PIN_FFMPEG_HLS_INIT_CONFIG_HLS_BLOB:-}" == 5b1dc4579a040602110d0ffffbc104ea40d9c5da ]] \
+      || fail "SE4-P4 requires its exact HLS init-config companion (E6)"
+    [[ "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" == b170e0eea6e4b364fc5b4616f22e1a2b464662c19ef71f89b0592c806f1250db \
+        && "${PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB:-}" == ff99262dec1124c133f1a832b04845e7bf06c020 ]] \
+      || fail "SE4-P1 requires its exact HTTP chunked-end module"
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == fcf554c93afb1e3f13173909d74273cfee58ee19 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 6da863e55ba90e9e5dc816a796594f1d8cea6c28 \
+        && "$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB" == bd0333dcc2207809189d535729c74f6a3a4f33ba ]] \
+      || fail "SE4-P1 requires its exact crypto/MPEGVIDEO/AAC Makefile.in build modules for GE-Proton11-12"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    [[ "${PIN_GE_SKIP_PATCHES:-}" == patches/wine-hotfixes/pending/rtworkq-dont-hold-queues-section-during-system-queue-shutdown.patch:fa65977bda168c863cffea3faa0643f21c0f990524e7e90fe1105794e501bc7d,patches/protonfixes/0003-gamefix-kingdoms-of-amalur-re-reckoning-d3dcompiler.patch:30f6b9b5bd427eadeb114a748fa4ed6666d11f26e26447f6492daa31d0e17311 ]] \
+      || fail "SE4-P4 must skip exactly GE's rtworkq post-series hotfix and protonfixes 0003"
+    ;;
+  ge-proton11-12-se4-p6)
+    # SE4-P6 (2026-11-14): the SE4-P4 pin with PIN_ID and PIN_BUILD_NAME changed (FFmpeg companions
+    # E5 and E6 unchanged); the Wine series is SE4-P4's plus 0046 and 0048. Same GE11-12 fields,
+    # other FFmpeg modules and skips; the SE4-P1 profile token is reused.
+    SELECTED_PROFILE=se4p1
+    selected_pin_sha256=232686e6c5218f75533ef046dbe58e795d40aa363cfbb1e14efff933aa3b5b2a
+    # Series digest of patches/series-ge-proton11-12-se4-p6 (pinned_ge_series_digest).
+    selected_residual_digest=ba45c48da2bb7c502dc53d437dcb4e91ab5ec66ebd5dfeaee1bf4f0b648c1554
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-12-rtsp-se4-p6 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-12 \
+        && "$PIN_SOURCE_COMMIT" == f85547f0ea51ac356ab42b4de57b927b0044cc85 \
+        && "$PIN_SOURCE_TREE" == b8286f4c76ec63a6b2096ab111d04d410bba19de \
+        && "$PIN_WINE_COMMIT" == fda79a585939fb7512dc220a11249f9ffe825fcf \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == f0d6510f75de69d17a6fb6278fe308541a4e1ef6 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == upstream \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-12 pin or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_http_chunkend_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    pinned_ge_hls_init_config_patch >/dev/null
+    [[ "${PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256:-}" == 64e51d21420282a3b25379544a689338ff01ae6435cccd867f258469d0929430 \
+        && "${PIN_FFMPEG_HLS_INIT_CONFIG_HLS_BLOB:-}" == 5b1dc4579a040602110d0ffffbc104ea40d9c5da ]] \
+      || fail "SE4-P6 requires its exact HLS init-config companion (E6)"
+    [[ "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" == b170e0eea6e4b364fc5b4616f22e1a2b464662c19ef71f89b0592c806f1250db \
+        && "${PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB:-}" == ff99262dec1124c133f1a832b04845e7bf06c020 ]] \
+      || fail "SE4-P1 requires its exact HTTP chunked-end module"
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == fcf554c93afb1e3f13173909d74273cfee58ee19 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 6da863e55ba90e9e5dc816a796594f1d8cea6c28 \
+        && "$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB" == bd0333dcc2207809189d535729c74f6a3a4f33ba ]] \
+      || fail "SE4-P1 requires its exact crypto/MPEGVIDEO/AAC Makefile.in build modules for GE-Proton11-12"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    [[ "${PIN_GE_SKIP_PATCHES:-}" == patches/wine-hotfixes/pending/rtworkq-dont-hold-queues-section-during-system-queue-shutdown.patch:fa65977bda168c863cffea3faa0643f21c0f990524e7e90fe1105794e501bc7d,patches/protonfixes/0003-gamefix-kingdoms-of-amalur-re-reckoning-d3dcompiler.patch:30f6b9b5bd427eadeb114a748fa4ed6666d11f26e26447f6492daa31d0e17311 ]] \
+      || fail "SE4-P6 must skip exactly GE's rtworkq post-series hotfix and protonfixes 0003"
+    ;;
   *)
     fail "verify-preparation does not recognize selected pin $PIN_ID"
     ;;
@@ -873,7 +1127,7 @@ fi
   || fail "selected game-test series must remain PACKAGE_RELEASE=0"
 expected_default_jobs=16
 expected_default_make_jobs=8
-if [[ "$PIN_ID" == ge-proton11-7-se2-p16 || "$PIN_ID" == ge-proton11-7-se2-p17 || "$PIN_ID" == ge-proton11-7-se2-p18 || "$PIN_ID" == ge-proton11-7-se2-p19a || "$PIN_ID" == ge-proton11-7-se2-p19b || "$PIN_ID" == ge-proton11-7-se2-p19b2 || "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 || "$SELECTED_PROFILE" == se3p1 || "$SELECTED_PROFILE" == se3p2 || "$SELECTED_PROFILE" == se3p3 || "$SELECTED_PROFILE" == se3p4 || "$SELECTED_PROFILE" == se3p5 || "$SELECTED_PROFILE" == se3p6 || "$SELECTED_PROFILE" == se3p7 || "$SELECTED_PROFILE" == se3p8 || "$SELECTED_PROFILE" == se3p9 || "$SELECTED_PROFILE" == se3 ]]; then
+if [[ "$PIN_ID" == ge-proton11-7-se2-p16 || "$PIN_ID" == ge-proton11-7-se2-p17 || "$PIN_ID" == ge-proton11-7-se2-p18 || "$PIN_ID" == ge-proton11-7-se2-p19a || "$PIN_ID" == ge-proton11-7-se2-p19b || "$PIN_ID" == ge-proton11-7-se2-p19b2 || "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 || "$SELECTED_PROFILE" == se3p1 || "$SELECTED_PROFILE" == se3p2 || "$SELECTED_PROFILE" == se3p3 || "$SELECTED_PROFILE" == se3p4 || "$SELECTED_PROFILE" == se3p5 || "$SELECTED_PROFILE" == se3p6 || "$SELECTED_PROFILE" == se3p7 || "$SELECTED_PROFILE" == se3p8 || "$SELECTED_PROFILE" == se3p9 || "$SELECTED_PROFILE" == se3 || "$SELECTED_PROFILE" == se4p1 ]]; then
   expected_default_jobs=8
   expected_default_make_jobs=4
 fi
@@ -1037,7 +1291,7 @@ expected_base_series=(
   experimental/0017-winedmo-propagate-terminal-network-read-errors.patch
   experimental/0018-winewayland-advertise-wine-vr-device-extensions.patch
 )
-if [[ "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 || "$SELECTED_PROFILE" == se3p1 || "$SELECTED_PROFILE" == se3p2 || "$SELECTED_PROFILE" == se3p3 || "$SELECTED_PROFILE" == se3p4 || "$SELECTED_PROFILE" == se3p5 || "$SELECTED_PROFILE" == se3p6 || "$SELECTED_PROFILE" == se3p7 || "$SELECTED_PROFILE" == se3p8 || "$SELECTED_PROFILE" == se3p9 || "$SELECTED_PROFILE" == se3 ]]; then
+if [[ "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 || "$SELECTED_PROFILE" == se3p1 || "$SELECTED_PROFILE" == se3p2 || "$SELECTED_PROFILE" == se3p3 || "$SELECTED_PROFILE" == se3p4 || "$SELECTED_PROFILE" == se3p5 || "$SELECTED_PROFILE" == se3p6 || "$SELECTED_PROFILE" == se3p7 || "$SELECTED_PROFILE" == se3p8 || "$SELECTED_PROFILE" == se3p9 || "$SELECTED_PROFILE" == se3 || "$SELECTED_PROFILE" == se4p1 ]]; then
   # Digest covers every ordered residual path AND every patch byte; no count
   # or historical patch basename can stand in for this composition identity.
   [[ "$(pinned_ge_series_digest "$ROOT_DIR/patches" "$PATCH_SERIES")" \
@@ -1344,7 +1598,7 @@ python3 "$ROOT_DIR/tests/wine-header-compile/test_fresh_setup.py" >/dev/null
 python3 "$ROOT_DIR/tests/avpro-audio-state/test_model.py" >/dev/null
 python3 "$ROOT_DIR/tests/media-engine-pause-scrub/test_model.py" >/dev/null
 python3 "$ROOT_DIR/tests/source-replacement-lifecycle/test_model.py" --series "$PATCH_SERIES" >/dev/null
-if [[ ( "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 || "$SELECTED_PROFILE" == se3p1 || "$SELECTED_PROFILE" == se3p2 || "$SELECTED_PROFILE" == se3p3 || "$SELECTED_PROFILE" == se3p4 || "$SELECTED_PROFILE" == se3p5 || "$SELECTED_PROFILE" == se3p6 || "$SELECTED_PROFILE" == se3p7 || "$SELECTED_PROFILE" == se3p8 || "$SELECTED_PROFILE" == se3p9 || "$SELECTED_PROFILE" == se3 ) && -n "${PREPARED_SOURCE:-}" ]]; then
+if [[ ( "$SELECTED_PROFILE" == p20 || "$SELECTED_PROFILE" == p21 || "$SELECTED_PROFILE" == p22 || "$SELECTED_PROFILE" == p23 || "$SELECTED_PROFILE" == p24 || "$SELECTED_PROFILE" == se2 || "$SELECTED_PROFILE" == se3p1 || "$SELECTED_PROFILE" == se3p2 || "$SELECTED_PROFILE" == se3p3 || "$SELECTED_PROFILE" == se3p4 || "$SELECTED_PROFILE" == se3p5 || "$SELECTED_PROFILE" == se3p6 || "$SELECTED_PROFILE" == se3p7 || "$SELECTED_PROFILE" == se3p8 || "$SELECTED_PROFILE" == se3p9 || "$SELECTED_PROFILE" == se3 || "$SELECTED_PROFILE" == se4p1 ) && -n "${PREPARED_SOURCE:-}" ]]; then
   # The consolidated series retains the source contracts, not the old patch
   # filenames. Audit their actual postimages; no runtime oracle is changed.
   bash "$ROOT_DIR/scripts/audit-patched-wine.sh" \
@@ -1410,6 +1664,7 @@ python3 "$ROOT_DIR/tests/tooling/test_master_mono_preparation.py"
 python3 "$ROOT_DIR/tests/tooling/test_nvml_build_input.py"
 python3 "$ROOT_DIR/tests/tooling/test_low_latency_manifest.py"
 python3 "$ROOT_DIR/tests/tooling/test_artifact_privacy.py"
+python3 "$ROOT_DIR/tests/tooling/test_ge_skip_patches.py"
 if [[ ${#selected_module_series[@]} -gt 0 ]]; then
   # These regressions deliberately start with the unchanged SE1 control,
   # not the selected (already patched) candidate. Source availability remains

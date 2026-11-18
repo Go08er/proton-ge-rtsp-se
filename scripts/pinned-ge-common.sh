@@ -115,7 +115,10 @@ pinned_ge_load_config() {
     PIN_FFMPEG_RTSPS_PATCH_SHA256 PIN_FFMPEG_RTSPS_RTSP_BLOB
     PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256 PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB
     PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256 PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB
-    PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256 PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB)
+    PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256 PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB
+    PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256 PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB
+    PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256 PIN_FFMPEG_HLS_INIT_CONFIG_HLS_BLOB
+    PIN_GE_SKIP_PATCHES)
   local -A seen=() allowed=()
 
   # The loader may be called repeatedly in one shell, and callers may export
@@ -379,12 +382,177 @@ pinned_ge_load_config() {
         && "${PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB:-}" =~ ^[0-9a-f]{40}$ ]] \
       || pinned_ge_fail "HTTP filesize companion requires the HTTP-seek module and both patch/postimage digests in schema 5" || return 1
   fi
+  if [[ -n "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}${PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB:-}" ]]; then
+    # The module's http.c preimage is the HTTP-filesize postimage.
+    [[ "$PIN_SCHEMA_VERSION" == 5 && -n "${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}" \
+        && -n "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" \
+        && "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" =~ ^[0-9a-f]{64}$ \
+        && "${PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB:-}" =~ ^[0-9a-f]{40}$ ]] \
+      || pinned_ge_fail "HTTP chunked-end module requires the HTTP-seek and HTTP-filesize modules and both patch/postimage digests in schema 5" || return 1
+  fi
   if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}${PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB:-}" ]]; then
     [[ "$PIN_SCHEMA_VERSION" == 5 \
         && "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" =~ ^[0-9a-f]{64}$ \
         && "${PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB:-}" =~ ^[0-9a-f]{40}$ ]] \
       || pinned_ge_fail "HLS early-seek companion requires both patch/postimage digests in schema 5" || return 1
   fi
+  if [[ -n "${PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256:-}${PIN_FFMPEG_HLS_INIT_CONFIG_HLS_BLOB:-}" ]]; then
+    # E6 applies on top of the HLS early-seek companion, so that pair is required too.
+    [[ "$PIN_SCHEMA_VERSION" == 5 \
+        && "${PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256:-}" =~ ^[0-9a-f]{64}$ \
+        && "${PIN_FFMPEG_HLS_INIT_CONFIG_HLS_BLOB:-}" =~ ^[0-9a-f]{40}$ \
+        && "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" =~ ^[0-9a-f]{64}$ \
+        && "${PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB:-}" =~ ^[0-9a-f]{40}$ ]] \
+      || pinned_ge_fail "HLS init-config companion requires both patch/postimage digests and the HLS early-seek companion in schema 5" || return 1
+  fi
+  if [[ -n "${PIN_GE_SKIP_PATCHES:-}" ]]; then
+    pinned_ge_ge_skip_patch_entries >/dev/null || return 1
+  fi
+}
+
+# Optional pin deviation PIN_GE_SKIP_PATCHES=<path>:<sha256>[,<path>:<sha256>...]:
+# GE patch applications omitted from the generated copy of GE's driver.
+# Prints "path<TAB>sha256" per entry; prints nothing when the pin has none.
+pinned_ge_ge_skip_patch_entries() {
+  [[ -n "${PIN_GE_SKIP_PATCHES:-}" ]] || return 0
+  local value="$PIN_GE_SKIP_PATCHES" entry path sha
+  local -a entries
+  local -A seen_paths=()
+  [[ "$value" != ,* && "$value" != *, && "$value" != *,,* ]] \
+    || pinned_ge_fail "PIN_GE_SKIP_PATCHES has an empty entry" || return 1
+  IFS=, read -r -a entries <<<"$value"
+  for entry in "${entries[@]}"; do
+    [[ "$entry" =~ ^(patches/[A-Za-z0-9._+/-]+\.patch):([0-9a-f]{64})$ ]] \
+      || pinned_ge_fail "PIN_GE_SKIP_PATCHES entry is not <patches/...patch>:<sha256>: $entry" || return 1
+    path="${BASH_REMATCH[1]}"
+    sha="${BASH_REMATCH[2]}"
+    case "/$path/" in
+      *//*|*/../*|*/./*) pinned_ge_fail "PIN_GE_SKIP_PATCHES path is not normalized: $path" || return 1 ;;
+    esac
+    [[ -z "${seen_paths[$path]+present}" ]] \
+      || pinned_ge_fail "PIN_GE_SKIP_PATCHES repeats a path: $path" || return 1
+    seen_paths["$path"]=1
+    printf '%s\t%s\n' "$path" "$sha"
+  done
+}
+
+# Form of each skip in a generated driver: "dir-member" when the driver carries
+# the skip-aware directory case for the entry, otherwise "line". Prints
+# "path<TAB>form" per entry; prints nothing when the pin has none.
+pinned_ge_ge_skip_forms() {
+  local driver="$1" path sha dir name form
+  [[ -n "${PIN_GE_SKIP_PATCHES:-}" ]] || return 0
+  [[ -f "$driver" && ! -L "$driver" ]] \
+    || pinned_ge_fail "generated GE driver is absent: $driver" || return 1
+  while IFS=$'\t' read -r path sha; do
+    dir="${path%/*}"
+    name="${path##*/}"
+    if [[ "$(grep -c -F -e "            \"../$dir//$name\")" "$driver" || true)" == 1 ]]; then
+      # shellcheck disable=SC2100 # a plain assignment, not arithmetic
+      form=dir-member
+    else
+      form=line
+    fi
+    printf '%s\t%s\n' "$path" "$form"
+  done < <(pinned_ge_ge_skip_patch_entries)
+}
+
+# "path=form,path=form" for the state records, only when some skip uses the
+# dir-member form (a pin using only the single-line form records nothing new).
+pinned_ge_ge_skip_forms_value() {
+  local driver="$1" path form value="" any=0
+  [[ -n "${PIN_GE_SKIP_PATCHES:-}" ]] || return 0
+  while IFS=$'\t' read -r path form; do
+    [[ "$form" == dir-member ]] && any=1
+    value+="${value:+,}$path=$form"
+  done < <(pinned_ge_ge_skip_forms "$driver")
+  [[ "$any" == 1 ]] && printf '%s\n' "$value"
+  return 0
+}
+
+# Prepared-state/invocation record for the optional skip. Empty output keeps
+# every pin without the field byte-identical. With the generated driver, a
+# dir-member skip also records its form.
+pinned_ge_ge_skip_records() {
+  [[ -n "${PIN_GE_SKIP_PATCHES:-}" ]] || return 0
+  printf 'ge_skipped_patches\t%s\n' "$PIN_GE_SKIP_PATCHES"
+  [[ -n "${1:-}" ]] || return 0
+  local forms
+  forms="$(pinned_ge_ge_skip_forms_value "$1")" || return 1
+  [[ -z "$forms" ]] || printf 'ge_skipped_patch_forms\t%s\n' "$forms"
+}
+
+# Require a state file to carry exactly the pin's skip record (or none), and
+# optionally that the generated driver omits exactly those applications. With
+# a driver, the dir-member form is checked as well (form record, exact skip-aware
+# function, and with the driver log and the source tree, one skip line plus
+# every other directory member logged as applied).
+pinned_ge_require_ge_skip_state() {
+  local file="$1" driver="${2:-}" log="${3:-}" source_dir="${4:-}" path sha form
+  local forms_record forms_expected dir name member expected_members logged_members normalized func_block
+  if [[ -z "${PIN_GE_SKIP_PATCHES:-}" ]]; then
+    ! grep -q -P '^ge_skipped_patches\t|^ge_skipped_patch_forms\t' "$file" \
+      || pinned_ge_fail "state records a skipped GE patch the pin does not declare: $file" || return 1
+    return 0
+  fi
+  [[ "$(grep -c -P '^ge_skipped_patches\t' "$file")" == 1 \
+      && "$(pinned_ge_state_value "$file" ge_skipped_patches)" == "$PIN_GE_SKIP_PATCHES" ]] \
+    || pinned_ge_fail "skipped GE patch provenance differs from the pin: $file" || return 1
+  [[ "$(grep -c -P '^ge_skipped_patch_forms\t' "$file" || true)" -le 1 ]] \
+    || pinned_ge_fail "skipped GE patch form record is repeated: $file" || return 1
+  forms_record=""
+  if grep -q -P '^ge_skipped_patch_forms\t' "$file"; then
+    forms_record="$(pinned_ge_state_value "$file" ge_skipped_patch_forms)"
+  fi
+  if [[ -z "$driver" ]]; then
+    # No driver: the record, when present, must name exactly the pin's entries.
+    if [[ -n "$forms_record" ]]; then
+      forms_expected=""
+      while IFS=$'\t' read -r path sha; do
+        forms_expected+="${forms_expected:+,}$path=F"
+      done < <(pinned_ge_ge_skip_patch_entries)
+      normalized="${forms_record//=dir-member/=F}"
+      normalized="${normalized//=line/=F}"
+      [[ "$normalized" == "$forms_expected" && "$forms_record" == *=dir-member* ]] \
+        || pinned_ge_fail "skipped GE patch form record is malformed: $file" || return 1
+    fi
+    return 0
+  fi
+  while IFS=$'\t' read -r path sha; do
+    [[ "$(grep -c -F -e "apply_patch \"../$path\"" "$driver" || true)" == 0 \
+        && "$(grep -c -F -e "echo \"WINE: -RTSP- skipping GE patch (pinned deviation): $path\"" "$driver" || true)" == 1 ]] \
+      || pinned_ge_fail "generated GE driver does not omit exactly the pinned skipped patch: $path" || return 1
+  done < <(pinned_ge_ge_skip_patch_entries)
+  forms_expected="$(pinned_ge_ge_skip_forms_value "$driver")" || return 1
+  [[ "$forms_record" == "$forms_expected" ]] \
+    || pinned_ge_fail "skipped GE patch form record differs from the generated driver: $file" || return 1
+  while IFS=$'\t' read -r path form; do
+    [[ "$form" == dir-member ]] || continue
+    dir="${path%/*}"
+    name="${path##*/}"
+    # The skip-aware function (and its skip/applying case lines) occur exactly once.
+    func_block="$(awk '/^apply_all_in_dir\(\) \{$/ {f=1} f {print} f && /^\}$/ {exit}' "$driver")"
+    [[ "$(grep -c -F -e 'apply_all_in_dir() {' "$driver" || true)" == 1 \
+        && "$(grep -c -F -e "            \"../$dir//$name\")" <<<"$func_block" || true)" == 1 \
+        && "$(grep -c -F -e "            \"../$dir//\"*)" <<<"$func_block" || true)" == 1 \
+        && "$(grep -c -x -F -e "        case \"\$patch\" in" <<<"$func_block" || true)" == 1 \
+        && "$(grep -c -x -F -e "        apply_patch \"\$patch\"" <<<"$func_block" || true)" == 1 \
+        && "$(grep -c -F -e "apply_all_in_dir \"../$dir/\"" "$driver" || true)" == 1 ]] \
+      || pinned_ge_fail "generated GE driver lacks the exact skip-aware directory application: $path" || return 1
+    [[ -z "$log" ]] && continue
+    [[ -n "$source_dir" && -d "$source_dir/$dir" ]] \
+      || pinned_ge_fail "source directory needed to check the skipped member's directory: $dir" || return 1
+    [[ "$(grep -c -x -F -e "WINE: -RTSP- skipping GE patch (pinned deviation): $path" "$log" || true)" == 1 ]] \
+      || pinned_ge_fail "patch-driver log lacks exactly one skip line for $path" || return 1
+    expected_members="$(
+      for member in "$source_dir/$dir"/*.patch; do
+        member="${member##*/}"
+        [[ "$member" == "$name" ]] || printf 'WINE: -RTSP- applying GE patch (skip-aware directory): %s/%s\n' "$dir" "$member"
+      done | LC_ALL=C sort)"
+    logged_members="$(grep -E "^WINE: -RTSP- applying GE patch \(skip-aware directory\): $dir/[^/]+$" "$log" | LC_ALL=C sort)"
+    [[ -n "$expected_members" && "$expected_members" == "$logged_members" ]] \
+      || pinned_ge_fail "patch-driver log does not show the other members of $dir applied: $path" || return 1
+  done < <(pinned_ge_ge_skip_forms "$driver")
 }
 
 pinned_ge_http_filesize_patch() {
@@ -392,6 +560,14 @@ pinned_ge_http_filesize_patch() {
   [[ -n "${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" \
       && "$(pinned_ge_sha256 "$patch")" == "$PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256" ]] \
     || pinned_ge_fail "HTTP filesize companion differs from the selected pin" || return 1
+  printf '%s\n' "$patch"
+}
+
+pinned_ge_http_chunkend_patch() {
+  local patch="$PINNED_GE_ROOT/patches/proposed/ffmpeg-http-chunked-end-not-premature.patch"
+  [[ -n "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" \
+      && "$(pinned_ge_sha256 "$patch")" == "$PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256" ]] \
+    || pinned_ge_fail "HTTP chunked-end module differs from the selected pin" || return 1
   printf '%s\n' "$patch"
 }
 
@@ -403,6 +579,14 @@ pinned_ge_hls_early_seek_patch() {
   printf '%s\n' "$patch"
 }
 
+pinned_ge_hls_init_config_patch() {
+  local patch="$PINNED_GE_ROOT/patches/proposed/ffmpeg-hls-announce-changed-init-codec-config.patch"
+  [[ -n "${PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256:-}" \
+      && "$(pinned_ge_sha256 "$patch")" == "$PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256" ]] \
+    || pinned_ge_fail "HLS init-config companion differs from the selected pin" || return 1
+  printf '%s\n' "$patch"
+}
+
 # Named P19b companions, separate from the unchanged four security backports.
 # Empty output preserves historical prepared/build receipts byte-for-byte.
 pinned_ge_ffmpeg_playback_records() {
@@ -410,9 +594,17 @@ pinned_ge_ffmpeg_playback_records() {
     printf 'ffmpeg_http_filesize_patch_sha256\t%s\nffmpeg_http_filesize_http_blob\t%s\n' \
       "$PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256" "$PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB"
   fi
+  if [[ -n "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" ]]; then
+    printf 'ffmpeg_http_chunkend_patch_sha256\t%s\nffmpeg_http_chunkend_http_blob\t%s\n' \
+      "$PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256" "$PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB"
+  fi
   if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" ]]; then
     printf 'ffmpeg_hls_early_seek_patch_sha256\t%s\nffmpeg_hls_early_seek_hls_blob\t%s\n' \
       "$PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256" "$PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB"
+  fi
+  if [[ -n "${PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256:-}" ]]; then
+    printf 'ffmpeg_hls_init_config_patch_sha256\t%s\nffmpeg_hls_init_config_hls_blob\t%s\n' \
+      "$PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256" "$PIN_FFMPEG_HLS_INIT_CONFIG_HLS_BLOB"
   fi
 }
 
@@ -938,6 +1130,9 @@ pinned_ge_require_prepared_media_provenance() (
       && "$(pinned_ge_state_value "$state_file" final_winegstreamer_external_references)" == 0 \
       && "$(pinned_ge_state_value "$state_file" final_diff_check_baseline_match)" == passed ]] \
     || pinned_ge_fail "prepared-state media-cleanup provenance is inconsistent" || return 1
+  pinned_ge_require_ge_skip_state "$state_file" \
+    "$state_dir/protonprep-valve-staging.generated.sh" \
+    "$state_dir/patch-driver.log" "$source" || return 1
 
   baseline_sha="$(pinned_ge_sha256 "$baseline")"
   recorded_status="$(pinned_ge_state_value "$state_file" ge_pre_rtsp_diff_check_status)"
@@ -1581,7 +1776,7 @@ pinned_ge_require_prepared_ffmpeg_security_provenance() (
     pinned_ge_http_seek_patch >/dev/null || return 1
     expected_touched_paths="$(printf '%s\nlibavformat/http.c\n' "$expected_touched_paths" | LC_ALL=C sort -u)"
     [[ "$(pinned_ge_git -C "$source/ffmpeg" hash-object --no-filters -- libavformat/http.c)" \
-        == "${PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB:-$PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB}" \
+        == "${PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB:-${PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB:-$PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB}}" \
         && "$(pinned_ge_state_value "$patch_audit" http_seek_patch_sha256)" == "$PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256" \
         && "$(pinned_ge_state_value "$patch_audit" http_seek_http_blob)" == "$PIN_FFMPEG_HTTP_SEEK_HTTP_BLOB" ]] \
       || pinned_ge_fail "HTTP seek companion postimage or audit differs from the pin" || return 1
@@ -1592,14 +1787,26 @@ pinned_ge_require_prepared_ffmpeg_security_provenance() (
         && "$(pinned_ge_state_value "$patch_audit" http_filesize_http_blob)" == "$PIN_FFMPEG_HTTP_FILESIZE_HTTP_BLOB" ]] \
       || pinned_ge_fail "HTTP filesize companion audit differs from the pin" || return 1
   fi
+  if [[ -n "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" ]]; then
+    pinned_ge_http_chunkend_patch >/dev/null || return 1
+    [[ "$(pinned_ge_state_value "$patch_audit" http_chunkend_patch_sha256)" == "$PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256" \
+        && "$(pinned_ge_state_value "$patch_audit" http_chunkend_http_blob)" == "$PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB" ]] \
+      || pinned_ge_fail "HTTP chunked-end module audit differs from the pin" || return 1
+  fi
   if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" ]]; then
     pinned_ge_hls_early_seek_patch >/dev/null || return 1
     expected_touched_paths="$(printf '%s\nlibavformat/hls.c\n' "$expected_touched_paths" | LC_ALL=C sort -u)"
     [[ "$(pinned_ge_git -C "$source/ffmpeg" hash-object --no-filters -- libavformat/hls.c)" \
-        == "$PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB" \
+        == "${PIN_FFMPEG_HLS_INIT_CONFIG_HLS_BLOB:-$PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB}" \
         && "$(pinned_ge_state_value "$patch_audit" hls_early_seek_patch_sha256)" == "$PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256" \
         && "$(pinned_ge_state_value "$patch_audit" hls_early_seek_hls_blob)" == "$PIN_FFMPEG_HLS_EARLY_SEEK_HLS_BLOB" ]] \
       || pinned_ge_fail "HLS early-seek companion postimage or audit differs from the pin" || return 1
+  fi
+  if [[ -n "${PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256:-}" ]]; then
+    pinned_ge_hls_init_config_patch >/dev/null || return 1
+    [[ "$(pinned_ge_state_value "$patch_audit" hls_init_config_patch_sha256)" == "$PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256" \
+        && "$(pinned_ge_state_value "$patch_audit" hls_init_config_hls_blob)" == "$PIN_FFMPEG_HLS_INIT_CONFIG_HLS_BLOB" ]] \
+      || pinned_ge_fail "HLS init-config companion audit differs from the pin" || return 1
   fi
   touched_count="$(wc -l <<<"$expected_touched_paths")"
   series_digest="$(pinned_ge_series_digest "$patch_root" "$series")" || return 1
@@ -1626,6 +1833,8 @@ pinned_ge_require_prepared_ffmpeg_security_provenance() (
       -v expected_touched="$touched_count" -v rtsps="${PIN_FFMPEG_RTSPS_PATCH_SHA256:-}" \
       -v http_seek="${PIN_FFMPEG_HTTP_SEEK_PATCH_SHA256:-}" \
       -v http_filesize="${PIN_FFMPEG_HTTP_FILESIZE_PATCH_SHA256:-}" \
+      -v http_chunkend="${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" \
+      -v hls_init_config="${PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256:-}" \
       -v hls_early_seek="${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" '
     BEGIN {
       unique["ffmpeg_security_patch_audit_version"] = 1
@@ -1652,9 +1861,17 @@ pinned_ge_require_prepared_ffmpeg_security_provenance() (
         unique["http_filesize_patch_sha256"] = 1
         unique["http_filesize_http_blob"] = 1
       }
+      if (http_chunkend != "") {
+        unique["http_chunkend_patch_sha256"] = 1
+        unique["http_chunkend_http_blob"] = 1
+      }
       if (hls_early_seek != "") {
         unique["hls_early_seek_patch_sha256"] = 1
         unique["hls_early_seek_hls_blob"] = 1
+      }
+      if (hls_init_config != "") {
+        unique["hls_init_config_patch_sha256"] = 1
+        unique["hls_init_config_hls_blob"] = 1
       }
     }
     $1 == "patch" {
