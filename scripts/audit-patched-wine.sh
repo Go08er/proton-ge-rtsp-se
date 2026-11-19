@@ -200,6 +200,7 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-12-se4-p3/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
       -e 'ge-proton11-12-se4-p4/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
       -e 'ge-proton11-12-se4-p6/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
+      -e 'ge-proton11-12-se4-p7/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
       -e 'ge-proton11-9-se2-p21/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' \
       -e 'ge-proton11-9-se2-p20/0008-mfmediaengine-retain-control-intent-and-buffering-events.patch' "$PATCH_SERIES"; then
     IMMEDIATE_SEEK_SERIES=1
@@ -226,6 +227,7 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-12-se4-p3/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
       -e 'ge-proton11-12-se4-p4/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
       -e 'ge-proton11-12-se4-p6/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
+      -e 'ge-proton11-12-se4-p7/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
       -e 'ge-proton11-9-se2-p21/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' \
       -e 'ge-proton11-9-se2-p20/0002-winedmo-retain-generation-queues-and-adaptive-buffer.patch' "$PATCH_SERIES"; then
     LIVE_BUFFER_SERIES=1
@@ -249,6 +251,7 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-12-se4-p3/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
       -e 'ge-proton11-12-se4-p4/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
       -e 'ge-proton11-12-se4-p6/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
+      -e 'ge-proton11-12-se4-p7/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
       -e 'ge-proton11-9-se2-p21/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' \
       -e 'ge-proton11-9-se2-p20/0010-mfsrcsnk-retain-source-origin-and-queued-tail-drain.patch' "$PATCH_SERIES"; then
     EOS_DRAIN_SERIES=1
@@ -272,6 +275,7 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-12-se4-p3/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
       -e 'ge-proton11-12-se4-p4/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
       -e 'ge-proton11-12-se4-p6/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
+      -e 'ge-proton11-12-se4-p7/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
       -e 'ge-proton11-9-se2-p21/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' \
       -e 'ge-proton11-9-se2-p20/0003-winedmo-retain-native-decoder-coordinates-and-parser-drain.patch' "$PATCH_SERIES"; then
     NATIVE_AUDIO_TIMELINE_SERIES=1
@@ -374,6 +378,7 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
       -e 'ge-proton11-12-se4-p3/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
       -e 'ge-proton11-12-se4-p4/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
       -e 'ge-proton11-12-se4-p6/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
+      -e 'ge-proton11-12-se4-p7/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
       -e 'ge-proton11-9-se2-p21/0009-mfmediaengine-retain-render-clock-frame-demand.patch' \
       -e 'ge-proton11-9-se2-p20/0009-mfmediaengine-retain-render-clock-frame-demand.patch' "$PATCH_SERIES"; then
     A320_SERIES=1
@@ -400,6 +405,10 @@ if [[ "$SERIES_SPECIFIC" == 1 ]]; then
   fi
   # SE4-P6 (2026-11-14): the same network contract for the SE4-P6 patch directory (Wine series = SE4-P4's + 0046 + 0048).
   if grep -q '^ge-proton11-12-se4-p6/' "$PATCH_SERIES"; then
+    SE4_NETWORK_CONTRACT=1
+  fi
+  # SE4-P7 (2026-11-19): the same network contract for the SE4-P7 patch directory (Wine series = SE4-P6's; dual DXVK carries no Wine patch).
+  if grep -q '^ge-proton11-12-se4-p7/' "$PATCH_SERIES"; then
     SE4_NETWORK_CONTRACT=1
   fi
   if grep -Eq '(^|/)0046-mfmediaengine-never-call-the-application-with-the-engine-lock-held\.patch$' "$PATCH_SERIES"; then

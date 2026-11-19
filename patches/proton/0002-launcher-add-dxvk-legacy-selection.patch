@@ -1,0 +1,107 @@
+diff --git a/proton b/proton
+index 032bcd0..1f19059 100755
+--- a/proton
++++ b/proton
+@@ -217,6 +217,17 @@ def file_exists(s, *, follow_symlinks):
+ def nonzero(s):
+     return len(s) > 0 and s != "0"
+ 
++# Dual DXVK: the legacy DXVK build ships beside the primary one in
++# lib/wine/dxvk-legacy.  AppIDs listed here default to it; every other AppID
++# keeps the primary DXVK unless PROTON_DXVK_LEGACY or the dxvklegacy token asks.
++DXVK_LEGACY_DEFAULT_APPIDS = ("438100",)  # VRChat
++
++def dxvk_variant_dir(lib_dir, want_legacy):
++    """Return (directory below lib_dir, legacy active) for the DXVK DLL set."""
++    if want_legacy and file_exists(lib_dir + "wine/dxvk-legacy", follow_symlinks=True):
++        return "wine/dxvk-legacy", True
++    return "wine/dxvk", False
++
+ def proton_build_name():
+     """The build name from this Proton's version file, e.g. "GE-Proton11-12"."""
+     try:
+@@ -1313,6 +1324,19 @@ class CompatData:
+                     not ("WINEDLLOVERRIDES" in g_session.env and "dxgi=b" in g_session.env["WINEDLLOVERRIDES"])
+             use_nvapi = 'disablenvapi' not in g_session.compat_config or 'forcenvapi' in g_session.compat_config
+             use_dxvk_d3d8 = "dxvkd3d8" in g_session.compat_config
++            # The DLL copies below run on every launch, so a flag flip swaps
++            # the DXVK set without touching prefix_info or forcing an update.
++            dxvk_dir, dxvk_legacy_active = dxvk_variant_dir(g_proton.lib_dir,
++                    "dxvklegacy" in g_session.compat_config)
++            dxvk_variant_msg = "DXVK variant: " + ("legacy" if dxvk_legacy_active else "default") + \
++                    " (" + g_session.dxvk_legacy_reason
++            if "dxvklegacy" in g_session.compat_config and not dxvk_legacy_active:
++                dxvk_variant_msg += "; wine/dxvk-legacy is missing, using the primary DXVK"
++            dxvk_variant_msg += ")"
++            log(dxvk_variant_msg)
++            if g_session.log_file:
++                g_session.log_file.write(dxvk_variant_msg + "\n")
++                g_session.log_file.flush()
+ 
+             builtin_dll_copy = os.environ.get("PROTON_DLL_COPY",
+                     #dxsetup redist
+@@ -1444,9 +1468,9 @@ class CompatData:
+                 try_copy(g_proton.arch_pe_dir("wine", False) + "vrclient_x64.dll", "drive_c/vrclient/bin",
+                         prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+ 
+-                try_copy(g_proton.arch_pe_dir("wine/dxvk", True) + "openvr_api_dxvk.dll", "drive_c/windows/syswow64",
++                try_copy(g_proton.arch_pe_dir(dxvk_dir, True) + "openvr_api_dxvk.dll", "drive_c/windows/syswow64",
+                         prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+-                try_copy(g_proton.arch_pe_dir("wine/dxvk", False) + "openvr_api_dxvk.dll", "drive_c/windows/system32",
++                try_copy(g_proton.arch_pe_dir(dxvk_dir, False) + "openvr_api_dxvk.dll", "drive_c/windows/system32",
+                         prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+ 
+                 #copy x86_64 wineopenxr files into place
+@@ -1482,9 +1506,9 @@ class CompatData:
+                             prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+ 
+                 for f in dxvkfiles:
+-                    try_copy(g_proton.arch_pe_dir("wine/dxvk", False) + f + ".dll", "drive_c/windows/system32",
++                    try_copy(g_proton.arch_pe_dir(dxvk_dir, False) + f + ".dll", "drive_c/windows/system32",
+                             prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+-                    try_copy(g_proton.arch_pe_dir("wine/dxvk", True) + f + ".dll", "drive_c/windows/syswow64",
++                    try_copy(g_proton.arch_pe_dir(dxvk_dir, True) + f + ".dll", "drive_c/windows/syswow64",
+                             prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+                     g_session.dlloverrides[f] = "n"
+ 
+@@ -2190,6 +2214,31 @@ class Session:
+             self.compat_config.discard(config_name)
+         return True
+ 
++    def select_dxvk_variant(self):
++        """Resolve the DXVK variant, highest priority first: the environment
++        (launch options or user_settings.py), the dxvklegacy / nodxvklegacy
++        tokens, the per-AppID default, then the primary DXVK.  Leaves the
++        decision in compat_config as "dxvklegacy" and returns the reason."""
++        reason = "none"
++        if "PROTON_DXVK_LEGACY" in self.env:
++            reason = "env"
++        elif "nodxvklegacy" in self.compat_config or "dxvklegacy" in self.compat_config:
++            reason = "token"
++            if "nodxvklegacy" in self.compat_config:
++                # Both tokens: fail safe to the primary DXVK.
++                self.compat_config.discard("dxvklegacy")
++        else:
++            appid = self.env.get("SteamGameId", "")
++            if not appid:
++                umu_id = self.env.get("UMU_ID", "")
++                if umu_id.startswith("umu-") and umu_id[4:].isdigit():
++                    appid = umu_id[4:]
++            if appid in DXVK_LEGACY_DEFAULT_APPIDS:
++                self.compat_config.add("dxvklegacy")
++                reason = "appid-default"
++        self.check_environment("PROTON_DXVK_LEGACY", "dxvklegacy")
++        return reason
++
+     def try_log_slr_versions(self):
+         try:
+             if "PRESSURE_VESSEL_RUNTIME_BASE" in self.env:
+@@ -2340,6 +2389,8 @@ class Session:
+         if "wined3d11" in self.compat_config:
+             self.compat_config.add("wined3d")
+ 
++        self.dxvk_legacy_reason = self.select_dxvk_variant()
++
+         self.check_environment("PROTON_USE_WOW64", "wow64")
+         if not self.check_environment("PROTON_USE_WINED3D", "wined3d"):
+             self.check_environment("PROTON_USE_WINED3D11", "wined3d")

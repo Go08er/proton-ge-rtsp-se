@@ -16,7 +16,7 @@ FFMPEG_SECURITY_PATCH_ROOT="$ROOT_DIR/patches/ffmpeg-security"
 FFMPEG_SECURITY_PATCH_SERIES="$ROOT_DIR/patches/ffmpeg-security/series"
 FFMPEG_CRYPTO_BUILD_PATCH_ROOT="$ROOT_DIR/patches/ffmpeg-build"
 FFMPEG_CRYPTO_BUILD_PATCH_SERIES="$ROOT_DIR/patches/ffmpeg-build/series"
-PROTON_LAUNCHER_PATCH="$ROOT_DIR/patches/proton/0001-launcher-add-scoped-xrizer-mode.patch"
+PROTON_LAUNCHER_PATCH=""
 
 usage() {
   cat <<'EOF'
@@ -78,6 +78,8 @@ done
 
 pinned_ge_load_config
 FFMPEG_CRYPTO_BUILD_PATCH_SERIES="$(pinned_ge_ffmpeg_crypto_build_series)"
+# Selected by the pin's launcher policy; empty for the unmodified upstream launcher.
+PROTON_LAUNCHER_PATCH="$(pinned_ge_launcher_patch_file)"
 [[ -n "$SOURCE_DIR" ]] || SOURCE_DIR="$(pinned_ge_default_source)"
 [[ -n "$STATE_DIR" ]] || STATE_DIR="$(pinned_ge_default_state_dir)"
 SOURCE_DIR="$(realpath -m -- "$SOURCE_DIR")"
@@ -399,9 +401,19 @@ if [[ "$PIN_SCHEMA_VERSION" == 5 ]]; then
     aac_parser_patch="$(pinned_ge_aac_parser_build_patch)"
     pinned_ge_git -C "$SOURCE_DIR" apply --check --whitespace=error-all -- "$aac_parser_patch"
     pinned_ge_git -C "$SOURCE_DIR" apply --whitespace=error-all -- "$aac_parser_patch"
+    # Its own postimage: the dual-DXVK module, when pinned, is applied after it.
     [[ "$(pinned_ge_git -C "$SOURCE_DIR" hash-object --no-filters -- Makefile.in)" \
-        == "$(pinned_ge_ffmpeg_final_makefile_blob)" ]] \
+        == "$PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB" ]] \
       || pinned_ge_fail "AAC-parser-enabled Makefile differs from its pin"
+  fi
+  if [[ -n "${PIN_DXVK_LEGACY_MAKEFILE_PATCH_SHA256:-}" ]]; then
+    # Last module in the Makefile.in chain: ships the legacy DXVK beside the primary one.
+    dxvk_legacy_patch="$(pinned_ge_dxvk_legacy_makefile_patch)"
+    pinned_ge_git -C "$SOURCE_DIR" apply --check --whitespace=error-all -- "$dxvk_legacy_patch"
+    pinned_ge_git -C "$SOURCE_DIR" apply --whitespace=error-all -- "$dxvk_legacy_patch"
+    [[ "$(pinned_ge_git -C "$SOURCE_DIR" hash-object --no-filters -- Makefile.in)" \
+        == "$(pinned_ge_final_makefile_blob)" ]] \
+      || pinned_ge_fail "dxvk-legacy-enabled Makefile differs from its pin"
   fi
 fi
 
@@ -457,9 +469,10 @@ else
   "$ROOT_DIR/scripts/audit-ffmpeg-source.sh" --source "$SOURCE_DIR" >/dev/null
 fi
 
-if [[ "$PIN_PROTON_LAUNCHER_POLICY" == scoped-xrizer ]]; then
+if [[ -n "$PROTON_LAUNCHER_PATCH" ]]; then
+  # Policies scoped-xrizer and dxvk-legacy each carry one launcher patch.
   [[ -f "$PROTON_LAUNCHER_PATCH" && ! -L "$PROTON_LAUNCHER_PATCH" ]] \
-    || pinned_ge_fail "Proton XRizer launcher patch is absent or unsafe"
+    || pinned_ge_fail "Proton launcher patch is absent or unsafe"
   pinned_ge_git -C "$SOURCE_DIR" apply --check -- "$PROTON_LAUNCHER_PATCH"
   pinned_ge_git -C "$SOURCE_DIR" apply -- "$PROTON_LAUNCHER_PATCH"
 else
@@ -501,6 +514,17 @@ rg -Fq 'ninja -j"$$(NINJA_JOBS)" -C "$$($(2)_$(3)_OBJ)" install' \
 
 pinned_ge_nvidia_build_rules "$SOURCE_DIR" normalize
 
+# Dual DXVK: export the pinned legacy tree (verified against the stores' commit and
+# tree ids and against PIN_DXVK_LEGACY_TREE_SHA256) before the root state digest, so
+# the .git/info/exclude entry is in place when the root checkout is inventoried.
+dxvk_legacy_source_digest=""
+if pinned_ge_dxvk_legacy_enabled; then
+  [[ ! -e "$SOURCE_DIR/dxvk-legacy" && ! -L "$SOURCE_DIR/dxvk-legacy" ]] \
+    || pinned_ge_fail "legacy DXVK export target already exists: dxvk-legacy"
+  bash "$ROOT_DIR/scripts/export-dxvk-legacy-source.sh" \
+    --source "$SOURCE_DIR" --config "$PINNED_GE_CONFIG_PATH" >/dev/null
+  dxvk_legacy_source_digest="$(pinned_ge_dxvk_legacy_source_digest "$SOURCE_DIR/dxvk-legacy")"
+fi
 root_state_digest="$(pinned_ge_repo_state_digest "$SOURCE_DIR" "$CONTRIB_MANIFEST")"
 wine_mono_source_digest=""
 if pinned_ge_has_mono_source "$SOURCE_DIR"; then
@@ -569,6 +593,7 @@ source_realpath="$(cd "$SOURCE_DIR" && pwd -P)"
   printf 'proton_launcher_patch\t%s\n' \
     "$(pinned_ge_launcher_patch_record)"
   printf 'proton_launcher_patch_sha256\t%s\n' "$proton_launcher_patch_sha256"
+  pinned_ge_dxvk_legacy_records "$dxvk_legacy_source_digest"
   printf 'patch_audit_sha256\t%s\n' "$patch_audit_sha256"
   printf 'source_audit_sha256\t%s\n' "$source_audit_sha256"
   if [[ "$PIN_SCHEMA_VERSION" == 5 ]]; then

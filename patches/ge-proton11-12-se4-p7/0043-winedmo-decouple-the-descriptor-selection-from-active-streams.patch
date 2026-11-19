@@ -1,0 +1,64 @@
+Subject: [SE4-P2] winedmo: decouple the descriptor's stream selection from active streams
+
+GE-Proton11-12's Wine bump made media_source_CreatePresentationDescriptor()
+select only the streams that are active, so that a descriptor created after
+Start reports the selection that was started. In the base, streams are
+created active, so the default descriptor still selects every stream.
+0002 creates streams inactive, because the demux thread idles until a
+stream is active, and its Stop deactivates them. Together, a descriptor
+created before the first Start, or after Stop, selected nothing: MFPlay's
+SetMediaItem failed with E_INVALIDARG, and a SourceReader client that
+reads without SetStreamSelection() had its reads refused.
+
+Track the reported selection in its own field: every stream until the
+first Start, then the streams of the last committed Start. Stop, a failed
+seek and Shutdown leave it alone, as the base and Wine's mfsrcsnk source
+leave their selection on Stop. 'active' and all of its readers are
+unchanged.
+
+Compile-checked only (x86_64 and i386, the SE4-P1 build's per-file commands,
+-Werror); not runtime-qualified.
+
+---
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -284,6 +284,9 @@
+ 
+     DWORD stream_id;
+     BOOL active;
++    /* Selection reported by CreatePresentationDescriptor, under source->cs:
++     * every stream until the first Start, then the last committed Start. */
++    BOOL selected;
+     BOOL paused;
+     BOOL eos;
+     LONG eos_epoch;
+@@ -1428,6 +1431,7 @@
+         if (was_active && !descriptors[i])
+             ++stream->request_generation;
+         stream->active = !!descriptors[i];
++        stream->selected = stream->active;
+         if (!stream->active)
+         {
+             media_packet_queue_flush(stream);
+@@ -2351,6 +2355,7 @@
+     object->descriptor = descriptor;
+ 
+     object->active = FALSE;
++    object->selected = TRUE;
+     object->eos = FALSE;
+     object->stream_index = stream_index;
+     object->is_video = is_video;
+@@ -2849,9 +2854,11 @@
+                 (const BYTE *)&source->origin, sizeof(source->origin))))
+             WARN("Failed to set presentation origin, hr %#lx.\n", hr);
+ 
++        /* Not 'active': streams stay inactive until Start so that the demux
++         * thread idles, and Stop or a failed seek deactivates them. */
+         for (i = 0; i < source->stream_count; ++i)
+         {
+-            if (!source->streams[i]->active)
++            if (!source->streams[i]->selected)
+                 continue;
+ 
+             if (FAILED(hr = IMFPresentationDescriptor_SelectStream(*descriptor, i)))

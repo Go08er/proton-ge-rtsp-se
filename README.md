@@ -60,10 +60,11 @@ documentation, not this overview.
 
 ## Development on main
 
-`main` carries an unreleased development candidate, SE4-P6 (GE-Proton11-12
-base), as source only: it is not tagged and has no binary. The latest release
-is SE3. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for what it contains,
-how to build it and its testing status.
+`main` carries an unreleased development candidate, SE4-P7 (GE-Proton11-12
+base, with a selectable second, older DXVK), as source only: it is not tagged
+and has no binary. The latest release is SE3. See
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for what it contains, how to build
+it and its testing status.
 
 ## Start here
 

@@ -38,20 +38,35 @@ print('--entrypoint=' + shlex.quote(json.dumps(command, separators=(',', ':'))))
 PY
 }
 
+# Policy -> carried launcher patch (project-relative path, or none).
 pinned_ge_launcher_patch_record() {
-  if [[ "$PIN_PROTON_LAUNCHER_POLICY" == upstream ]]; then
-    printf 'none\n'
+  case "$PIN_PROTON_LAUNCHER_POLICY" in
+    upstream) printf 'none\n' ;;
+    scoped-xrizer) printf 'patches/proton/0001-launcher-add-scoped-xrizer-mode.patch\n' ;;
+    dxvk-legacy) printf 'patches/proton/0002-launcher-add-dxvk-legacy-selection.patch\n' ;;
+    *) pinned_ge_fail "unsupported Proton launcher policy" || return 1 ;;
+  esac
+}
+
+# Absolute path of the selected policy's launcher patch; empty for upstream.
+pinned_ge_launcher_patch_file() {
+  local record
+  record="$(pinned_ge_launcher_patch_record)" || return 1
+  if [[ "$record" == none ]]; then
+    printf '\n'
   else
-    printf 'patches/proton/0001-launcher-add-scoped-xrizer-mode.patch\n'
+    printf '%s\n' "$PINNED_GE_ROOT/$record"
   fi
 }
 
 pinned_ge_launcher_patch_sha256() {
-  if [[ "$PIN_PROTON_LAUNCHER_POLICY" == upstream ]]; then
+  local record
+  record="$(pinned_ge_launcher_patch_record)" || return 1
+  if [[ "$record" == none ]]; then
     # Digest of the empty patch set, not the digest of the launcher itself.
     printf '' | sha256sum | cut -d ' ' -f 1
   else
-    pinned_ge_sha256 "$PINNED_GE_ROOT/$(pinned_ge_launcher_patch_record)"
+    pinned_ge_sha256 "$PINNED_GE_ROOT/$record"
   fi
 }
 
@@ -107,7 +122,13 @@ pinned_ge_load_config() {
     PIN_GE_PATCH_OVERLAP_MANIFEST
     PIN_GE_PATCH_OVERLAP_MANIFEST_SHA256
   )
+  local -a dxvk_legacy_keys=(
+    PIN_DXVK_LEGACY_COMMIT PIN_DXVK_LEGACY_TREE PIN_DXVK_LEGACY_VERSION_TAG
+    PIN_DXVK_LEGACY_NESTED PIN_DXVK_LEGACY_TREE_SHA256
+    PIN_DXVK_LEGACY_MAKEFILE_PATCH_SHA256 PIN_DXVK_LEGACY_MAKEFILE_BLOB
+  )
   local -a optional_keys=(PIN_PROTON_LAUNCHER_POLICY
+    "${dxvk_legacy_keys[@]}"
     PIN_FFMPEG_CRYPTO_BUILD_SERIES
     PIN_FFMPEG_DAV1D_PATCH_SHA256 PIN_FFMPEG_DAV1D_MAKEFILE_BLOB
     PIN_FFMPEG_MPEGVIDEO_PATCH_SHA256 PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB
@@ -159,7 +180,7 @@ pinned_ge_load_config() {
   # select the unmodified upstream launcher without changing old identities.
   PIN_PROTON_LAUNCHER_POLICY="${PIN_PROTON_LAUNCHER_POLICY:-scoped-xrizer}"
   case "$PIN_PROTON_LAUNCHER_POLICY" in
-    scoped-xrizer|upstream) ;;
+    scoped-xrizer|upstream|dxvk-legacy) ;;
     *) pinned_ge_fail "unsupported Proton launcher policy" || return 1 ;;
   esac
 
@@ -345,6 +366,29 @@ pinned_ge_load_config() {
   done
   [[ "$PIN_WITHOUT_NVIDIA_LIBS" =~ ^[01]$ && "$PIN_WITHOUT_VKLAYERS" =~ ^[01]$ ]] \
     || pinned_ge_fail "optional-component flags must be 0 or 1" || return 1
+  # Dual DXVK: the policy and the seven legacy-source keys come together or
+  # not at all, so a launcher that selects dxvk-legacy always has the payload.
+  legacy_key_count=0
+  for name in "${dxvk_legacy_keys[@]}"; do
+    [[ -z "${!name:-}" ]] || legacy_key_count=$((legacy_key_count + 1))
+  done
+  if [[ "$legacy_key_count" != 0 || "$PIN_PROTON_LAUNCHER_POLICY" == dxvk-legacy ]]; then
+    [[ "$legacy_key_count" == "${#dxvk_legacy_keys[@]}" \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == dxvk-legacy \
+        && "$PIN_SCHEMA_VERSION" == 5 \
+        && -n "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" ]] \
+      || pinned_ge_fail "dual DXVK requires launcher policy dxvk-legacy, schema 5, the AAC build module and every PIN_DXVK_LEGACY_* key" || return 1
+    [[ "$PIN_DXVK_LEGACY_COMMIT" =~ ^[0-9a-f]{40}$ \
+        && "$PIN_DXVK_LEGACY_TREE" =~ ^[0-9a-f]{40}$ \
+        && "$PIN_DXVK_LEGACY_VERSION_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-g[0-9a-f]{15}$ \
+        && "$PIN_DXVK_LEGACY_TREE_SHA256" =~ ^[0-9a-f]{64}$ \
+        && "$PIN_DXVK_LEGACY_MAKEFILE_PATCH_SHA256" =~ ^[0-9a-f]{64}$ \
+        && "$PIN_DXVK_LEGACY_MAKEFILE_BLOB" =~ ^[0-9a-f]{40}$ ]] \
+      || pinned_ge_fail "malformed PIN_DXVK_LEGACY_* identity" || return 1
+    [[ "$PIN_DXVK_LEGACY_VERSION_TAG" == *"-g${PIN_DXVK_LEGACY_COMMIT:0:15}" ]] \
+      || pinned_ge_fail "PIN_DXVK_LEGACY_VERSION_TAG does not describe PIN_DXVK_LEGACY_COMMIT" || return 1
+    pinned_ge_dxvk_legacy_rows >/dev/null || return 1
+  fi
   if [[ -n "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]]; then
     [[ "$PIN_SCHEMA_VERSION" == 5 \
         && "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}" =~ ^[0-9a-f]{64}$ \
@@ -635,6 +679,21 @@ pinned_ge_rtsps_transport_patch() {
 
 pinned_ge_ffmpeg_final_makefile_blob() {
   printf '%s\n' "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB}}}"
+}
+
+# The final root Makefile.in postimage of the whole module chain: the dual-DXVK
+# module is applied after the FFmpeg modules, so its blob is the final one when
+# the pin has it. FFmpeg-only pins are unchanged.
+pinned_ge_final_makefile_blob() {
+  printf '%s\n' "${PIN_DXVK_LEGACY_MAKEFILE_BLOB:-$(pinned_ge_ffmpeg_final_makefile_blob)}"
+}
+
+pinned_ge_dxvk_legacy_makefile_patch() {
+  local patch="$PINNED_GE_ROOT/patches/proposed/dxvk-legacy-build-module.patch"
+  [[ -n "${PIN_DXVK_LEGACY_MAKEFILE_PATCH_SHA256:-}" \
+      && "$(pinned_ge_sha256 "$patch")" == "$PIN_DXVK_LEGACY_MAKEFILE_PATCH_SHA256" ]] \
+    || pinned_ge_fail "dxvk-legacy build patch differs from the selected pin" || return 1
+  printf '%s\n' "$patch"
 }
 
 pinned_ge_mpegvideo_build_patch() {
@@ -1335,7 +1394,7 @@ pinned_ge_require_source_identity() {
     [[ "$PIN_SCHEMA_VERSION" == 5 \
         && "$(pinned_ge_git -C "$source" \
           hash-object --no-filters -- Makefile.in)" \
-          == "$(pinned_ge_ffmpeg_final_makefile_blob)" ]] \
+          == "$(pinned_ge_final_makefile_blob)" ]] \
       || pinned_ge_fail \
         "GE Makefile.in is neither the accepted snapshot nor the selected schema-5 build result" \
       || return 1
@@ -1728,6 +1787,220 @@ pinned_ge_repo_state_digest() {
   } | sha256sum | awk '{print $1}'
 }
 
+# ---------------------------------------------------------------------------
+# Dual DXVK (policy dxvk-legacy): the legacy DXVK source tree.
+#
+# The tree is not a submodule. It is exported at prepare time with `git
+# archive` from the already materialized DXVK object stores, after every
+# commit and tree id has been checked against the pin, into
+# $SOURCE_DIR/dxvk-legacy/dxvk (no .git). The root checkout ignores it through
+# .git/info/exclude, so the GE root state digest is unchanged; the exported
+# tree is bound separately by dxvk_legacy_source_sha256.
+# ---------------------------------------------------------------------------
+
+pinned_ge_dxvk_legacy_enabled() {
+  [[ -n "${PIN_DXVK_LEGACY_COMMIT:-}" ]]
+}
+
+# Rows "<path inside dxvk>\t<commit>\t<tree>": "." is DXVK itself, then the
+# nested pins in pin order (a parent must precede its children; verify_stores
+# fails otherwise, because it resolves each gitlink in the earlier row).
+pinned_ge_dxvk_legacy_rows() {
+  local entry path commit tree seen_rows=","
+  local -a entries
+  printf '.\t%s\t%s\n' "$PIN_DXVK_LEGACY_COMMIT" "$PIN_DXVK_LEGACY_TREE"
+  IFS=',' read -r -a entries <<<"$PIN_DXVK_LEGACY_NESTED"
+  [[ "${#entries[@]}" -gt 0 ]] \
+    || pinned_ge_fail "PIN_DXVK_LEGACY_NESTED is empty" || return 1
+  for entry in "${entries[@]}"; do
+    IFS=: read -r path commit tree <<<"$entry"
+    [[ "$entry" == "$path:$commit:$tree" \
+        && "$path" =~ ^[A-Za-z0-9_-][A-Za-z0-9._/-]*$ \
+        && "$path" != */ && "$path" != *//* && "$path" != *..* \
+        && "$commit" =~ ^[0-9a-f]{40}$ && "$tree" =~ ^[0-9a-f]{40}$ ]] \
+      || pinned_ge_fail "malformed PIN_DXVK_LEGACY_NESTED entry: $entry" || return 1
+    [[ "$seen_rows" != *",$path,"* ]] \
+      || pinned_ge_fail "PIN_DXVK_LEGACY_NESTED path is repeated: $path" || return 1
+    seen_rows="$seen_rows$path,"
+    printf '%s\t%s\t%s\n' "$path" "$commit" "$tree"
+  done
+}
+
+# Check, in the materialized object stores and without any fetch, that each
+# pinned commit exists, has the pinned tree, and is the gitlink its parent
+# pins. Prints nothing; fails closed on the first difference.
+pinned_ge_dxvk_legacy_verify_stores() {
+  local source="$1" rows path commit tree repo actual
+  local parent_path parent_commit parent_repo relative link candidate
+  local -A commit_of=() repo_of=()
+
+  rows="$(pinned_ge_dxvk_legacy_rows)" || return 1
+  while IFS=$'\t' read -r path commit tree; do
+    if [[ "$path" == . ]]; then repo="$source/dxvk"; else repo="$source/dxvk/$path"; fi
+    [[ -d "$repo" && ! -L "$repo" && -e "$repo/.git" ]] \
+      || pinned_ge_fail "legacy DXVK store is absent: dxvk/$path" || return 1
+    pinned_ge_git -C "$repo" cat-file -e "$commit^{commit}" 2>/dev/null \
+      || pinned_ge_fail "legacy DXVK commit $commit is absent from the store dxvk/$path" || return 1
+    actual="$(pinned_ge_git -C "$repo" rev-parse --verify "$commit^{tree}" 2>/dev/null)" \
+      || pinned_ge_fail "legacy DXVK commit $commit has no readable tree in dxvk/$path" || return 1
+    [[ "$actual" == "$tree" ]] \
+      || pinned_ge_fail "legacy DXVK tree of dxvk/$path is $actual, expected $tree" || return 1
+    commit_of["$path"]="$commit"
+    repo_of["$path"]="$repo"
+    if [[ "$path" != . ]]; then
+      # The nearest enclosing pinned repository must pin this commit as a gitlink.
+      parent_path="."
+      for candidate in "${!commit_of[@]}"; do
+        if [[ "$candidate" != . && "$path" == "$candidate"/* \
+            && ( "$parent_path" == . || "${#candidate}" -gt "${#parent_path}" ) ]]; then
+          parent_path="$candidate"
+        fi
+      done
+      parent_commit="${commit_of[$parent_path]}"
+      parent_repo="${repo_of[$parent_path]}"
+      if [[ "$parent_path" == . ]]; then relative="$path"; else relative="${path#"$parent_path"/}"; fi
+      link="$(pinned_ge_git -C "$parent_repo" ls-tree "$parent_commit" -- "$relative" \
+        | awk -F '[ \t]' '$1 == "160000" && $2 == "commit" {print $3}')"
+      [[ "$link" == "$commit" ]] \
+        || pinned_ge_fail "dxvk/$path is not the gitlink pinned by its parent legacy commit" || return 1
+    fi
+  done <<<"$rows"
+}
+
+# Verify an extracted tree of one repository against the committed objects:
+# exactly the committed blobs, byte for byte (git blob ids), with the
+# committed executable bits and no symlinks or extra files.
+pinned_ge_dxvk_legacy_check_extracted() {
+  local repo="$1" commit="$2" stage="$3"
+  pinned_ge_git -C "$repo" ls-tree -r -z "$commit" \
+    | python3 -I -c '
+import hashlib, os, stat, sys
+stage = sys.argv[1]
+expected = {}
+for record in sys.stdin.buffer.read().split(b"\0"):
+    if not record:
+        continue
+    meta, _, path = record.partition(b"\t")
+    mode, kind, oid = meta.decode().split()
+    if kind == "commit":
+        continue
+    if mode not in ("100644", "100755") or kind != "blob":
+        raise SystemExit("unsupported tree entry (%s %s): %s" % (mode, kind, path.decode(errors="replace")))
+    expected[os.fsdecode(path)] = (mode, oid)
+found = set()
+for directory, names, files in os.walk(stage):
+    for name in files + [n for n in names if os.path.islink(os.path.join(directory, n))]:
+        found.add(os.path.relpath(os.path.join(directory, name), stage))
+if found != set(expected):
+    raise SystemExit("extracted file set differs from the commit: +%d -%d" % (
+        len(found - set(expected)), len(set(expected) - found)))
+for path, (mode, oid) in expected.items():
+    full = os.path.join(stage, path)
+    info = os.lstat(full)
+    if not stat.S_ISREG(info.st_mode):
+        raise SystemExit("not a regular file: " + path)
+    with open(full, "rb") as handle:
+        data = handle.read()
+    if hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() != oid:
+        raise SystemExit("content differs from the committed blob: " + path)
+    if bool(info.st_mode & 0o111) != (mode == "100755"):
+        raise SystemExit("executable bit differs from the commit: " + path)
+' "$stage"
+}
+
+pinned_ge_dxvk_legacy_source_digest() {
+  local tree="$1" digest
+  [[ -d "$tree" && ! -L "$tree" ]] \
+    || pinned_ge_fail "legacy DXVK source tree is absent or unsafe: $tree" || return 1
+  digest="$(bash "$PINNED_GE_ROOT/scripts/hash-source-tree.sh" --tree "$tree" \
+    | awk -F '\t' '$1 == "normalized_tar_sha256" {print $2}')" || return 1
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] \
+    || pinned_ge_fail "could not hash the legacy DXVK source tree" || return 1
+  printf '%s\n' "$digest"
+}
+
+# Export the pinned legacy tree to "$2" (must not exist; its parent must).
+# Deterministic: fixed archive and process umask, no user/system Git config.
+pinned_ge_dxvk_legacy_export() (
+  set -euo pipefail
+  local source="$1" dest="$2" rows path commit tree repo stage work n=0
+  local -a scratch=()
+  trap 'rm -rf -- ${scratch[@]+"${scratch[@]}"}' EXIT
+
+  pinned_ge_dxvk_legacy_enabled \
+    || pinned_ge_fail "selected pin has no legacy DXVK source" || return 1
+  [[ ! -e "$dest" && ! -L "$dest" && -d "$(dirname -- "$dest")" ]] \
+    || pinned_ge_fail "legacy DXVK export destination exists or has no parent: $dest" || return 1
+  pinned_ge_dxvk_legacy_verify_stores "$source" || return 1
+  export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+  umask 022
+  work="$(mktemp -d "$(dirname -- "$dest")/.dxvk-legacy-export.XXXXXX")"
+  scratch+=("$work")
+  chmod 0755 "$work"
+  mkdir -m 0755 "$work/tree" "$work/tree/dxvk" "$work/stage"
+  rows="$(pinned_ge_dxvk_legacy_rows)"
+  while IFS=$'\t' read -r path commit tree; do
+    n=$((n + 1))
+    if [[ "$path" == . ]]; then repo="$source/dxvk"; else repo="$source/dxvk/$path"; fi
+    stage="$work/stage/$n"
+    mkdir -m 0755 "$stage"
+    pinned_ge_git -c tar.umask=0022 -C "$repo" archive --format=tar "$commit" \
+      | tar -x -p --no-same-owner -C "$stage" \
+      || pinned_ge_fail "git archive failed for dxvk/$path" || return 1
+    pinned_ge_dxvk_legacy_check_extracted "$repo" "$commit" "$stage" \
+      || pinned_ge_fail "exported legacy DXVK files differ from the committed objects: dxvk/$path" || return 1
+  done <<<"$rows"
+  # Assemble parents first so every nested tree lands in its gitlink directory.
+  n=0
+  while IFS=$'\t' read -r path commit tree; do
+    n=$((n + 1))
+    if [[ "$path" == . ]]; then
+      cp -a -- "$work/stage/$n/." "$work/tree/dxvk/"
+    else
+      # shellcheck disable=SC2174 # intended: -m sets the mode only of a directory this call creates
+      mkdir -p -m 0755 -- "$work/tree/dxvk/$path"
+      cp -a -- "$work/stage/$n/." "$work/tree/dxvk/$path/"
+    fi
+  done <<<"$rows"
+  mv -T -- "$work/tree" "$dest"
+)
+
+# Keep the exported tree out of the root checkout's untracked-file inventory.
+pinned_ge_dxvk_legacy_ensure_excluded() {
+  local source="$1" exclude
+  exclude="$(pinned_ge_git -C "$source" rev-parse --git-path info/exclude)" || return 1
+  [[ "$exclude" == /* ]] || exclude="$source/$exclude"
+  mkdir -p -- "$(dirname -- "$exclude")" || return 1
+  grep -qxF '/dxvk-legacy/' "$exclude" 2>/dev/null \
+    || printf '/dxvk-legacy/\n' >>"$exclude"
+}
+
+# State records for the prepared state and the build invocation. Empty for
+# pins without the legacy DXVK, so historical receipts stay byte-identical.
+pinned_ge_dxvk_legacy_records() {
+  local source_sha256="$1"
+  pinned_ge_dxvk_legacy_enabled || return 0
+  printf 'dxvk_legacy_commit\t%s\n' "$PIN_DXVK_LEGACY_COMMIT"
+  printf 'dxvk_legacy_source_sha256\t%s\n' "$source_sha256"
+  printf 'dxvk_legacy_makefile_patch_sha256\t%s\n' "$PIN_DXVK_LEGACY_MAKEFILE_PATCH_SHA256"
+  printf 'dxvk_legacy_makefile_blob\t%s\n' "$PIN_DXVK_LEGACY_MAKEFILE_BLOB"
+}
+
+# Re-hash the exported tree and compare it with the pin and with every record.
+pinned_ge_require_dxvk_legacy_state() {
+  local source="$1" state_file="$2" digest key expected
+  pinned_ge_dxvk_legacy_enabled || return 0
+  digest="$(pinned_ge_dxvk_legacy_source_digest "$source/dxvk-legacy")" || return 1
+  [[ "$digest" == "$PIN_DXVK_LEGACY_TREE_SHA256" ]] \
+    || pinned_ge_fail "exported legacy DXVK tree differs from PIN_DXVK_LEGACY_TREE_SHA256" || return 1
+  pinned_ge_dxvk_legacy_makefile_patch >/dev/null || return 1
+  while IFS=$'\t' read -r key expected; do
+    [[ -n "$key" ]] || continue
+    [[ "$(pinned_ge_state_value "$state_file" "$key")" == "$expected" ]] \
+      || pinned_ge_fail "prepared-state legacy DXVK record differs for $key" || return 1
+  done < <(pinned_ge_dxvk_legacy_records "$digest")
+}
+
 pinned_ge_require_prepared_ffmpeg_security_provenance() (
   set -euo pipefail
 
@@ -1976,7 +2249,9 @@ pinned_ge_require_prepared_ffmpeg_crypto_build_provenance() (
   local source="$1"
   local state_dir="$2"
   local state_file patch_root series audit record entry origin patch_sha
-  local series_digest makefile_blob enable_count chain_makefile_dir
+  local series_digest makefile_blob enable_count chain_makefile_dir base_makefile_dir
+  local -a scratch_dirs=()
+  trap 'rm -rf -- ${scratch_dirs[@]+"${scratch_dirs[@]}"}' EXIT
 
   source="$(realpath -e -- "$source")"
   state_dir="$(realpath -e -- "$state_dir")"
@@ -2000,21 +2275,37 @@ pinned_ge_require_prepared_ffmpeg_crypto_build_provenance() (
     || return 1
   makefile_blob="$(pinned_ge_git -C "$source" \
     hash-object --no-filters -- Makefile.in)"
-  [[ "$makefile_blob" == "$(pinned_ge_ffmpeg_final_makefile_blob)" ]] \
+  [[ "$makefile_blob" == "$(pinned_ge_final_makefile_blob)" ]] \
     || pinned_ge_fail "FFmpeg final Makefile differs from its pin" \
     || return 1
+  # The dual-DXVK module (last in the chain) is peeled first, on a scratch copy
+  # in its own throwaway repository; the FFmpeg checks below then see the
+  # FFmpeg-final Makefile exactly as for pins without it.
+  base_makefile_dir="$source"
+  if [[ -n "${PIN_DXVK_LEGACY_MAKEFILE_PATCH_SHA256:-}" ]]; then
+    base_makefile_dir="$(mktemp -d "${TMPDIR:-/tmp}/dxvk-legacy-makefile-chain.XXXXXX")"
+    scratch_dirs+=("$base_makefile_dir")
+    pinned_ge_git -C "$base_makefile_dir" init --quiet || return 1
+    cp -- "$source/Makefile.in" "$base_makefile_dir/Makefile.in"
+    pinned_ge_git -C "$base_makefile_dir" apply --reverse --whitespace=error-all -- \
+      "$(pinned_ge_dxvk_legacy_makefile_patch)" \
+      || pinned_ge_fail "dxvk-legacy patch cannot be peeled from the final Makefile" || return 1
+    [[ "$(pinned_ge_git -C "$base_makefile_dir" hash-object --no-filters -- Makefile.in)" \
+        == "$(pinned_ge_ffmpeg_final_makefile_blob)" ]] \
+      || pinned_ge_fail "Makefile without the dxvk-legacy module differs from the FFmpeg module chain" || return 1
+  fi
   # The AAC hunk sits in the trailing context of the MPEGVIDEO hunk, so the
   # earlier modules are checked in reverse application order on a scratch copy
   # (its own throwaway repository) after the AAC module has been peeled for real.
-  chain_makefile_dir="$source"
+  chain_makefile_dir="$base_makefile_dir"
   if [[ -n "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" ]]; then
-    pinned_ge_git -C "$source" apply --check --reverse --whitespace=error-all -- \
+    pinned_ge_git -C "$base_makefile_dir" apply --check --reverse --whitespace=error-all -- \
       "$(pinned_ge_aac_parser_build_patch)" || return 1
     chain_makefile_dir="$(mktemp -d "${TMPDIR:-/tmp}/ffmpeg-makefile-chain.XXXXXX")"
-    trap 'rm -rf -- "$chain_makefile_dir"' EXIT
+    scratch_dirs+=("$chain_makefile_dir")
     # Its own repository, so a parent worktree can never capture the apply.
     pinned_ge_git -C "$chain_makefile_dir" init --quiet || return 1
-    cp -- "$source/Makefile.in" "$chain_makefile_dir/Makefile.in"
+    cp -- "$base_makefile_dir/Makefile.in" "$chain_makefile_dir/Makefile.in"
     pinned_ge_git -C "$chain_makefile_dir" apply --reverse --whitespace=error-all -- \
       "$(pinned_ge_aac_parser_build_patch)" \
       || pinned_ge_fail "AAC parser patch cannot be peeled from the final Makefile" || return 1
@@ -3004,6 +3295,16 @@ ge_patch_overlap_target_blob	$(pinned_ge_state_value "$prepared_state" ge_patch_
 ge_patch_overlap_declared_target_blob	$(pinned_ge_state_value "$prepared_state" ge_patch_overlap_declared_target_blob)
 ge_patch_overlap_residual_diff_sha256	$(pinned_ge_state_value "$prepared_state" ge_patch_overlap_residual_diff_sha256)
 EOF
+  fi
+  if pinned_ge_dxvk_legacy_enabled; then
+    # Dual DXVK: a resumed build must carry the same legacy-source provenance.
+    while IFS=$'\t' read -r key expected; do
+      [[ -n "$key" ]] || continue
+      [[ "$(pinned_ge_state_value "$invocation" "$key")" == "$expected" ]] \
+        || pinned_ge_fail "resume legacy DXVK provenance differs for $key" \
+        || return 1
+    done < <(pinned_ge_dxvk_legacy_records \
+      "$(pinned_ge_state_value "$prepared_state" dxvk_legacy_source_sha256)")
   fi
   if [[ "$version" == 6 ]]; then
     pinned_ge_require_ffmpeg_playback_state "$invocation" || return 1

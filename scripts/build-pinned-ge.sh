@@ -239,7 +239,8 @@ FFMPEG_SECURITY_PATCH_ROOT="$ROOT_DIR/patches/ffmpeg-security"
 FFMPEG_SECURITY_PATCH_SERIES="$ROOT_DIR/patches/ffmpeg-security/series"
 FFMPEG_CRYPTO_BUILD_PATCH_ROOT="$ROOT_DIR/patches/ffmpeg-build"
 FFMPEG_CRYPTO_BUILD_PATCH_SERIES="$(pinned_ge_ffmpeg_crypto_build_series)"
-PROTON_LAUNCHER_PATCH="$ROOT_DIR/patches/proton/0001-launcher-add-scoped-xrizer-mode.patch"
+# Selected by the pin's launcher policy; empty for the unmodified upstream launcher.
+PROTON_LAUNCHER_PATCH="$(pinned_ge_launcher_patch_file)"
 INVOCATION_FILE="$STATE_DIR/build-invocation.tsv"
 CONFIGURE_STATE="$STATE_DIR/configure-state.tsv"
 
@@ -351,7 +352,10 @@ require_state dxvk_repo_state_sha256 \
   "$(pinned_ge_repo_state_digest "$SOURCE_DIR/dxvk")"
 require_state protonfixes_repo_state_sha256 \
   "$(pinned_ge_repo_state_digest "$SOURCE_DIR/protonfixes")"
-if [[ "$PIN_PROTON_LAUNCHER_POLICY" == scoped-xrizer ]]; then
+# Dual DXVK: the exported legacy tree is outside the root state digest (it is in
+# .git/info/exclude), so it is re-hashed here against the pin and the state.
+pinned_ge_require_dxvk_legacy_state "$SOURCE_DIR" "$STATE_FILE"
+if [[ -n "$PROTON_LAUNCHER_PATCH" ]]; then
   pinned_ge_git -C "$SOURCE_DIR" apply --check --reverse -- \
     "$PROTON_LAUNCHER_PATCH"
 else
@@ -569,6 +573,10 @@ write_build_invocation() {
     fi
     printf 'proton_launcher_patch_sha256\t%s\n' \
       "$(pinned_ge_launcher_patch_sha256)"
+    if pinned_ge_dxvk_legacy_enabled; then
+      pinned_ge_dxvk_legacy_records \
+        "$(pinned_ge_state_value "$STATE_FILE" dxvk_legacy_source_sha256)"
+    fi
     if [[ "$PIN_SCHEMA_VERSION" == 5 ]]; then
       printf 'ffmpeg_security_fix_commits\t%s\n' \
         "$PIN_FFMPEG_SECURITY_FIX_COMMITS"
@@ -1238,6 +1246,13 @@ write_artifact_provenance() {
       printf 'GE patch-overlap audit SHA-256: %s\n' \
         "$(pinned_ge_state_value "$STATE_FILE" \
           ge_patch_overlap_audit_sha256)"
+    fi
+    if pinned_ge_dxvk_legacy_enabled; then
+      printf 'DXVK legacy commit: %s\n' "$PIN_DXVK_LEGACY_COMMIT"
+      printf 'DXVK legacy source SHA-256: %s\n' \
+        "$(pinned_ge_state_value "$STATE_FILE" dxvk_legacy_source_sha256)"
+      printf 'DXVK legacy build-module SHA-256: %s\n' \
+        "$PIN_DXVK_LEGACY_MAKEFILE_PATCH_SHA256"
     fi
     printf 'Package release: 0 (local game-test artifact)\n'
     printf 'Project GStreamer payload: none\n'

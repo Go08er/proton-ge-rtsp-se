@@ -276,7 +276,8 @@ def configure_patch_contract(series: Path) -> None:
                                          "ge-proton11-12-se4-p2/",
                                          "ge-proton11-12-se4-p3/",
                                          "ge-proton11-12-se4-p4/",
-                                         "ge-proton11-12-se4-p6/"))}
+                                         "ge-proton11-12-se4-p6/",
+                                         "ge-proton11-12-se4-p7/"))}
     if consolidated:
         if len(consolidated) != 1:
             raise SystemExit("replacement model cannot mix immutable GE11-9 candidates")

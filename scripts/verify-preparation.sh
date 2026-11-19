@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE_DIR="${SOURCE_DIR:-$ROOT_DIR/sources/ge-proton11}"
 PATCH_SERIES="$ROOT_DIR/patches/series"
 WOW64_PROBE="$ROOT_DIR/patches/candidates/0001-winedmo-use-destroy-params-for-wow64-demuxer.patch"
-PROTON_LAUNCHER_PATCH="$ROOT_DIR/patches/proton/0001-launcher-add-scoped-xrizer-mode.patch"
+PROTON_LAUNCHER_PATCH=""
 # shellcheck source=pinned-ge-common.sh
 source "$ROOT_DIR/scripts/pinned-ge-common.sh"
 
@@ -106,6 +106,7 @@ bash "$ROOT_DIR/scripts/prepare-pinned-ge-source.sh" --help >/dev/null
 bash "$ROOT_DIR/scripts/build-pinned-ge.sh" --help >/dev/null
 bash "$ROOT_DIR/scripts/record-pinned-ge-resume-state.sh" --help >/dev/null
 bash "$ROOT_DIR/scripts/verify-pinned-ge-artifact.sh" --help >/dev/null
+bash "$ROOT_DIR/scripts/export-dxvk-legacy-source.sh" --help >/dev/null
 for offline_object_probe in \
     bootstrap-sources.sh \
     materialize-ge-wine.sh \
@@ -158,6 +159,8 @@ else
 fi
 
 pinned_ge_load_config
+# Selected by the pin's launcher policy; empty for the unmodified upstream launcher.
+PROTON_LAUNCHER_PATCH="$(pinned_ge_launcher_patch_file)"
 [[ "$PIN_SCHEMA_VERSION" == 5 ]] \
   || fail "selected security-refresh build does not use pin schema 5"
 [[ "$PINNED_GE_HAS_RETAINED_RESUME" == 0 ]] \
@@ -1107,6 +1110,66 @@ case "$PIN_ID" in
     [[ "${PIN_GE_SKIP_PATCHES:-}" == patches/wine-hotfixes/pending/rtworkq-dont-hold-queues-section-during-system-queue-shutdown.patch:fa65977bda168c863cffea3faa0643f21c0f990524e7e90fe1105794e501bc7d,patches/protonfixes/0003-gamefix-kingdoms-of-amalur-re-reckoning-d3dcompiler.patch:30f6b9b5bd427eadeb114a748fa4ed6666d11f26e26447f6492daa31d0e17311 ]] \
       || fail "SE4-P6 must skip exactly GE's rtworkq post-series hotfix and protonfixes 0003"
     ;;
+  ge-proton11-12-se4-p7)
+    # SE4-P7 (2026-11-19, DRAFT until phase B re-derives the two digests below): dual DXVK.
+    # The SE4-P6 pin with PIN_ID, PIN_BUILD_NAME and the launcher policy (dxvk-legacy) changed and the
+    # PIN_DXVK_LEGACY_* keys added; FFmpeg companions E5/E6 and the Wine series are SE4-P6's. Other
+    # GE11-12 fields, FFmpeg modules and skips as SE4-P6; the SE4-P1 profile token is reused.
+    SELECTED_PROFILE=se4p1
+    # Digest-derived values: the only two lines phase B changes when it appends media patches
+    # (work/se4p7-dev-20261119/phase-d/rederive-p7.sh prints both).
+    selected_pin_sha256=61b6be5cda6fb689b2a86747e919e2520157f49744f44be3e1c98fdf6df63871
+    # Series digest of patches/series-ge-proton11-12-se4-p7 (pinned_ge_series_digest).
+    selected_residual_digest=9d6f978f89e4e73ce4c9938a03ce3c0a6aa3718320ee214ad521ce661ddb2029
+    [[ "$(pinned_ge_sha256 "$PINNED_GE_CONFIG_PATH")" == "$selected_pin_sha256" \
+        && "$PIN_BUILD_NAME" == proton-ge-11-12-rtsp-se4-p7 \
+        && "$PIN_KIND" == release-tag \
+        && "$PIN_SOURCE_REF" == refs/tags/GE-Proton11-12 \
+        && "$PIN_SOURCE_COMMIT" == f85547f0ea51ac356ab42b4de57b927b0044cc85 \
+        && "$PIN_SOURCE_TREE" == b8286f4c76ec63a6b2096ab111d04d410bba19de \
+        && "$PIN_WINE_COMMIT" == fda79a585939fb7512dc220a11249f9ffe825fcf \
+        && "$PIN_WINE_STAGING_COMMIT" == 6cc805ea57132eeaf44764e9213823c9b8d0d300 \
+        && "$PIN_FFMPEG_COMMIT" == 9047fa1b084f76b1b4d065af2d743df1b40dfb56 \
+        && "$PIN_PATCH_DRIVER_BLOB" == f0d6510f75de69d17a6fb6278fe308541a4e1ef6 \
+        && "$PIN_PROTON_LAUNCHER_POLICY" == dxvk-legacy \
+        && "$PIN_WITHOUT_NVIDIA_LIBS" == 0 && "$PIN_WITHOUT_VKLAYERS" == 0 \
+        && "$PINNED_GE_HAS_PATCH_OVERLAP" == 0 \
+        && -z "${PIN_FFMPEG_DAV1D_PATCH_SHA256:-}${PIN_FFMPEG_DAV1D_MAKEFILE_BLOB:-}" ]] \
+      || fail "$PIN_ID immutable GE-Proton11-12 pin, dxvk-legacy launcher policy or upstream-dav1d policy changed"
+    pinned_ge_rtsps_transport_patch >/dev/null
+    pinned_ge_http_seek_patch >/dev/null
+    pinned_ge_mpegvideo_build_patch >/dev/null
+    pinned_ge_http_filesize_patch >/dev/null
+    pinned_ge_http_chunkend_patch >/dev/null
+    pinned_ge_hls_early_seek_patch >/dev/null
+    pinned_ge_hls_init_config_patch >/dev/null
+    [[ "${PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256:-}" == 64e51d21420282a3b25379544a689338ff01ae6435cccd867f258469d0929430 \
+        && "${PIN_FFMPEG_HLS_INIT_CONFIG_HLS_BLOB:-}" == 5b1dc4579a040602110d0ffffbc104ea40d9c5da ]] \
+      || fail "SE4-P7 requires its exact HLS init-config companion (E6)"
+    [[ "${PIN_FFMPEG_HTTP_CHUNKEND_PATCH_SHA256:-}" == b170e0eea6e4b364fc5b4616f22e1a2b464662c19ef71f89b0592c806f1250db \
+        && "${PIN_FFMPEG_HTTP_CHUNKEND_HTTP_BLOB:-}" == ff99262dec1124c133f1a832b04845e7bf06c020 ]] \
+      || fail "SE4-P7 requires its exact HTTP chunked-end module"
+    [[ "${PIN_FFMPEG_AAC_PARSER_PATCH_SHA256:-}" == 755d0909e3b1c1873086dfc16b3bb865850c7591453579bac1580be67519e374 \
+        && "${PIN_FFMPEG_AAC_PARSER_MAKEFILE_BLOB:-}" == fcf554c93afb1e3f13173909d74273cfee58ee19 \
+        && "${PIN_FFMPEG_MPEGVIDEO_MAKEFILE_BLOB:-}" == 6da863e55ba90e9e5dc816a796594f1d8cea6c28 \
+        && "$PIN_FFMPEG_CRYPTO_BUILD_MAKEFILE_BLOB" == bd0333dcc2207809189d535729c74f6a3a4f33ba ]] \
+      || fail "SE4-P7 requires its exact crypto/MPEGVIDEO/AAC Makefile.in build modules for GE-Proton11-12"
+    pinned_ge_aac_parser_build_patch >/dev/null
+    [[ "${PIN_GE_SKIP_PATCHES:-}" == patches/wine-hotfixes/pending/rtworkq-dont-hold-queues-section-during-system-queue-shutdown.patch:fa65977bda168c863cffea3faa0643f21c0f990524e7e90fe1105794e501bc7d,patches/protonfixes/0003-gamefix-kingdoms-of-amalur-re-reckoning-d3dcompiler.patch:30f6b9b5bd427eadeb114a748fa4ed6666d11f26e26447f6492daa31d0e17311 ]] \
+      || fail "SE4-P7 must skip exactly GE's rtworkq post-series hotfix and protonfixes 0003"
+    # Dual DXVK: the exact legacy identity (upstream DXVK 2cae043b and its nested pins, from
+    # DESIGN section 1), plus the carried build module and launcher patch bound by digest.
+    [[ "$PIN_DXVK_LEGACY_COMMIT" == 2cae043bdf767c8a7a2e0ee8d41537acfe773e8e \
+        && "$PIN_DXVK_LEGACY_TREE" == 5a331b92340591a2d18c53230970be75b0d396aa \
+        && "$PIN_DXVK_LEGACY_VERSION_TAG" == v2.7.1-668-g2cae043bdf767c8 \
+        && "$PIN_DXVK_LEGACY_NESTED" == subprojects/dxbc-spirv:0d4923a5efa45c18288819eb1094d7222b102bed:e6f20842fd84cedeb86ca99d4619ddc76f11c77c,subprojects/dxbc-spirv/submodules/spirv_headers:c8ad050fcb29e42a2f57d9f59e97488f465c436d:7577966d18e3d5203339a5daa9146f10fe46e785,subprojects/libdisplay-info:275e6459c7ab1ddd4b125f28d0440716e4888078:af4bbd04360eda1a4634a5aaf5d0408eb71925a1,include/vulkan:8864cdc896bbc2a9b6eb36b3218fc9ef57908d77:25b446994cd7956846e2d07e9958724d78c7ae3d,include/spirv:04f10f650d514df88b76d25e83db360142c7b174:2883db5426133e951df98616f78904371e854339,include/native/directx:9df86f2341616ef1888ae59919feaa6d4fad693d:66fcb250507a2c45bd9a22f44795d0e4c7b613f5 ]] \
+      || fail "SE4-P7 requires its exact legacy DXVK commit, tree, version tag and nested pins"
+    pinned_ge_dxvk_legacy_makefile_patch >/dev/null
+    [[ -f "$PROTON_LAUNCHER_PATCH" && ! -L "$PROTON_LAUNCHER_PATCH" \
+        && "$PROTON_LAUNCHER_PATCH" == "$ROOT_DIR/patches/proton/0002-launcher-add-dxvk-legacy-selection.patch" \
+        && "$(pinned_ge_launcher_patch_sha256)" == "$(pinned_ge_sha256 "$PROTON_LAUNCHER_PATCH")" ]] \
+      || fail "SE4-P7 requires the carried dxvk-legacy launcher patch"
+    ;;
   *)
     fail "verify-preparation does not recognize selected pin $PIN_ID"
     ;;
@@ -1265,6 +1328,7 @@ if [[ -e "$prepared_source/wine/.git" \
       "$prepared_source" "$prepared_state"
   fi
   printf 'Prepared media cleanup, diff baseline, and zero-reference provenance passed.\n'
+  pinned_ge_require_dxvk_legacy_state "$prepared_source" "$prepared_state/prepared-source.tsv"
 else
   printf 'NOTE: complete pinned prepared tree is unavailable; live media provenance check skipped.\n'
 fi
@@ -1490,9 +1554,9 @@ manifest_build_contrib_entry_count="$(
     == "$manifest_build_contrib_entry_count" ]] \
   || fail \
     "parsed build-contrib entry count differs from the selected pin manifest"
-if [[ "$PIN_PROTON_LAUNCHER_POLICY" == scoped-xrizer ]]; then
+if [[ -n "$PROTON_LAUNCHER_PATCH" ]]; then
 [[ -f "$PROTON_LAUNCHER_PATCH" && ! -L "$PROTON_LAUNCHER_PATCH" ]] \
-  || fail "separate Proton XRizer launcher patch is absent or unsafe"
+  || fail "separate Proton launcher patch is absent or unsafe"
 if [[ -e "$prepared_source/.git" \
     && -f "$prepared_state/prepared-source.tsv" ]]; then
   git -C "$prepared_source" apply --check --reverse -- "$PROTON_LAUNCHER_PATCH"
@@ -1510,6 +1574,8 @@ elif [[ -e "$prepared_source/.git" && -f "$prepared_state/prepared-source.tsv" ]
 fi
 if [[ "$PIN_PROTON_LAUNCHER_POLICY" == upstream ]]; then
   printf '%s Wine media patches; upstream Proton launcher (no XRizer compatibility flag). PACKAGE_RELEASE=0.\n' "${#series_paths[@]}"
+elif [[ "$PIN_PROTON_LAUNCHER_POLICY" == dxvk-legacy ]]; then
+  printf '%s Wine media patches; dual DXVK (legacy %s beside the primary DXVK) with the separate dxvk-legacy Proton launcher patch. PACKAGE_RELEASE=0.\n' "${#series_paths[@]}" "${PIN_DXVK_LEGACY_COMMIT:0:8}"
 elif [[ "$SELECTED_PROFILE" == a320 || "$SELECTED_PROFILE" == a321 || "$SELECTED_PROFILE" == a322 || "$SELECTED_PROFILE" == a323 ]]; then
   printf '%s %s GE-Proton11-6 Wine media patches and the separate Proton XRizer launcher patch selected under PACKAGE_RELEASE=0.\n' "${#series_paths[@]}" "$SELECTED_PROFILE"
 elif [[ "$SELECTED_PROFILE" == a319 ]]; then
@@ -1582,6 +1648,12 @@ python3 "$ROOT_DIR/tests/sar-flush-control/test_model.py" >/dev/null
 python3 "$ROOT_DIR/tests/clock-start-control/test_model.py" >/dev/null
 python3 "$ROOT_DIR/tests/pcm-probe-control/test_model.py" >/dev/null
 python3 "$ROOT_DIR/tests/tooling/test_launcher_policy.py" >/dev/null
+if pinned_ge_dxvk_legacy_enabled; then
+  python3 "$ROOT_DIR/tests/tooling/test_dxvk_legacy_launcher.py" >/dev/null
+  python3 "$ROOT_DIR/tests/tooling/test_dxvk_legacy_export.py" >/dev/null
+  python3 "$ROOT_DIR/tests/tooling/test_dxvk_legacy_build_module.py" >/dev/null
+  python3 "$ROOT_DIR/tests/tooling/test_dxvk_legacy_artifact.py" >/dev/null
+fi
 python3 "$ROOT_DIR/tests/tooling/test_preparation_profile.py" >/dev/null
 python3 "$ROOT_DIR/tests/tooling/test_p19a_profile.py" >/dev/null
 python3 "$ROOT_DIR/tests/tooling/test_p19b_profile.py" >/dev/null

@@ -90,7 +90,8 @@ SHA512="$BUILD_DIR/$PIN_BUILD_NAME.sha512sum"
 SHA256="$BUILD_DIR/SHA256SUMS"
 INVOCATION="$STATE_DIR/build-invocation.tsv"
 CONFIGURE_STATE="$STATE_DIR/configure-state.tsv"
-PROTON_LAUNCHER_PATCH="$ROOT_DIR/patches/proton/0001-launcher-add-scoped-xrizer-mode.patch"
+# Selected by the pin's launcher policy; empty for the unmodified upstream launcher.
+PROTON_LAUNCHER_PATCH="$(pinned_ge_launcher_patch_file)"
 
 for path in "$TOOL_DIR" "$ARCHIVE" "$SHA512" "$SHA256" "$INVOCATION" \
     "$CONFIGURE_STATE"; do
@@ -125,6 +126,9 @@ pinned_ge_require_complete_build_contrib "$SOURCE_DIR" "$CONTRIB_MANIFEST"
 [[ "$(pinned_ge_repo_state_digest "$SOURCE_DIR" "$CONTRIB_MANIFEST")" \
     == "$(pinned_ge_state_value "$PREPARED_STATE" root_repo_state_sha256)" ]] \
   || pinned_ge_fail "built source differs beyond the validated build-contrib cache"
+# Dual DXVK: the exported legacy tree is excluded from the root state digest,
+# so it is re-hashed against the pin and every prepared-state record.
+pinned_ge_require_dxvk_legacy_state "$SOURCE_DIR" "$PREPARED_STATE"
 for repo_state_record in \
     'wine:wine_repo_state_sha256' \
     'dxvk:dxvk_repo_state_sha256' \
@@ -203,6 +207,15 @@ done
 [[ "$(pinned_ge_state_value "$INVOCATION" proton_launcher_patch_sha256)" \
     == "$(pinned_ge_state_value "$PREPARED_STATE" proton_launcher_patch_sha256)" ]] \
   || pinned_ge_fail "artifact invocation launcher-patch digest differs from prepared state"
+if pinned_ge_dxvk_legacy_enabled; then
+  for state_file_to_check in "$INVOCATION" "$PREPARED_STATE"; do
+    while IFS=$'\t' read -r key expected; do
+      [[ "$(pinned_ge_state_value "$state_file_to_check" "$key")" == "$expected" ]] \
+        || pinned_ge_fail "artifact legacy DXVK provenance differs for $key"
+    done < <(pinned_ge_dxvk_legacy_records \
+      "$(pinned_ge_state_value "$PREPARED_STATE" dxvk_legacy_source_sha256)")
+  done
+fi
 if [[ "$PIN_SCHEMA_VERSION" == 5 ]]; then
   pinned_ge_require_ffmpeg_playback_state "$INVOCATION"
   pinned_ge_require_ffmpeg_playback_state "$PREPARED_STATE"
@@ -564,15 +577,87 @@ PY
 if [[ "$PIN_PROTON_LAUNCHER_POLICY" == upstream ]]; then
   pinned_ge_require_upstream_launcher "$SOURCE_DIR" "$TOOL_DIR/proton"
 else
-for launcher_policy in \
-    'self.env.get("PROTON_XR_MODE", "auto").strip().lower()' \
-    'self.xr_mode not in ("auto", "xrizer")' \
-    'if self.xr_mode == "xrizer":' \
-    'self.dlloverrides["wineopenxr"] = "d"' \
-    'self.log_file.write("XR mode: " + self.xr_mode + "\n")'; do
+# Per-policy launcher token list (policy -> carried launcher patch).
+case "$PIN_PROTON_LAUNCHER_POLICY" in
+  dxvk-legacy)
+    launcher_policy_tokens=(
+      'DXVK_LEGACY_DEFAULT_APPIDS = ("438100",)'
+      'def dxvk_variant_dir(lib_dir, want_legacy):'
+      'return "wine/dxvk-legacy", True'
+      'def select_dxvk_variant(self):'
+      '"PROTON_DXVK_LEGACY" in self.env'
+      '"nodxvklegacy" in self.compat_config'
+      'self.check_environment("PROTON_DXVK_LEGACY", "dxvklegacy")'
+      'dxvk_variant_msg = "DXVK variant: "'
+      'g_proton.arch_pe_dir(dxvk_dir, False) + f + ".dll"'
+    )
+    ;;
+  *)
+    launcher_policy_tokens=(
+      'self.env.get("PROTON_XR_MODE", "auto").strip().lower()'
+      'self.xr_mode not in ("auto", "xrizer")'
+      'if self.xr_mode == "xrizer":'
+      'self.dlloverrides["wineopenxr"] = "d"'
+      'self.log_file.write("XR mode: " + self.xr_mode + "\n")'
+    )
+    ;;
+esac
+for launcher_policy in "${launcher_policy_tokens[@]}"; do
   rg -Fq "$launcher_policy" "$TOOL_DIR/proton" \
-    || pinned_ge_fail "artifact launcher omits scoped XRizer policy: $launcher_policy"
+    || pinned_ge_fail "artifact launcher omits the $PIN_PROTON_LAUNCHER_POLICY policy: $launcher_policy"
 done
+if [[ "$PIN_PROTON_LAUNCHER_POLICY" == dxvk-legacy ]]; then
+  # The artifact launcher is the prepared (patched) source launcher, byte for byte.
+  [[ "$(pinned_ge_git -C "$SOURCE_DIR" hash-object -- "$TOOL_DIR/proton")" \
+      == "$(pinned_ge_git -C "$SOURCE_DIR" hash-object -- "$SOURCE_DIR/proton")" ]] \
+    || pinned_ge_fail "artifact launcher differs from the prepared dxvk-legacy launcher"
+fi
+fi
+
+if pinned_ge_dxvk_legacy_enabled; then
+  # Dual DXVK payload (acceptance tests T0a/T0b): a complete legacy directory beside
+  # the primary DXVK, carrying the legacy identity and no GE-patched-tree tag.
+  legacy_dxvk_dir="$TOOL_DIR/files/lib/wine/dxvk-legacy"
+  primary_dxvk_dir="$TOOL_DIR/files/lib/wine/dxvk"
+  legacy_version_expected=" $PIN_DXVK_LEGACY_COMMIT dxvk (${PIN_DXVK_LEGACY_VERSION_TAG%-g*}-g${PIN_DXVK_LEGACY_COMMIT:0:8})"
+  [[ -f "$legacy_dxvk_dir/version" && ! -L "$legacy_dxvk_dir/version" \
+      && "$(cat "$legacy_dxvk_dir/version")" == "$legacy_version_expected" \
+      && "$(wc -l <"$legacy_dxvk_dir/version")" == 1 ]] \
+    || pinned_ge_fail "legacy DXVK version file does not carry the pinned identity"
+  primary_version_text="$(cat "$primary_dxvk_dir/version")"
+  primary_tag="${primary_version_text##*\(}"
+  primary_tag="${primary_tag%\)}"
+  [[ "$primary_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-g[0-9a-f]+$ \
+      && "$primary_tag" != "${PIN_DXVK_LEGACY_VERSION_TAG%-g*}"* ]] \
+    || pinned_ge_fail "primary DXVK version file is not a distinct DXVK build: $primary_tag"
+  for arch in i386 x86_64; do
+    for dll in d3d8 d3d9 d3d10core d3d11 dxgi openvr_api_dxvk; do
+      [[ -f "$legacy_dxvk_dir/$arch-windows/$dll.dll" && ! -L "$legacy_dxvk_dir/$arch-windows/$dll.dll" \
+          && -f "$primary_dxvk_dir/$arch-windows/$dll.dll" ]] \
+        || pinned_ge_fail "dual DXVK payload is incomplete: $arch-windows/$dll.dll"
+    done
+    # openvr_api_dxvk.dll is Valve's prebuilt copy: equal in both directories.
+    [[ "$(pinned_ge_sha256 "$legacy_dxvk_dir/$arch-windows/openvr_api_dxvk.dll")" \
+        == "$(pinned_ge_sha256 "$primary_dxvk_dir/$arch-windows/openvr_api_dxvk.dll")" ]] \
+      || pinned_ge_fail "legacy and primary openvr_api_dxvk.dll differ ($arch)"
+    # The built DLLs differ, and carry their own identity strings.
+    [[ "$(pinned_ge_sha256 "$legacy_dxvk_dir/$arch-windows/d3d11.dll")" \
+        != "$(pinned_ge_sha256 "$primary_dxvk_dir/$arch-windows/d3d11.dll")" ]] \
+      || pinned_ge_fail "legacy and primary d3d11.dll are identical ($arch)"
+    for dll in d3d11 dxgi; do
+      python3 -I - "$legacy_dxvk_dir/$arch-windows/$dll.dll" "$PIN_DXVK_LEGACY_VERSION_TAG" \
+          "$primary_dxvk_dir/$arch-windows/$dll.dll" "$primary_tag" <<'PY' \
+        || pinned_ge_fail "legacy/primary DXVK identity strings are wrong in $arch-windows/$dll.dll"
+import sys
+legacy = open(sys.argv[1], "rb").read()
+primary = open(sys.argv[3], "rb").read()
+if sys.argv[2].encode() not in legacy or b"GE-Proton" in legacy:
+    raise SystemExit("legacy DLL lacks the legacy version tag or carries a GE-Proton tag")
+if sys.argv[4].encode() not in primary or sys.argv[2].encode() in primary:
+    raise SystemExit("primary DLL lacks its own version tag or carries the legacy one")
+PY
+    done
+  done
 fi
 
 internal_pattern="\"$PIN_BUILD_NAME\" // Internal name of this tool"
@@ -630,6 +715,13 @@ if [[ -n "${PIN_FFMPEG_HLS_EARLY_SEEK_PATCH_SHA256:-}" ]]; then
 fi
 if [[ -n "${PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256:-}" ]]; then
   provenance_lines+=("FFmpeg HLS-init-config companion SHA-256: $PIN_FFMPEG_HLS_INIT_CONFIG_PATCH_SHA256")
+fi
+if pinned_ge_dxvk_legacy_enabled; then
+  provenance_lines+=(
+    "DXVK legacy commit: $PIN_DXVK_LEGACY_COMMIT"
+    "DXVK legacy source SHA-256: $(pinned_ge_state_value "$PREPARED_STATE" dxvk_legacy_source_sha256)"
+    "DXVK legacy build-module SHA-256: $PIN_DXVK_LEGACY_MAKEFILE_PATCH_SHA256"
+  )
 fi
 if [[ -n "${PIN_GE_SKIP_PATCHES:-}" ]]; then
   provenance_lines+=("GE patches skipped by the pin (path:SHA-256): $PIN_GE_SKIP_PATCHES")

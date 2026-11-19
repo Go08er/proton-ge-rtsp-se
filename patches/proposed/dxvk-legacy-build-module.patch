@@ -1,0 +1,87 @@
+Subject: [PATCH] build: ship the legacy DXVK 2cae043b beside the primary DXVK
+
+SE4-P7 dual DXVK. Adds a second, unpatched DXVK package, dxvk-legacy, built
+from upstream DXVK 2cae043b (v2.7.1-668), the DXVK of the Beta4 build. It is
+installed to lib/wine/dxvk-legacy/{i386,x86_64}-windows and never replaces
+lib/wine/dxvk; the Proton launcher selects the directory per launch.
+
+The source is not a submodule: prepare-pinned-ge-source.sh exports it into
+dxvk-legacy/dxvk with git archive from the pinned, tree-verified submodule
+object stores (scripts/export-dxvk-legacy-source.sh), so the GE gitlinks,
+.gitmodules and the primary dxvk tree stay as pinned. The exported tree has no
+.git: the version tag and the lib/wine/dxvk-legacy/version file are fixed
+strings that equal the Beta4 identity. GE's -GE-Proton(dirty) tag is
+intentionally not used; the tree is clean and unpatched. The legacy directory
+gets its own two openvr_api_dxvk.dll copies, so it is a complete set.
+
+Apply to the GE superproject after the crypto, MPEGVIDEO and AAC-parser build
+patches (this is the last Makefile.in module). Requires the pin's
+PIN_DXVK_LEGACY_MAKEFILE_BLOB as the final Makefile.in postimage. Project-
+authored build integration, not an upstream GE patch.
+---
+diff --git a/Makefile.in b/Makefile.in
+index fcf554c..be0d7e5 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -798,6 +798,40 @@ $(OBJ)/.dxvk-post-source:
+ 	echo "$(shell git -C $(SRCDIR) submodule status -- dxvk || echo no-git-repo-info)" > $(DST_LIBDIR)/wine/dxvk/version
+ 	touch $@
+ 
++##
++## dxvk-legacy
++##
++
++# Dual DXVK (SE4-P7): upstream DXVK 2cae043b, unpatched, exported at prepare
++# time from the pinned submodule stores into dxvk-legacy/dxvk. It ships beside
++# the primary DXVK in lib/wine/dxvk-legacy and is selected per launch by the
++# Proton launcher; it never replaces lib/wine/dxvk. No arm64ec (ARCHS has none).
++DXVK_LEGACY_i386_SOURCE_DATE_EPOCH := $(shell expr $(i386_SOURCE_DATE_EPOCH) - 3)
++DXVK_LEGACY_x86_64_SOURCE_DATE_EPOCH := $(shell expr $(x86_64_SOURCE_DATE_EPOCH) - 3)
++
++DXVK_LEGACY_SOURCE_ARGS = \
++  --exclude version.h.in \
++
++DXVK_LEGACY_i386_MESON_ARGS = --bindir=$(DXVK_LEGACY_i386_DST)/lib/wine/dxvk-legacy/i386-windows
++DXVK_LEGACY_x86_64_MESON_ARGS = --bindir=$(DXVK_LEGACY_x86_64_DST)/lib/wine/dxvk-legacy/x86_64-windows
++DXVK_LEGACY_HOST_DEPENDS = glslang
++
++$(eval $(call rules-source,dxvk-legacy,$(SRCDIR)/dxvk-legacy/dxvk))
++$(eval $(call rules-meson,dxvk-legacy,i386,windows))
++$(eval $(call rules-meson,dxvk-legacy,x86_64,windows))
++
++# The exported tree has no .git, so the version tag and the version file are
++# fixed strings that mirror the Beta4 DXVK identity byte for byte.
++$(OBJ)/.dxvk-legacy-post-source:
++	sed -re 's#@VCS_TAG@#v2.7.1-668-g2cae043bdf767c8#' \
++	    $(SRCDIR)/dxvk-legacy/dxvk/version.h.in > $(DXVK_LEGACY_SRC)/version.h.in
++	mkdir -p $(DST_LIBDIR)/wine/dxvk-legacy
++	rm -rf $(DST_LIBDIR)/wine/dxvk-legacy/version
++	echo " 2cae043bdf767c8a7a2e0ee8d41537acfe773e8e dxvk (v2.7.1-668-g2cae043b)" > $(DST_LIBDIR)/wine/dxvk-legacy/version
++	touch $@
++
++default_pfx: dxvk-legacy
++
+ 
+ ##
+ ## d7vk
+@@ -1696,6 +1730,20 @@ $(OVR_x86_64_DIST): $(SRCDIR)/openvr/bin/win64/openvr_api.dll | $(DST_DIR)
+ 
+ all-dist: $(OVR_i386_DIST) $(OVR_x86_64_DIST)
+ 
++# The legacy DXVK directory carries its own copies, so the launcher can switch
++# the whole directory with one variable.
++OVR_LEGACY_i386_DIST := $(DST_LIBDIR)/wine/dxvk-legacy/i386-windows/openvr_api_dxvk.dll
++$(OVR_LEGACY_i386_DIST): $(SRCDIR)/openvr/bin/win32/openvr_api.dll | $(DST_DIR)
++	mkdir -p $(DST_LIBDIR)/wine/dxvk-legacy/i386-windows
++	cp -af $< $@
++
++OVR_LEGACY_x86_64_DIST := $(DST_LIBDIR)/wine/dxvk-legacy/x86_64-windows/openvr_api_dxvk.dll
++$(OVR_LEGACY_x86_64_DIST): $(SRCDIR)/openvr/bin/win64/openvr_api.dll | $(DST_DIR)
++	mkdir -p $(DST_LIBDIR)/wine/dxvk-legacy/x86_64-windows
++	cp -af $< $@
++
++all-dist: $(OVR_LEGACY_i386_DIST) $(OVR_LEGACY_x86_64_DIST)
++
+ ifneq ($(findstring aarch64,$(unix_ARCHS)),)
+ OVR_aarch64_DIST := $(DST_LIBDIR)/wine/dxvk/aarch64-windows/openvr_api_dxvk.dll
+ 

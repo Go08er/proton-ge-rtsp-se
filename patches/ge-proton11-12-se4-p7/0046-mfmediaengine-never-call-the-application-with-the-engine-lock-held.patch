@@ -1,0 +1,1983 @@
+Subject: [SE4-P6] mfmediaengine: never call the application with the engine lock held
+
+IMFMediaEngineNotify::EventNotify was called with engine->cs held from about
+thirty places (the session event handler, the load handler, Play, Pause,
+SetCurrentTime, SetSource, ...), and every per-frame call of the engine
+takes the same lock. An application callback that runs for a long time,
+takes a lock the calling thread holds, or hands the work to the calling
+thread and waits, therefore stops OnVideoStreamTick, GetCurrentTime and
+every other call on that engine for as long as it runs: as long as the
+handler, or until the application's own timeout when it waits for the
+blocked thread. A failed load, a stalled source and a buffering change all
+reach the application this way. The same holds for the calls into
+IMFMediaEngineExtension, which also ran under the lock.
+
+No application code runs with the engine lock held any more.
+
+Every notification goes through media_engine_notify(), which only appends
+it, with its parameters and the raising thread, to a per-engine outbox.
+Every acquisition of the lock goes through media_engine_lock() and
+media_engine_unlock(). The thread that releases the lock at its outermost
+level delivers the notifications it raised, in order, after leaving the
+lock and before the call that raised them returns, so each notification is
+still delivered by the thread that raised it (SEEKING by the time
+SetCurrentTime returns, as Wine's tests expect) and the order within a
+thread does not change.
+
+The application still never sees two notifications of one engine at once:
+delivery holds a per-engine recursive delivery lock, which is never taken
+with the engine lock held. Work-queue callbacks (session events, sink
+events, load handler) wait for it while holding no engine lock, as they
+waited for the engine lock before. An application-facing call never waits
+for a callback that has run for 10 ms or more: it hands its notifications
+off and returns at once, and the holder delivers them, in order, before it
+releases it (and no notification is left behind when the holder releases at
+the same moment). The one exception is a callback that started less than
+10 ms ago, which is waited for until those 10 ms are up: a handler often
+signals the thread that then calls the engine while the handler is still
+returning, and that call's notifications stay on its thread. A call made from inside a callback
+takes the delivery lock recursively and delivers the notifications it
+raises before it returns, as it did when the callback ran under the lock.
+
+Where the code after a notification depends on what the application did in
+its handler, the site delivers first and then revalidates what it read:
+the buffering re-check after BUFFERINGSTARTED, the ready state between
+LOADEDMETADATA and LOADEDDATA, the
+SEEKED handling of a started session, the replacement check after LOADSTART
+and after PURGEQUEUEDEVENTS. The extension's BeginCreateObject and
+CanPlayType are called with the lock dropped.
+
+The deliverer holds a reference on the engine and on the callback for the
+whole delivery. Shutdown drops what has not been delivered and nothing is
+queued after it; a delivery already in progress may finish, and Shutdown
+never waits for a callback.
+
+Diagnostics, always compiled and on the existing channel, each kind at most
+one line per engine and second: a WARN at 100 ms and an ERR at 1 s when a
+notification takes that long in the application; a WARN at 50 ms and an ERR
+at 1 s when a call waited for the engine lock, naming the call that waited
+and the site and thread that held it; a WARN at 100 ms and an ERR at 1 s
+when the engine lock was held that long, naming the site that held it; and
+an ERR, once per engine, if a callback is about to start with the lock held
+by the calling thread (a regression guard that must never fire).
+
+Limits. Under contention (another thread is inside a callback of the
+same engine) an application-facing call returns before its notifications
+are delivered, and the thread in the slow callback delivers them; without
+contention, nothing changes. The load handler still holds the engine lock
+while it creates the topology, so calls on the same engine wait for a load;
+that wait is reported by the lock-wait diagnostic, not removed here. Calls
+the engine makes into other application-supplied objects during a load (an
+extension-created source, effects) are not changed.
+
+---
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -23,6 +23,7 @@
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "winternl.h"
+ 
+ #include "mfapi.h"
+ #include "mfmediaengine.h"
+@@ -155,6 +156,26 @@
+     IMFByteStream *bytestream;
+ };
+ 
++struct media_engine_event
++{
++    MF_MEDIA_ENGINE_EVENT event;
++    DWORD_PTR param1;
++    DWORD param2;
++    DWORD thread_id;    /* the thread that raised it, which delivers it */
++    BOOL handed_off;    /* its thread could not deliver it, any deliverer may */
++};
++
++enum media_engine_diag
++{
++    MEDIA_ENGINE_DIAG_SLOW_NOTIFY_WARN,
++    MEDIA_ENGINE_DIAG_SLOW_NOTIFY_ERR,
++    MEDIA_ENGINE_DIAG_LOCK_WAIT_WARN,
++    MEDIA_ENGINE_DIAG_LOCK_WAIT_ERR,
++    MEDIA_ENGINE_DIAG_LOCK_HOLD_WARN,
++    MEDIA_ENGINE_DIAG_LOCK_HOLD_ERR,
++    MEDIA_ENGINE_DIAG_COUNT,
++};
++
+ struct media_engine
+ {
+     IMFMediaEngineEx IMFMediaEngineEx_iface;
+@@ -241,8 +262,402 @@
+         } d3d11;
+     } video_frame;
+     CRITICAL_SECTION cs;
++    /* Lock bookkeeping, written by the owner of cs; read without it only for diagnostics. */
++    unsigned int lock_depth;
++    BOOL lock_internal;     /* the outermost holder is a work-queue callback, which may wait to deliver */
++    const char *volatile lock_site;
++    volatile DWORD lock_tid;
++    volatile LONGLONG delivery_since;   /* when the callback now running started, 0 if none; interlocked */
++    volatile LONGLONG lock_since;   /* read with an interlocked operation, 32-bit targets tear 64-bit reads */
++    /* Notifications raised but not yet delivered, see media_engine_unlock(). Protected by cs. */
++    struct
++    {
++        struct media_engine_event *events;
++        size_t count, capacity;
++        LONG closed;
++        LONG guard_reported;
++        LONG handed_off;    /* entries marked handed off, read without engine->cs */
++    } outbox;
++    /* Held while the application is called; recursive, never acquired with cs held. */
++    CRITICAL_SECTION delivery_cs;
++    ULONGLONG diag_time[MEDIA_ENGINE_DIAG_COUNT];
+ };
+ 
++/* Locking and notification rules.
++ *
++ * The engine never calls application code (IMFMediaEngineNotify and
++ * IMFMediaEngineExtension) with engine->cs held. An application callback may
++ * run for a long time, or wait for a thread that is itself waiting in an
++ * engine call, and with the lock held that stops every caller of the engine,
++ * the per-frame calls included.
++ *
++ * Every notification therefore goes through media_engine_notify(), which only
++ * appends it, tagged with the raising thread, to the per-engine outbox. The
++ * thread that releases engine->cs at its outermost level delivers its own
++ * notifications, in order, after leaving it and before the call that raised
++ * them returns, as before: each notification is delivered by the thread that
++ * raised it.
++ *
++ * The application still never sees two notifications of one engine at once:
++ * delivery holds delivery_cs, a recursive lock that is never acquired while
++ * engine->cs is held (the order is delivery_cs, then engine->cs). Work-queue
++ * callbacks (session events, sink events, load handler) wait for it, holding
++ * no engine lock, as they waited for engine->cs before. An application-facing
++ * call does not wait for another thread's callback (beyond a short grace, see
++ * media_engine_try_delivery()): when delivery_cs stays taken it marks its
++ * notifications handed off and returns, and the holder delivers
++ * handed-off notifications, in order, before it releases (and looks again
++ * after releasing, so none is left behind). A call made from inside a
++ * callback takes delivery_cs recursively and delivers the notifications it
++ * raises before it returns.
++ *
++ * A site whose later logic depends on the application having seen the
++ * notification calls media_engine_flush_notifications() and then revalidates
++ * its state, because the lock is dropped there.
++ *
++ * Every acquisition goes through media_engine_lock() or
++ * media_engine_lock_wq(), which also report long waits together with the
++ * site that held the lock. */
++
++#define MEDIA_ENGINE_SLOW_NOTIFY_WARN_MS 100
++#define MEDIA_ENGINE_SLOW_NOTIFY_ERR_MS  1000
++#define MEDIA_ENGINE_LOCK_WAIT_WARN_MS  50
++#define MEDIA_ENGINE_LOCK_WAIT_ERR_MS   1000
++#define MEDIA_ENGINE_LOCK_HOLD_WARN_MS  100
++#define MEDIA_ENGINE_LOCK_HOLD_ERR_MS   1000
++#define MEDIA_ENGINE_DIAG_INTERVAL_MS   1000
++#define MEDIA_ENGINE_DELIVERY_GRACE_MS  10
++
++/* At most one line per engine and kind per second. */
++static BOOL media_engine_diag_allowed(struct media_engine *engine, enum media_engine_diag kind)
++{
++    ULONGLONG now = GetTickCount64();
++
++    if (engine->diag_time[kind] && now - engine->diag_time[kind] < MEDIA_ENGINE_DIAG_INTERVAL_MS)
++        return FALSE;
++    engine->diag_time[kind] = now;
++    return TRUE;
++}
++
++/* 0: nothing to report, 1: WARN, 2: ERR; the kind pairs are WARN, ERR in this order. */
++static int media_engine_diag_level(struct media_engine *engine, enum media_engine_diag warn_kind, ULONGLONG ms,
++        ULONGLONG warn_ms, ULONGLONG err_ms)
++{
++    if (ms >= err_ms)
++        return media_engine_diag_allowed(engine, warn_kind + 1) ? 2 : 0;
++    if (ms >= warn_ms)
++        return media_engine_diag_allowed(engine, warn_kind) ? 1 : 0;
++    return 0;
++}
++
++#define MEDIA_ENGINE_DIAG(level, ...) \
++    do { if ((level) == 2) ERR(__VA_ARGS__); else if ((level) == 1) WARN(__VA_ARGS__); } while (0)
++
++/* Called at the outermost release, with the lock held: how long it was held, and by which site. */
++static void media_engine_report_lock_hold(struct media_engine *engine)
++{
++    ULONGLONG held = GetTickCount64() - engine->lock_since;
++    int level = media_engine_diag_level(engine, MEDIA_ENGINE_DIAG_LOCK_HOLD_WARN, held,
++            MEDIA_ENGINE_LOCK_HOLD_WARN_MS, MEDIA_ENGINE_LOCK_HOLD_ERR_MS);
++
++    MEDIA_ENGINE_DIAG(level, "%s held the engine lock for %lu ms (thread %04lx).\n", engine->lock_site,
++            (unsigned long)held, engine->lock_tid);
++}
++
++static void media_engine_lock_common(struct media_engine *engine, const char *site, BOOL internal)
++{
++    if (!TryEnterCriticalSection(&engine->cs))
++    {
++        const char *holder = engine->lock_site;
++        DWORD holder_tid = engine->lock_tid;
++        ULONGLONG start = GetTickCount64(), since = InterlockedCompareExchange64(&engine->lock_since, 0, 0), wait;
++        int level;
++
++        EnterCriticalSection(&engine->cs);
++        wait = GetTickCount64() - start;
++        level = media_engine_diag_level(engine, MEDIA_ENGINE_DIAG_LOCK_WAIT_WARN, wait,
++                MEDIA_ENGINE_LOCK_WAIT_WARN_MS, MEDIA_ENGINE_LOCK_WAIT_ERR_MS);
++        MEDIA_ENGINE_DIAG(level, "%s waited %lu ms for the engine lock, held by %s (thread %04lx, held %lu ms when the wait began).\n",
++                site, (unsigned long)wait, holder ? holder : "(unknown)", holder_tid,
++                (unsigned long)(since && start > since ? start - since : 0));
++    }
++
++    if (!engine->lock_depth++)
++    {
++        engine->lock_tid = GetCurrentThreadId();
++        InterlockedCompareExchange64(&engine->lock_since, GetTickCount64(), engine->lock_since); /* only the owner writes */
++        engine->lock_site = site;
++        engine->lock_internal = internal;
++    }
++}
++
++/* For application-facing methods. */
++static void media_engine_lock(struct media_engine *engine, const char *site)
++{
++    media_engine_lock_common(engine, site, FALSE);
++}
++
++/* For work-queue callbacks, which may wait for another thread's callback to finish. */
++static void media_engine_lock_wq(struct media_engine *engine, const char *site)
++{
++    media_engine_lock_common(engine, site, TRUE);
++}
++
++/* Regression guard: nothing may call the application with the lock held. */
++static void media_engine_check_app_call(struct media_engine *engine, const char *what)
++{
++    if (RtlIsCriticalSectionLockedByThread(&engine->cs) && !InterlockedExchange(&engine->outbox.guard_reported, 1))
++        ERR("%s is about to be called with the engine lock held.\n", what);
++}
++
++static void media_engine_deliver_event(struct media_engine *engine, const struct media_engine_event *event)
++{
++    ULONGLONG start, elapsed;
++    LONGLONG outer_since;
++    HRESULT hr;
++    int level;
++
++    media_engine_check_app_call(engine, "A notification");
++
++    start = GetTickCount64();
++    /* The holder of delivery_cs is the only writer; a nested callback restores the outer one's start. */
++    outer_since = InterlockedCompareExchange64(&engine->delivery_since, 0, 0);
++    InterlockedCompareExchange64(&engine->delivery_since, start, outer_since);
++    hr = IMFMediaEngineNotify_EventNotify(engine->callback, event->event, event->param1, event->param2);
++    elapsed = GetTickCount64() - start;
++    InterlockedCompareExchange64(&engine->delivery_since, outer_since, start);
++
++    TRACE("Notification %u, param1 %s, param2 %#lx: callback hr %#lx, %lu ms.\n", event->event,
++            wine_dbgstr_longlong(event->param1), event->param2, hr, (unsigned long)elapsed);
++
++    level = media_engine_diag_level(engine, MEDIA_ENGINE_DIAG_SLOW_NOTIFY_WARN, elapsed,
++            MEDIA_ENGINE_SLOW_NOTIFY_WARN_MS, MEDIA_ENGINE_SLOW_NOTIFY_ERR_MS);
++    MEDIA_ENGINE_DIAG(level, "Notification %u took %lu ms in the application callback (thread %04lx).\n",
++            event->event, (unsigned long)elapsed, GetCurrentThreadId());
++}
++
++/* An application call does not wait for another thread's callback, with one exception: an application
++ * often signals from a handler and the signalled thread calls the engine at once, while the handler is
++ * still returning. A call therefore waits for a callback that started less than MEDIA_ENGINE_DELIVERY_GRACE_MS
++ * ago, until that time is up, which keeps the notification of that call on the calling thread. A callback that
++ * has run longer gets the notification handed off at once, so a slow handler costs the caller nothing. */
++static BOOL media_engine_try_delivery(struct media_engine *engine)
++{
++    ULONGLONG now = GetTickCount64(), since, deadline = now + MEDIA_ENGINE_DELIVERY_GRACE_MS;
++
++    while (!TryEnterCriticalSection(&engine->delivery_cs))
++    {
++        since = InterlockedCompareExchange64(&engine->delivery_since, 0, 0);
++        if (since && since + MEDIA_ENGINE_DELIVERY_GRACE_MS < deadline)
++            deadline = since + MEDIA_ENGINE_DELIVERY_GRACE_MS;
++        if (GetTickCount64() >= deadline)
++            return FALSE;
++        Sleep(1);
++    }
++    return TRUE;
++}
++
++/* Takes the notifications this thread raised, and those handed off, out of the outbox, in order.
++ * Only this thread's own entries when own_only: a work-queue thread that takes before it waits for the delivery
++ * lock must leave handed-off entries in the outbox, or a later one could overtake an earlier one of the same
++ * thread. Called with engine->cs held. Returns NULL when there are none, or when memory ran out (*failed): the
++ * entries then stay for the next deliverer, or for Shutdown. */
++static struct media_engine_event *media_engine_take_events(struct media_engine *engine, DWORD tid, BOOL own_only,
++        size_t *count, BOOL *failed)
++{
++    struct media_engine_event *batch, *events = engine->outbox.events;
++    size_t i, n = 0, kept = 0;
++
++    *failed = FALSE;
++    for (i = 0; i < engine->outbox.count; ++i)
++        if ((events[i].thread_id == tid && !events[i].handed_off) || (!own_only && events[i].handed_off))
++            ++n;
++    *count = n;
++    if (!n)
++        return NULL;
++    if (!(batch = malloc(n * sizeof(*batch))))
++    {
++        *failed = TRUE;
++        return NULL;
++    }
++
++    for (i = 0, n = 0; i < engine->outbox.count; ++i)
++    {
++        if ((events[i].thread_id == tid && !events[i].handed_off) || (!own_only && events[i].handed_off))
++        {
++            if (events[i].handed_off)
++                InterlockedDecrement(&engine->outbox.handed_off);
++            batch[n++] = events[i];
++        }
++        else
++            events[kept++] = events[i];
++    }
++    engine->outbox.count = kept;
++    return batch;
++}
++
++/* Releases the lock, and at the outermost level delivers this thread's notifications. */
++static void media_engine_unlock(struct media_engine *engine)
++{
++    DWORD tid = GetCurrentThreadId();
++    struct media_engine_event *batch = NULL;
++    BOOL internal, mine = FALSE, failed = FALSE;
++    size_t count = 0, i;
++
++    if (--engine->lock_depth)
++    {
++        LeaveCriticalSection(&engine->cs);
++        return;
++    }
++    media_engine_report_lock_hold(engine);
++    engine->lock_site = NULL;
++    internal = engine->lock_internal;
++
++    /* Entries handed off earlier are the holder's to deliver, they must not cost this call a wait again. */
++    for (i = 0; i < engine->outbox.count; ++i)
++        if (engine->outbox.events[i].thread_id == tid && !engine->outbox.events[i].handed_off)
++            mine = TRUE;
++    if (!mine)
++    {
++        LeaveCriticalSection(&engine->cs);
++        return;
++    }
++
++    if (internal)
++    {
++        /* A work-queue thread takes its entries while it still holds the lock, so that it is back at its queue
++         * as soon as it has delivered them, then waits for the delivery lock. */
++        batch = media_engine_take_events(engine, tid, TRUE, &count, &failed);
++        LeaveCriticalSection(&engine->cs);
++        if (!batch)
++            return;
++        EnterCriticalSection(&engine->delivery_cs);
++    }
++    else
++    {
++        LeaveCriticalSection(&engine->cs);
++        if (!media_engine_try_delivery(engine))
++        {
++            /* Another thread is still in a callback: hand over, then try once more, without waiting, as it
++             * may have just left. Whoever holds the lock looks for handed-off entries before leaving it. */
++            EnterCriticalSection(&engine->cs);
++            for (i = 0; i < engine->outbox.count; ++i)
++                if (engine->outbox.events[i].thread_id == tid && !engine->outbox.events[i].handed_off)
++                {
++                    engine->outbox.events[i].handed_off = TRUE;
++                    InterlockedIncrement(&engine->outbox.handed_off);
++                }
++            LeaveCriticalSection(&engine->cs);
++            if (!TryEnterCriticalSection(&engine->delivery_cs))
++                return;
++        }
++    }
++
++    IMFMediaEngineEx_AddRef(&engine->IMFMediaEngineEx_iface);
++    IMFMediaEngineNotify_AddRef(engine->callback);
++
++    do
++    {
++        for (;;)
++        {
++            if (!batch)
++            {
++                EnterCriticalSection(&engine->cs);
++                batch = media_engine_take_events(engine, tid, FALSE, &count, &failed);
++                LeaveCriticalSection(&engine->cs);
++                if (!batch)
++                    break;
++            }
++
++            for (i = 0; i < count; ++i)
++            {
++                /* Shutdown drops what has not started. */
++                if (InterlockedCompareExchange(&engine->outbox.closed, 0, 0))
++                    break;
++                media_engine_deliver_event(engine, &batch[i]);
++            }
++            free(batch);
++            batch = NULL;
++            if (!InterlockedCompareExchange(&engine->outbox.handed_off, 0, 0))
++                break;
++        }
++        LeaveCriticalSection(&engine->delivery_cs);
++        /* A thread that found the lock taken marked its entries before trying again: if one did, and the
++         * lock is free now, deliver them (otherwise whoever holds it does). */
++    } while (!failed && InterlockedCompareExchange(&engine->outbox.handed_off, 0, 0)
++            && TryEnterCriticalSection(&engine->delivery_cs));
++
++    IMFMediaEngineNotify_Release(engine->callback);
++    IMFMediaEngineEx_Release(&engine->IMFMediaEngineEx_iface);
++}
++
++/* Drops the lock for a call that must not run with it held, at the outermost level only (when it is held more
++ * than once it cannot be dropped, and the caller goes on with it held). Returns the state for retake. */
++static BOOL media_engine_drop_lock(struct media_engine *engine, BOOL *internal)
++{
++    if (engine->lock_depth != 1)
++        return FALSE;
++    *internal = engine->lock_internal;
++    media_engine_unlock(engine);
++    return TRUE;
++}
++
++static void media_engine_retake_lock(struct media_engine *engine, const char *site, BOOL internal)
++{
++    media_engine_lock_common(engine, site, internal);
++}
++
++/* Raises a notification; delivered when the lock is released. Called with the lock held. */
++static void media_engine_notify(struct media_engine *engine, MF_MEDIA_ENGINE_EVENT event, DWORD_PTR param1,
++        DWORD param2)
++{
++    struct media_engine_event *entry;
++
++    if (engine->outbox.closed)
++        return;
++
++    if (!mf_array_reserve((void **)&engine->outbox.events, &engine->outbox.capacity, engine->outbox.count + 1,
++            sizeof(*engine->outbox.events)))
++    {
++        ERR("Failed to queue notification %u.\n", event);
++        return;
++    }
++
++    entry = &engine->outbox.events[engine->outbox.count++];
++    entry->event = event;
++    entry->param1 = param1;
++    entry->param2 = param2;
++    entry->thread_id = GetCurrentThreadId();
++    entry->handed_off = FALSE;
++}
++
++/* Delivers what has been raised so far, with the lock dropped, and takes the lock again. The caller must
++ * revalidate whatever it read before: the application can call back into the engine from its handlers.
++ * Does nothing when the lock is held more than once, as it cannot be dropped then; the events are then
++ * delivered when the outermost holder leaves. */
++static void media_engine_flush_notifications(struct media_engine *engine, const char *site)
++{
++    BOOL internal;
++
++    if (media_engine_drop_lock(engine, &internal))
++        media_engine_retake_lock(engine, site, internal);
++}
++
++/* Shutdown: drops what has not been delivered, and nothing more is queued. Called with the lock held. */
++static void media_engine_close_notifications(struct media_engine *engine)
++{
++    InterlockedExchange(&engine->outbox.closed, 1);
++    InterlockedExchange(&engine->outbox.handed_off, 0);
++    free(engine->outbox.events);
++    engine->outbox.events = NULL;
++    engine->outbox.count = engine->outbox.capacity = 0;
++}
++
++static BOOL media_engine_source_is_current(struct media_engine *engine, UINT64 generation)
++{
++    return !(engine->flags & FLAGS_ENGINE_SHUT_DOWN) && generation == engine->source_generation;
++}
++
+ static double media_engine_get_client_duration(const struct media_engine *engine)
+ {
+     if (isinf(engine->duration) && engine->current_source
+@@ -251,18 +666,16 @@
+     return engine->duration;
+ }
+ 
+-static HRESULT media_engine_notify_live_event(struct media_engine *engine,
++static void media_engine_notify_live_event(struct media_engine *engine,
+         MF_MEDIA_ENGINE_EVENT event, DWORD_PTR param1, DWORD param2)
+ {
+-    HRESULT hr = IMFMediaEngineNotify_EventNotify(engine->callback, event, param1, param2);
+-
+     if (isinf(engine->duration))
+-        TRACE("Live client notification %u: callback hr %#lx, param1 %s, param2 %#lx, "
+-                "flags %#x, ready %u, network %u.\n", event, hr,
++        TRACE("Live client notification %u: param1 %s, param2 %#lx, "
++                "flags %#x, ready %u, network %u.\n", event,
+                 wine_dbgstr_longlong(param1), param2, engine->flags,
+                 engine->ready_state, engine->network_state);
+ 
+-    return hr;
++    media_engine_notify(engine, event, param1, param2);
+ }
+ 
+ static void media_engine_release_video_frame_resources(struct media_engine *engine)
+@@ -1109,21 +1522,25 @@
+             BOOL started = event_type == MEBufferingStarted;
+             DWORD characteristics = 0;
+             UINT64 generation;
++            BOOL was_ended;
+             MFCLOCK_STATE state;
+             IMFMediaEvent_GetValue(event, &source);
+-            EnterCriticalSection(&engine->cs);
++            media_engine_lock_wq(engine, "session_events_Invoke:MEBuffering");
+             if (source.vt != VT_UNKNOWN || source.punkVal != (IUnknown *)engine->presentation.source
+                     || engine->presentation.generation != engine->source_generation
+                     || (engine->flags & (FLAGS_ENGINE_SHUT_DOWN | FLAGS_ENGINE_SOURCE_PENDING))) goto buffering_done;
+             generation = engine->source_generation;
++            was_ended = !!(engine->flags & FLAGS_ENGINE_IS_ENDED);
+             engine->buffering = started;
+             engine->last_video_tick_clock = MINLONGLONG; engine->last_video_tick_time = 0;
+-            IMFMediaEngineNotify_EventNotify(engine->callback, started ?
++            media_engine_notify(engine, started ?
+                     MF_MEDIA_ENGINE_EVENT_BUFFERINGSTARTED : MF_MEDIA_ENGINE_EVENT_BUFFERINGENDED, 0, 0);
+             /* Notifications can replace the source or change user intent. */
+-            if (generation == engine->source_generation && engine->playback_requested
++            media_engine_flush_notifications(engine, "session_events_Invoke:MEBuffering");
++            if (generation == engine->source_generation && engine->buffering == started && engine->playback_requested
+                     && !(engine->flags & (FLAGS_ENGINE_SHUT_DOWN | FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PAUSED
+-                    | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_SCRUBBING)))
++                    | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_SCRUBBING))
++                    && (was_ended || !(engine->flags & FLAGS_ENGINE_IS_ENDED)))
+             {
+                 if (started || (SUCCEEDED(IMFPresentationClock_GetState(engine->clock, 0, &state)) && state == MFCLOCK_STATE_RUNNING))
+                 {
+@@ -1133,23 +1550,25 @@
+                     if (!engine->presentation.source || FAILED(IMFMediaSource_GetCharacteristics(
+                             engine->presentation.source, &characteristics))
+                             || !(characteristics & MFMEDIASOURCE_IS_LIVE))
+-                        IMFMediaEngineNotify_EventNotify(engine->callback, started ? MF_MEDIA_ENGINE_EVENT_WAITING : MF_MEDIA_ENGINE_EVENT_PLAYING, 0, 0);
++                        media_engine_notify(engine, started ? MF_MEDIA_ENGINE_EVENT_WAITING : MF_MEDIA_ENGINE_EVENT_PLAYING, 0, 0);
+                 }
+             }
+ buffering_done:
+-            LeaveCriticalSection(&engine->cs);
++            media_engine_unlock(engine);
+             PropVariantClear(&source);
+             break;
+         }
+         case MESessionTopologyStatus:
+         {
+             UINT32 topo_status = 0;
++            UINT64 generation;
+ 
+             IMFMediaEvent_GetUINT32(event, &MF_EVENT_TOPOLOGY_STATUS, &topo_status);
+             if (topo_status != MF_TOPOSTATUS_READY)
+                 break;
+ 
+-            EnterCriticalSection(&engine->cs);
++            media_engine_lock_wq(engine, "session_events_Invoke:MESessionTopologyStatus");
++            generation = engine->source_generation;
+ 
+             media_engine_apply_volume(engine);
+ 
+@@ -1160,34 +1579,53 @@
+             media_engine_notify_live_event(engine, MF_MEDIA_ENGINE_EVENT_DURATIONCHANGE, 0, 0);
+             media_engine_notify_live_event(engine, MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA, 0, 0);
+ 
+-            engine->ready_state = MF_MEDIA_ENGINE_READY_HAVE_ENOUGH_DATA;
++            /* The handlers see the metadata state, and may replace the source. */
++            media_engine_flush_notifications(engine, "session_events_Invoke:MESessionTopologyStatus");
++            if (media_engine_source_is_current(engine, generation))
++            {
++                engine->ready_state = MF_MEDIA_ENGINE_READY_HAVE_ENOUGH_DATA;
+ 
+-            media_engine_notify_live_event(engine, MF_MEDIA_ENGINE_EVENT_LOADEDDATA, 0, 0);
+-            media_engine_notify_live_event(engine, MF_MEDIA_ENGINE_EVENT_CANPLAY, 0, 0);
++                media_engine_notify_live_event(engine, MF_MEDIA_ENGINE_EVENT_LOADEDDATA, 0, 0);
++                media_engine_notify_live_event(engine, MF_MEDIA_ENGINE_EVENT_CANPLAY, 0, 0);
+ 
+-            if (engine->flags & FLAGS_ENGINE_SCRUBBING)
+-                media_engine_set_rate(engine, FALSE, 0.0);
++                if (engine->flags & FLAGS_ENGINE_SCRUBBING)
++                    media_engine_set_rate(engine, FALSE, 0.0);
++            }
+ 
+-            LeaveCriticalSection(&engine->cs);
++            media_engine_unlock(engine);
+ 
+             break;
+         }
+         case MESessionStarted:
+-            EnterCriticalSection(&engine->cs);
++        {
++            UINT64 generation;
++
++            media_engine_lock_wq(engine, "session_events_Invoke:MESessionStarted");
++            generation = engine->source_generation;
+             if (engine->flags & FLAGS_ENGINE_SEEKING)
+             {
+-                double next_seek = engine->next_seek;
+-                double current_seek = engine->current_seek;
++                double next_seek, current_seek;
+ 
+-                engine->current_seek = NAN;
+-                engine->next_seek = NAN;
+                 media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_IS_ENDED, FALSE);
+-                IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKED, 0, 0);
+-                IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
+-                if (isfinite(next_seek) && (!isfinite(current_seek) || fabs(next_seek - current_seek) > 0.001))
+-                    media_engine_set_current_time(engine, next_seek);
+-                else if (!(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_SCRUBBING)))
+-                    restart_playback = TRUE;
++                media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_SEEKED, 0, 0);
++                media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
++                /* What follows depends on the handlers: they may pause, seek or replace the source. A seek
++                 * they (or another thread) started meanwhile is the newest request: leave it alone, and
++                 * read the pending seek only now, so that no older request replaces it. */
++                media_engine_flush_notifications(engine, "session_events_Invoke:MESessionStarted");
++                if (!media_engine_source_is_current(engine, generation))
++                    goto started_done;
++                if (!(engine->flags & FLAGS_ENGINE_SEEKING))
++                {
++                    next_seek = engine->next_seek;
++                    current_seek = engine->current_seek;
++                    engine->current_seek = NAN;
++                    engine->next_seek = NAN;
++                    if (isfinite(next_seek) && (!isfinite(current_seek) || fabs(next_seek - current_seek) > 0.001))
++                        media_engine_set_current_time(engine, next_seek);
++                    else if (!(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_SCRUBBING)))
++                        restart_playback = TRUE;
++                }
+             }
+ 
+             /* A Start queued behind a failed topology fails too; do not follow the
+@@ -1203,16 +1641,27 @@
+             if (restart_playback && !(engine->flags & FLAGS_ENGINE_SEEKING))
+                 media_engine_start_playback(engine);
+             TRACE("Session started, notify playing %u, flags %#x.\n", playing_event, engine->flags);
+-            LeaveCriticalSection(&engine->cs);
+             if (playing_event)
+                 media_engine_notify_live_event(engine, MF_MEDIA_ENGINE_EVENT_PLAYING, 0, 0);
++started_done:
++            media_engine_unlock(engine);
+             break;
++        }
+         case MESessionEnded:
+-            EnterCriticalSection(&engine->cs);
+-            ended_event = media_engine_handle_ended(engine);
+-            LeaveCriticalSection(&engine->cs);
++            media_engine_lock_wq(engine, "session_events_Invoke:MESessionEnded");
++            /* The ended state belongs to the run that ended; a new position request clears it, and an end that
++             * arrives while a new position is pending is stale: it must not set the state. It still ends
++             * buffering, as handling an end does. */
++            if ((engine->flags & FLAGS_ENGINE_PAUSED) && engine->presentation.start_position.vt == VT_I8)
++            {
++                engine->buffering = FALSE;
++                ended_event = FALSE;
++            }
++            else
++                ended_event = media_engine_handle_ended(engine);
+             if (ended_event)
+-                IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ENDED, 0, 0);
++                media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_ENDED, 0, 0);
++            media_engine_unlock(engine);
+             break;
+ 
+         case MESessionTopologySet:
+@@ -1225,7 +1674,7 @@
+              * own request, otherwise leave the state alone. */
+             if (FAILED(IMFMediaEvent_GetStatus(event, &status)))
+                 status = S_OK;
+-            EnterCriticalSection(&engine->cs);
++            media_engine_lock_wq(engine, "session_events_Invoke:MESessionTopologySet");
+             if (++engine->topology_events == engine->presentation.topology_request && FAILED(status)
+                     && !(engine->flags & (FLAGS_ENGINE_SHUT_DOWN | FLAGS_ENGINE_SOURCE_PENDING))
+                     && engine->presentation.generation == engine->source_generation)
+@@ -1240,10 +1689,10 @@
+                 media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING
+                         | FLAGS_ENGINE_PLAY_PENDING | FLAGS_ENGINE_PAUSE_PENDING
+                         | FLAGS_ENGINE_WAITING | FLAGS_ENGINE_SCRUBBING, FALSE);
+-                IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ERROR,
++                media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_ERROR,
+                         engine->error_code, status);
+             }
+-            LeaveCriticalSection(&engine->cs);
++            media_engine_unlock(engine);
+             break;
+         }
+ 
+@@ -1271,12 +1720,12 @@
+                 error_code = MF_MEDIA_ENGINE_ERR_DECODE;
+             else
+                 error_code = MF_MEDIA_ENGINE_ERR_NETWORK;
+-            EnterCriticalSection(&engine->cs);
++            media_engine_lock_wq(engine, "session_events_Invoke:MEError");
+             if ((engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+                     || engine->presentation.generation != engine->source_generation
+                     || source.punkVal != (IUnknown *)engine->presentation.source)
+             {
+-                LeaveCriticalSection(&engine->cs);
++                media_engine_unlock(engine);
+                 PropVariantClear(&source);
+                 break;
+             }
+@@ -1289,24 +1738,24 @@
+             media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING
+                     | FLAGS_ENGINE_PLAY_PENDING | FLAGS_ENGINE_PAUSE_PENDING
+                     | FLAGS_ENGINE_WAITING | FLAGS_ENGINE_SCRUBBING, FALSE);
+-            IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ERROR,
++            media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_ERROR,
+                     error_code, error);
+-            LeaveCriticalSection(&engine->cs);
++            media_engine_unlock(engine);
+ 
+             PropVariantClear(&source);
+             break;
+         }
+ 
+         case MEEndOfPresentationSegment:
+-            EnterCriticalSection(&engine->cs);
++            media_engine_lock_wq(engine, "session_events_Invoke:MEEndOfPresentationSegment");
+             if (engine->presentation.frame_sink)
+                 video_frame_sink_notify_end_of_presentation_segment(engine->presentation.frame_sink);
+-            LeaveCriticalSection(&engine->cs);
++            media_engine_unlock(engine);
+             break;
+ 
+         case MESessionRateChanged:
+ 
+-            EnterCriticalSection(&engine->cs);
++            media_engine_lock_wq(engine, "session_events_Invoke:MESessionRateChanged");
+             if (engine->flags & FLAGS_ENGINE_SCRUBBING &&
+                     IMFMediaEvent_GetValue(event, &rate) == S_OK &&
+                     rate.vt == VT_R4)
+@@ -1340,24 +1789,24 @@
+                     }
+                 }
+             }
+-            LeaveCriticalSection(&engine->cs);
++            media_engine_unlock(engine);
+             break;
+ 
+         case MESessionScrubSampleComplete:
+ 
+-            EnterCriticalSection(&engine->cs);
++            media_engine_lock_wq(engine, "session_events_Invoke:MESessionScrubSampleComplete");
+             if ((engine->flags & FLAGS_ENGINE_SCRUBBING)
+                     && !(engine->flags & FLAGS_ENGINE_PAUSE_PENDING)
+                     && FAILED(hr = IMFMediaSession_Pause(engine->session)))
+                 WARN("Failed to pause media session %#lx.\n", hr);
+-            LeaveCriticalSection(&engine->cs);
++            media_engine_unlock(engine);
+             break;
+ 
+         case MESessionPaused:
+         {
+             BOOL scrubbing;
+ 
+-            EnterCriticalSection(&engine->cs);
++            media_engine_lock_wq(engine, "session_events_Invoke:MESessionPaused");
+             scrubbing = !!(engine->flags & FLAGS_ENGINE_SCRUBBING);
+             if (scrubbing)
+                 media_engine_set_rate(engine, FALSE, engine->default_playback_rate);
+@@ -1387,7 +1836,7 @@
+             }
+             if (start_pending)
+                 media_engine_start_playback(engine);
+-            LeaveCriticalSection(&engine->cs);
++            media_engine_unlock(engine);
+             break;
+         }
+     }
+@@ -1429,7 +1878,7 @@
+     struct media_engine *engine = impl_from_sink_events_IMFAsyncCallback(iface);
+     MF_MEDIA_ENGINE_EVENT event = IMFAsyncResult_GetStatus(result);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock_wq(engine, __func__);
+ 
+     TRACE("Media Engine sink event %u, flags %#x, ready %u, network %u, duration %.6f.\n",
+             event, engine->flags, engine->ready_state, engine->network_state, engine->duration);
+@@ -1443,7 +1892,7 @@
+             ;
+     }
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return S_OK;
+ }
+@@ -1627,11 +2076,6 @@
+     return hr;
+ }
+ 
+-static BOOL media_engine_source_is_current(struct media_engine *engine, UINT64 generation)
+-{
+-    return !(engine->flags & FLAGS_ENGINE_SHUT_DOWN) && generation == engine->source_generation;
+-}
+-
+ /* must be called with engine->cs held */
+ static void media_engine_clear_presentation(struct media_engine *engine)
+ {
+@@ -1655,9 +2099,11 @@
+     {
+         /* critical section can not be held during shutdown, as shut down requires all pending
+          * callbacks to complete, and some callbacks require this cs */
+-        LeaveCriticalSection(&engine->cs);
++        BOOL internal, dropped = media_engine_drop_lock(engine, &internal);
++
+         IMFMediaSource_Shutdown(source);
+-        EnterCriticalSection(&engine->cs);
++        if (dropped)
++            media_engine_retake_lock(engine, __func__, internal);
+         IMFMediaSource_Release(source);
+     }
+     if (pd)
+@@ -1989,12 +2435,14 @@
+     generation = context->generation;
+     IUnknown_Release(state);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock_wq(engine, __func__);
+     if (!media_engine_source_is_current(engine, generation))
+         goto stale;
+ 
+     engine->network_state = MF_MEDIA_ENGINE_NETWORK_LOADING;
+-    IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_LOADSTART, 0, 0);
++    media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_LOADSTART, 0, 0);
++    /* The handler may replace the source. */
++    media_engine_flush_notifications(engine, __func__);
+     if (!media_engine_source_is_current(engine, generation))
+         goto stale;
+ 
+@@ -2039,16 +2487,16 @@
+         engine->network_state = MF_MEDIA_ENGINE_NETWORK_NO_SOURCE;
+         engine->error_code = MF_MEDIA_ENGINE_ERR_SRC_NOT_SUPPORTED;
+         engine->extended_code = hr;
+-        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ERROR, engine->error_code,
++        media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_ERROR, engine->error_code,
+                 engine->extended_code);
+     }
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return S_OK;
+ 
+ stale:
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+     media_engine_discard_source_object(object);
+     return S_OK;
+ }
+@@ -2103,12 +2551,13 @@
+ {
+     BOOL shutdown_session;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     shutdown_session = !(engine->flags & FLAGS_ENGINE_SHUT_DOWN);
+     if (shutdown_session)
+         media_engine_set_flag(engine, FLAGS_ENGINE_SHUT_DOWN, TRUE);
++    media_engine_close_notifications(engine);
+     media_engine_clear_presentation(engine);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     /* Keep the session alive until its sources and pending callbacks have been
+      * shut down.  Explicit Shutdown() already performs this step. */
+@@ -2137,6 +2586,7 @@
+     }
+     SysFreeString(engine->current_source);
+     DeleteCriticalSection(&engine->cs);
++    DeleteCriticalSection(&engine->delivery_cs);
+     free(engine->video_frame.buffer);
+     free(engine);
+ }
+@@ -2167,7 +2617,7 @@
+ 
+     *error = NULL;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else if (engine->error_code)
+@@ -2181,7 +2631,7 @@
+     error_code = engine->error_code;
+     extended_code = engine->extended_code;
+     duration = engine->duration;
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     if (isinf(duration))
+     {
+@@ -2205,12 +2655,12 @@
+     if ((unsigned int)code > MF_MEDIA_ENGINE_ERR_ENCRYPTED)
+         return E_INVALIDARG;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+         engine->error_code = code;
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -2244,10 +2694,6 @@
+ 
+     engine->ready_state = MF_MEDIA_ENGINE_READY_HAVE_NOTHING;
+ 
+-    IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PURGEQUEUEDEVENTS, 0, 0);
+-    if (!media_engine_source_is_current(engine, generation))
+-        return S_OK;
+-
+     start_pending = !(engine->flags & FLAGS_ENGINE_PAUSED) || (engine->flags & FLAGS_ENGINE_IS_ENDED);
+     engine->playback_requested = start_pending;
+ 
+@@ -2269,6 +2715,15 @@
+             | FLAGS_ENGINE_SEEKING, FALSE);
+     media_engine_set_flag(engine, FLAGS_ENGINE_PAUSED, !start_pending);
+     media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, start_pending);
++    if (url || bytestream)
++        media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING, TRUE);
++
++    /* The handler may replace the source, or call Play(). Deliver once the state is complete (a call
++     * from another thread meanwhile sees the source pending), then revalidate. */
++    media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_PURGEQUEUEDEVENTS, 0, 0);
++    media_engine_flush_notifications(engine, __func__);
++    if (!media_engine_source_is_current(engine, generation))
++        return S_OK;
+ 
+     if (!url && !bytestream)
+     {
+@@ -2279,8 +2734,6 @@
+ 
+     if (url || bytestream)
+     {
+-        media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING, TRUE);
+-
+         if (engine->extension)
+             origin = MEDIA_ENGINE_LOAD_EXTENSION;
+         else if (bytestream)
+@@ -2296,8 +2749,15 @@
+ 
+         if (engine->extension)
+         {
+-            hr = IMFMediaEngineExtension_BeginCreateObject(engine->extension, url, bytestream, MF_OBJECT_MEDIASOURCE, NULL,
+-                    &engine->load_handler, &context->IUnknown_iface);
++            /* The extension is application code: call it without the lock. The caller holds the only level
++             * here unless it was itself called with the lock held more than once. */
++            BOOL internal, dropped = media_engine_drop_lock(engine, &internal);
++
++            media_engine_check_app_call(engine, "IMFMediaEngineExtension::BeginCreateObject");
++            hr = IMFMediaEngineExtension_BeginCreateObject(engine->extension, url, bytestream, MF_OBJECT_MEDIASOURCE,
++                    NULL, &engine->load_handler, &context->IUnknown_iface);
++            if (dropped)
++                media_engine_retake_lock(engine, __func__, internal);
+         }
+         else
+         {
+@@ -2335,14 +2795,14 @@
+ 
+     TRACE("%p, %s.\n", iface, debugstr_w(url));
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+         hr = media_engine_set_source(engine, NULL, url);
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -2356,7 +2816,7 @@
+ 
+     *url = NULL;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+@@ -2366,7 +2826,7 @@
+             hr = E_OUTOFMEMORY;
+     }
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -2379,11 +2839,11 @@
+     double duration;
+     unsigned int flags;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     state = engine->network_state;
+     duration = engine->duration;
+     flags = engine->flags;
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     if (isinf(duration))
+     {
+@@ -2405,9 +2865,9 @@
+ 
+     TRACE("%p.\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     preload = engine->preload;
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return preload;
+ }
+@@ -2418,9 +2878,9 @@
+ 
+     TRACE("%p, %d.\n", iface, preload);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     engine->preload = preload;
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return S_OK;
+ }
+@@ -2438,7 +2898,7 @@
+     if (FAILED(hr = create_time_range(range)))
+         return hr;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     duration = engine->duration;
+     client_duration = media_engine_get_client_duration(engine);
+@@ -2451,7 +2911,7 @@
+     if (isinf(duration))
+         impl_from_IMFMediaTimeRange(*range)->trace_live_buffered = TRUE;
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     if (isinf(duration))
+     {
+@@ -2473,7 +2933,7 @@
+ 
+     TRACE("(%p).\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+@@ -2483,7 +2943,7 @@
+     TRACE("Load requested, autoplay %u, flags %#x, ready %u, network %u.\n", autoplay,
+             engine->flags, engine->ready_state, engine->network_state);
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     if (autoplay)
+         hr = IMFMediaEngineEx_Play(iface);
+@@ -2545,6 +3005,8 @@
+ static HRESULT WINAPI media_engine_CanPlayType(IMFMediaEngineEx *iface, BSTR mime_type, MF_MEDIA_ENGINE_CANPLAY *answer)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    IMFMediaEngineExtension *extension = NULL;
++    BOOL audio_only = FALSE;
+     HRESULT hr = S_OK;
+ 
+     TRACE("%p, %s, %p.\n", iface, debugstr_w(mime_type), answer);
+@@ -2553,7 +3015,7 @@
+         return E_POINTER;
+     *answer = MF_MEDIA_ENGINE_CANPLAY_NOT_SUPPORTED;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+@@ -2562,12 +3024,22 @@
+         if (media_engine_is_supported_type(mime_type))
+             *answer = MF_MEDIA_ENGINE_CANPLAY_MAYBE;
+ 
+-        if (engine->extension)
+-             hr = IMFMediaEngineExtension_CanPlayType(engine->extension, !!(engine->flags & MF_MEDIA_ENGINE_AUDIOONLY),
+-                     mime_type, answer);
++        if ((extension = engine->extension))
++        {
++            IMFMediaEngineExtension_AddRef(extension);
++            audio_only = !!(engine->flags & MF_MEDIA_ENGINE_AUDIOONLY);
++        }
+     }
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
++
++    if (extension)
++    {
++        /* Application code: not with the lock held. */
++        media_engine_check_app_call(engine, "IMFMediaEngineExtension::CanPlayType");
++        hr = IMFMediaEngineExtension_CanPlayType(extension, audio_only, mime_type, answer);
++        IMFMediaEngineExtension_Release(extension);
++    }
+ 
+     return hr;
+ }
+@@ -2578,7 +3050,7 @@
+     static LONG live_ready_count;
+     unsigned short state;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     state = engine->ready_state;
+     if (isinf(engine->duration))
+     {
+@@ -2589,7 +3061,7 @@
+                     count, state, engine->flags, engine->network_state);
+     }
+     TRACE("%p returning %u flags %#x.\n", iface, state, engine->flags);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return state;
+ }
+@@ -2600,7 +3072,7 @@
+     static LONG live_seeking_count;
+     BOOL value;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     value = !!(engine->flags & FLAGS_ENGINE_SEEKING);
+     if (isinf(engine->duration))
+     {
+@@ -2611,7 +3083,7 @@
+                     count, value, engine->flags, engine->ready_state, engine->network_state);
+     }
+     TRACE("%p returning %d flags %#x.\n", iface, value, engine->flags);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return value;
+ }
+@@ -2624,7 +3096,7 @@
+     MFTIME clocktime;
+     MFCLOCK_STATE state;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if ((engine->flags & FLAGS_ENGINE_SEEKING) && isfinite(engine->current_seek))
+     {
+         ret = engine->current_seek;
+@@ -2676,7 +3148,7 @@
+             TRACE("Live current time call %ld: %.6f, flags %#x, ready %u, network %u.\n",
+                     count, ret, engine->flags, engine->ready_state, engine->network_state);
+     }
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return ret;
+ }
+@@ -2706,11 +3178,11 @@
+         engine->video_preroll_time = MINLONGLONG;
+         engine->last_committed_seek_time = GetTickCount();
+         media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING, FALSE);
+-        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKING, 0, 0);
+-        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKED, 0, 0);
+-        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
++        media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_SEEKING, 0, 0);
++        media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_SEEKED, 0, 0);
++        media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
+         if (media_engine_handle_ended(engine))
+-            IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ENDED, 0, 0);
++            media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_ENDED, 0, 0);
+         return S_OK;
+     }
+ 
+@@ -2742,12 +3214,13 @@
+     if (IMFMediaEngineEx_IsPaused(&engine->IMFMediaEngineEx_iface))
+     {
+         engine->presentation.start_position = position;
++        media_engine_set_flag(engine, FLAGS_ENGINE_IS_ENDED, FALSE);
+         engine->last_committed_seek = seektime;
+         engine->video_preroll_time = seektime * 10000000;
+         engine->last_committed_seek_time = GetTickCount();
+-        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKING, 0, 0);
+-        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKED, 0, 0);
+-        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
++        media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_SEEKING, 0, 0);
++        media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_SEEKED, 0, 0);
++        media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
+         return S_OK;
+     }
+ 
+@@ -2759,7 +3232,7 @@
+         engine->last_committed_seek_time = GetTickCount();
+         media_engine_set_flag(engine, FLAGS_ENGINE_IS_ENDED | FLAGS_ENGINE_WAITING, FALSE);
+         media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING, TRUE);
+-        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKING, 0, 0);
++        media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_SEEKING, 0, 0);
+     }
+ 
+     return hr;
+@@ -2772,14 +3245,14 @@
+ 
+     TRACE("%p, %f.\n", iface, time);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+         hr = media_engine_set_current_time(engine, time);
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -2800,11 +3273,11 @@
+ 
+     TRACE("%p.\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     duration = engine->duration;
+     value = media_engine_get_client_duration(engine);
+     flags = engine->flags;
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     if (isinf(duration))
+     {
+@@ -2826,12 +3299,12 @@
+     unsigned int flags;
+     BOOL value;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     value = !!(engine->flags & FLAGS_ENGINE_PAUSED);
+     duration = engine->duration;
+     flags = engine->flags;
+     TRACE("%p returning %d flags %#x.\n", iface, value, flags);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     if (isinf(duration))
+     {
+@@ -2851,9 +3324,9 @@
+ 
+     TRACE("%p.\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     rate = engine->default_playback_rate;
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return rate;
+ }
+@@ -2865,15 +3338,15 @@
+ 
+     TRACE("%p, %f.\n", iface, rate);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else if (engine->default_playback_rate != rate)
+     {
+         engine->default_playback_rate = rate;
+-        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_RATECHANGE, 0, 0);
++        media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_RATECHANGE, 0, 0);
+     }
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -2885,9 +3358,9 @@
+ 
+     TRACE("%p.\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     rate = engine->playback_rate;
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return rate;
+ }
+@@ -2899,15 +3372,15 @@
+ 
+     TRACE("%p, %f.\n", iface, rate);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else if (engine->playback_rate != rate)
+     {
+         engine->playback_rate = rate;
+-        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_RATECHANGE, 0, 0);
++        media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_RATECHANGE, 0, 0);
+     }
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -2922,7 +3395,7 @@
+ 
+     FIXME("(%p, %p): stub.\n", iface, played);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+@@ -2930,7 +3403,7 @@
+     duration = engine->duration;
+     flags = engine->flags;
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     if (isinf(duration))
+     {
+@@ -2956,7 +3429,7 @@
+ 
+     TRACE("%p, %p.\n", iface, seekable);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     duration = engine->duration;
+     engine_flags = engine->flags;
+@@ -2975,7 +3448,7 @@
+         }
+     }
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     if (FAILED(hr) && time_range)
+     {
+@@ -3003,9 +3476,9 @@
+ 
+     TRACE("%p.\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     value = !!(engine->flags & FLAGS_ENGINE_IS_ENDED);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return value;
+ }
+@@ -3017,9 +3490,9 @@
+ 
+     TRACE("%p.\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     value = !!(engine->flags & FLAGS_ENGINE_AUTO_PLAY);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return value;
+ }
+@@ -3031,13 +3504,13 @@
+ 
+     TRACE("%p, %d.\n", iface, autoplay);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     media_engine_set_flag(engine, FLAGS_ENGINE_AUTO_PLAY, autoplay);
+     if (autoplay && !(engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+             && engine->network_state == MF_MEDIA_ENGINE_NETWORK_IDLE
+             && !engine->playback_requested)
+         hr = IMFMediaEngineEx_Play(iface);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -3049,9 +3522,9 @@
+ 
+     TRACE("%p.\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     value = !!(engine->flags & FLAGS_ENGINE_LOOP);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return value;
+ }
+@@ -3062,9 +3535,9 @@
+ 
+     FIXME("(%p, %d): stub.\n", iface, loop);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     media_engine_set_flag(engine, FLAGS_ENGINE_LOOP, loop);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return S_OK;
+ }
+@@ -3076,7 +3549,7 @@
+     DWORD characteristics = 0;
+     BOOL is_live = FALSE;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     TRACE("%p enter flags %#x ready %u network %u.\n", iface, engine->flags, engine->ready_state,
+             engine->network_state);
+ 
+@@ -3116,7 +3589,7 @@
+ 
+     TRACE("%p leave hr %#lx flags %#x ready %u network %u.\n", iface, hr, engine->flags,
+             engine->ready_state, engine->network_state);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -3126,7 +3599,7 @@
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
+     HRESULT hr = S_OK;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     TRACE("%p enter flags %#x ready %u network %u.\n", iface, engine->flags, engine->ready_state,
+             engine->network_state);
+ 
+@@ -3147,17 +3620,17 @@
+                 media_engine_set_flag(engine, FLAGS_ENGINE_WAITING | FLAGS_ENGINE_IS_ENDED, FALSE);
+                 media_engine_set_flag(engine, FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_PAUSE_PENDING, TRUE);
+ 
+-                IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
+-                IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PAUSE, 0, 0);
++                media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
++                media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_PAUSE, 0, 0);
+             }
+         }
+ 
+-        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PURGEQUEUEDEVENTS, 0, 0);
++        media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_PURGEQUEUEDEVENTS, 0, 0);
+     }
+ 
+     TRACE("%p leave hr %#lx flags %#x ready %u network %u.\n", iface, hr, engine->flags,
+             engine->ready_state, engine->network_state);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -3169,9 +3642,9 @@
+ 
+     TRACE("%p.\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     ret = !!(engine->flags & FLAGS_ENGINE_MUTED);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return ret;
+ }
+@@ -3183,15 +3656,15 @@
+ 
+     TRACE("%p, %d.\n", iface, muted);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else if (!!(engine->flags & FLAGS_ENGINE_MUTED) ^ !!muted)
+     {
+         media_engine_set_flag(engine, FLAGS_ENGINE_MUTED, muted);
+-        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_VOLUMECHANGE, 0, 0);
++        media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_VOLUMECHANGE, 0, 0);
+     }
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -3203,9 +3676,9 @@
+ 
+     TRACE("%p.\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     volume = engine->volume;
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return volume;
+ }
+@@ -3217,16 +3690,16 @@
+ 
+     TRACE("%p, %f.\n", iface, volume);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else if (volume != engine->volume)
+     {
+         engine->volume = volume;
+         media_engine_apply_volume(engine);
+-        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_VOLUMECHANGE, 0, 0);
++        media_engine_notify(engine, MF_MEDIA_ENGINE_EVENT_VOLUMECHANGE, 0, 0);
+     }
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -3239,7 +3712,7 @@
+ 
+     TRACE("%p.\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     value = !!(engine->flags & FLAGS_ENGINE_HAS_VIDEO);
+     if (isinf(engine->duration))
+     {
+@@ -3248,7 +3721,7 @@
+         if (count <= 8 || !(count % 120))
+             TRACE("Live HasVideo call %ld: %u, flags %#x.\n", count, value, engine->flags);
+     }
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return value;
+ }
+@@ -3261,7 +3734,7 @@
+ 
+     TRACE("%p.\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     value = !!(engine->flags & FLAGS_ENGINE_HAS_AUDIO);
+     if (isinf(engine->duration))
+     {
+@@ -3270,7 +3743,7 @@
+         if (count <= 8 || !(count % 120))
+             TRACE("Live HasAudio call %ld: %u, flags %#x.\n", count, value, engine->flags);
+     }
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return value;
+ }
+@@ -3289,7 +3762,7 @@
+     if (!cx && !cy)
+         return E_INVALIDARG;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+@@ -3306,7 +3779,7 @@
+     duration = engine->duration;
+     flags = engine->flags;
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     if (isinf(duration))
+     {
+@@ -3334,7 +3807,7 @@
+     if (!cx && !cy)
+         return E_INVALIDARG;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+@@ -3351,7 +3824,7 @@
+     duration = engine->duration;
+     flags = engine->flags;
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     if (isinf(duration))
+     {
+@@ -3372,20 +3845,21 @@
+ 
+     TRACE("%p.\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+     {
+         media_engine_set_flag(engine, FLAGS_ENGINE_SHUT_DOWN, TRUE);
++        media_engine_close_notifications(engine);
+         media_engine_clear_presentation(engine);
+         /* critical section can not be held during shutdown, as shut down requires all pending
+          * callbacks to complete, and some callbacks require this cs */
+-        LeaveCriticalSection(&engine->cs);
++        media_engine_unlock(engine);
+         IMFMediaSession_Shutdown(engine->session);
+-        EnterCriticalSection(&engine->cs);
++        media_engine_lock(engine, __func__);
+     }
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4083,7 +4557,7 @@
+             src_rect->left, src_rect->top, src_rect->right, src_rect->bottom) : "(null)",
+             wine_dbgstr_rect(dst_rect), color);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (SUCCEEDED(IUnknown_QueryInterface(surface, &IID_ID3D11Texture2D, (void **)&texture)))
+     {
+@@ -4113,7 +4587,7 @@
+                     wine_dbgstr_longlong(engine->video_frame.pts), engine->flags);
+     }
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4129,7 +4603,7 @@
+ 
+     TRACE("%p, %p.\n", iface, pts);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+@@ -4199,7 +4673,7 @@
+                     clocktime != MINLONGLONG ? wine_dbgstr_longlong(clocktime) : "(unset)", engine->flags);
+     }
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4211,7 +4685,7 @@
+ 
+     TRACE("%p, %p, %s.\n", iface, bytestream, debugstr_w(url));
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+@@ -4220,7 +4694,7 @@
+     else
+         hr = media_engine_set_source(engine, bytestream, url);
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4234,10 +4708,10 @@
+ 
+     FIXME("%p, %x, %p stub.\n", iface, stat_id, stat);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     duration = engine->duration;
+     flags = engine->flags;
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     if (isinf(duration))
+     {
+@@ -4297,7 +4771,7 @@
+ 
+     TRACE("%p, %p.\n", iface, flags);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+     {
+         hr = MF_E_SHUTDOWN;
+@@ -4312,7 +4786,7 @@
+     }
+     duration = engine->duration;
+     engine_flags = engine->flags;
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     if (isinf(duration))
+     {
+@@ -4337,14 +4811,14 @@
+ 
+     TRACE("%p, %s, %p.\n", iface, debugstr_guid(attribute), value);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else if (engine->presentation.pd)
+         hr = IMFPresentationDescriptor_GetItem(engine->presentation.pd, attribute, value);
+     duration = engine->duration;
+     flags = engine->flags;
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     if (isinf(duration))
+     {
+@@ -4365,12 +4839,12 @@
+ 
+     TRACE("%p, %p.\n", iface, stream_count);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else if (engine->presentation.pd)
+         hr = IMFPresentationDescriptor_GetStreamDescriptorCount(engine->presentation.pd, stream_count);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4385,7 +4859,7 @@
+ 
+     TRACE("%p, %ld, %s, %p.\n", iface, stream_index, debugstr_guid(attribute), value);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else if (engine->presentation.pd)
+@@ -4415,7 +4889,7 @@
+     if (isinf(engine->duration))
+         TRACE("Live stream attribute: stream %lu, attribute %s, hr %#lx, vt %u.\n", stream_index,
+                 debugstr_guid(attribute), hr, SUCCEEDED(hr) && value ? value->vt : VT_EMPTY);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4434,7 +4908,7 @@
+ 
+     *enabled = FALSE;
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else if (engine->presentation.pd)
+@@ -4450,7 +4924,7 @@
+     if (isinf(engine->duration))
+         TRACE("Live stream selection: stream %lu, selected %u, hr %#lx.\n",
+                 stream_index, *enabled, hr);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4508,9 +4982,9 @@
+ 
+     TRACE("%p, %p, %d.\n", iface, effect, is_optional);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     hr = media_engine_insert_effect(engine, &engine->video_effects, effect, is_optional);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4522,9 +4996,9 @@
+ 
+     TRACE("%p, %p, %d.\n", iface, effect, is_optional);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     hr = media_engine_insert_effect(engine, &engine->audio_effects, effect, is_optional);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4536,7 +5010,7 @@
+ 
+     TRACE("%p.\n", iface);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+@@ -4544,7 +5018,7 @@
+         media_engine_clear_effects(&engine->audio_effects);
+         media_engine_clear_effects(&engine->video_effects);
+     }
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4633,14 +5107,14 @@
+ 
+     TRACE("%p, %p.\n", iface, category);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+         hr = IMFAttributes_GetUINT32(engine->attributes, &MF_MEDIA_ENGINE_AUDIO_CATEGORY, category);
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4652,14 +5126,14 @@
+ 
+     TRACE("%p, %u.\n", iface, category);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+         hr = IMFAttributes_SetUINT32(engine->attributes, &MF_MEDIA_ENGINE_AUDIO_CATEGORY, category);
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4671,14 +5145,14 @@
+ 
+     TRACE("%p, %p.\n", iface, role);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+         hr = IMFAttributes_GetUINT32(engine->attributes, &MF_MEDIA_ENGINE_AUDIO_ENDPOINT_ROLE, role);
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4690,14 +5164,14 @@
+ 
+     TRACE("%p, %u.\n", iface, role);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+         hr = IMFAttributes_SetUINT32(engine->attributes, &MF_MEDIA_ENGINE_AUDIO_ENDPOINT_ROLE, role);
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4709,12 +5183,12 @@
+ 
+     TRACE("%p, %p.\n", iface, enabled);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+         *enabled = !!(engine->flags & MF_MEDIA_ENGINE_REAL_TIME_MODE);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4726,12 +5200,12 @@
+ 
+     TRACE("%p, %d.\n", iface, enable);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+         media_engine_set_flag(engine, MF_MEDIA_ENGINE_REAL_TIME_MODE, enable);
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4746,14 +5220,14 @@
+     if (mode)
+         FIXME("mode %#x is ignored.\n", mode);
+ 
+-    EnterCriticalSection(&engine->cs);
++    media_engine_lock(engine, __func__);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+         hr = media_engine_set_current_time(engine, seektime);
+ 
+-    LeaveCriticalSection(&engine->cs);
++    media_engine_unlock(engine);
+ 
+     return hr;
+ }
+@@ -4939,6 +5413,7 @@
+     engine->next_seek = NAN;
+     engine->video_frame.pts = MINLONGLONG;
+     InitializeCriticalSection(&engine->cs);
++    InitializeCriticalSection(&engine->delivery_cs);
+ 
+     if (FAILED(hr = IMFAttributes_GetUnknown(attributes, &MF_MEDIA_ENGINE_CALLBACK, &IID_IMFMediaEngineNotify,
+             (void **)&engine->callback)))

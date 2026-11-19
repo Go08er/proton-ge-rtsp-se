@@ -1,0 +1,322 @@
+Subject: [P20 review] winedmo retain codec admission and format validation
+
+Residual against GE-Proton11-9 after ge-video-rework.
+Source-reviewed only: not compiler or runtime qualification.
+Prior P19b2 patch ownership (some behavior is now upstream):
+  ge-master-20260913-se2-p10/0050-winedmo-expose-existing-mjpeg-video-decoder.patch
+  ge-master-20260913-se2-p12/0051-winedmo-expose-existing-mpeg-video-decoders.patch
+  ge-master-20260913-se2-p12/0052-winedmo-register-existing-mpeg4-video-aliases.patch
+  ge-master-20260913-se2-p8/0047-winedmo-expose-ac3-and-eac3-audio-decoding.patch
+  proposed/0027-winedmo-expose-vp8-and-hevc-decoders.patch
+  proposed/0033-winedmo-bound-and-extend-audio-channel-counts.patch
+  proposed/0042-winedmo-expose-existing-flac-audio-decoder.patch
+  proposed/0048-winedmo-expose-existing-dts-alac-and-g711-decoders.patch
+  proposed/0049-winedmo-expose-existing-mpeg-layer-audio-decoder.patch
+
+---
+diff --git a/dlls/winedmo/unix_media_type.c b/dlls/winedmo/unix_media_type.c
+--- a/dlls/winedmo/unix_media_type.c
++++ b/dlls/winedmo/unix_media_type.c
+@@ -206,7 +206,11 @@
+ 
+     format_tag = wave_format_tag_from_codec_id( params->codec_id );
+     if (params->codec_id == AV_CODEC_ID_OPUS) format_tag = WAVE_FORMAT_OPUS;
+-    else if (params->codec_id == AV_CODEC_ID_AC3) format_tag = WAVE_FORMAT_EXTENSIBLE;
++    /* RIFF DTS uses 0x2001; MOV ALAC uses a fourcc. Publish MF's canonical tags. */
++    else if (params->codec_id == AV_CODEC_ID_DTS) format_tag = WAVE_FORMAT_DTS;
++    else if (params->codec_id == AV_CODEC_ID_ALAC) format_tag = WAVE_FORMAT_ALAC;
++    else if (params->codec_id == AV_CODEC_ID_AC3 || params->codec_id == AV_CODEC_ID_EAC3)
++        format_tag = WAVE_FORMAT_EXTENSIBLE;
+     /* Big-endian PCM in native Windows is given the usual WAVE_FORMAT_PCM tag. */
+     else if (params->codec_id == AV_CODEC_ID_PCM_S16BE) format_tag = WAVE_FORMAT_PCM;
+ 
+@@ -217,6 +221,7 @@
+ 
+         if (params->codec_id == AV_CODEC_ID_VORBIS) subtype = MFAudioFormat_Vorbis;
+         else if (params->codec_id == AV_CODEC_ID_AC3) subtype = MFAudioFormat_Dolby_AC3;
++        else if (params->codec_id == AV_CODEC_ID_EAC3) subtype = MFAudioFormat_Dolby_DDPlus;
+         else subtype.Data1 = format_tag;
+ 
+         wave_format_size += sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+@@ -384,6 +389,7 @@
+         if (params->codec_id == AV_CODEC_ID_MPEG1VIDEO) format->guidFormat = MEDIASUBTYPE_MPEG1Payload;
+         else if (params->codec_id == AV_CODEC_ID_MPEG2VIDEO) format->guidFormat = MFVideoFormat_MPEG2;
+         else if (params->codec_id == AV_CODEC_ID_H264) format->guidFormat.Data1 = MFVideoFormat_H264.Data1;
++        else if (params->codec_id == AV_CODEC_ID_VP8) format->guidFormat.Data1 = MFVideoFormat_VP80.Data1;
+         else if (params->codec_id == AV_CODEC_ID_VP9) format->guidFormat.Data1 = MFVideoFormat_VP90.Data1;
+         else if (params->codec_id == AV_CODEC_ID_AV1) format->guidFormat.Data1 = MFVideoFormat_AV1.Data1;
+         else if (params->codec_id == AV_CODEC_ID_HEVC) format->guidFormat.Data1 = MFVideoFormat_HEVC.Data1;
+diff --git a/dlls/winedmo/audio_decoder.c b/dlls/winedmo/audio_decoder.c
+--- a/dlls/winedmo/audio_decoder.c
++++ b/dlls/winedmo/audio_decoder.c
+@@ -32,6 +32,10 @@
+ #include "wine/debug.h"
+ #include "wine/winedmo.h"
+ 
++#include "initguid.h"
++DEFINE_MEDIATYPE_GUID(MFAudioFormat_ALAW,WAVE_FORMAT_ALAW);
++DEFINE_MEDIATYPE_GUID(MFAudioFormat_MULAW,WAVE_FORMAT_MULAW);
++
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+ 
+@@ -47,7 +51,7 @@
+                 .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},
+ };
+ 
+-static const UINT32 default_channel_mask[7] =
++static const UINT32 default_channel_mask[9] =
+ {
+     0,
+     SPEAKER_FRONT_CENTER,
+@@ -56,6 +60,9 @@
+     KSAUDIO_SPEAKER_QUAD,
+     KSAUDIO_SPEAKER_QUAD | SPEAKER_FRONT_CENTER,
+     KSAUDIO_SPEAKER_5POINT1,
++    /* Match FFmpeg's default layouts, not Windows' 7.1-wide mask. */
++    KSAUDIO_SPEAKER_5POINT1_SURROUND | SPEAKER_BACK_CENTER,
++    KSAUDIO_SPEAKER_7POINT1_SURROUND,
+ };
+ 
+ static inline UINT32 wave_format_size(const WAVEFORMATEX *format)
+@@ -363,6 +370,25 @@
+     if (b->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE)
+         return b->SubFormat.Data1 == a->Format.wFormatTag;
+     return a->Format.wFormatTag == b->Format.wFormatTag;
++}
++
++static BOOL valid_mpeg_audio_input(const WAVEFORMATEXTENSIBLE *format, UINT32 size)
++{
++    WORD layer;
++    UINT32 header_size = sizeof(MPEG1WAVEFORMAT) - sizeof(WAVEFORMATEX);
++
++    if (size < sizeof(*format) || format->Format.cbSize < CBSIZE(WAVEFORMATEXTENSIBLE)
++            || !format->Format.nChannels || format->Format.nChannels > 2)
++        return FALSE;
++    /* Complete sync frames carry the layer in-band. If the MF type provides
++     * MPEG1WAVEFORMAT metadata, require the complete header and layer 1 or 2. */
++    if (format->Format.cbSize == CBSIZE(WAVEFORMATEXTENSIBLE))
++        return TRUE;
++    if (format->Format.cbSize < CBSIZE(WAVEFORMATEXTENSIBLE) + header_size
++            || size < sizeof(*format) + header_size)
++        return FALSE;
++    memcpy(&layer, format + 1, sizeof(layer));
++    return layer == ACM_MPEG_LAYER1 || layer == ACM_MPEG_LAYER2;
+ }
+ 
+ static HRESULT WINAPI transform_SetInputType(IMFTransform *iface, DWORD id, IMFMediaType *type, DWORD flags)
+@@ -401,6 +427,11 @@
+     if (FAILED(hr = MFCreateWaveFormatExFromMFMediaType(type, (WAVEFORMATEX **)&format, &size,
+             MFWaveFormatExConvertFlag_ForceExtensible)))
+         return hr;
++    if (IsEqualGUID(&format->SubFormat, &MFAudioFormat_MPEG) && !valid_mpeg_audio_input(format, size))
++    {
++        CoTaskMemFree(format);
++        return MF_E_INVALIDMEDIATYPE;
++    }
+     wfx = *format;
+     CoTaskMemFree(format);
+ 
+@@ -410,8 +441,18 @@
+         return MF_E_INVALIDMEDIATYPE;
+ 
+     if (wfx.Format.nChannels >= ARRAY_SIZE(default_channel_mask) || !wfx.Format.nSamplesPerSec
+-            /* 2 is the minimum size of AudioSpecificConfig() */
+-            || wfx.Format.cbSize < 2 + CBSIZE(WAVEFORMATEXTENSIBLE))
++            /* Dolby/DTS/MPEG sync frames and G.711 need no out-of-band config.
++             * ALAC needs the 36-byte QuickTime atom consumed by FFmpeg;
++             * keep all other inputs' existing two-byte requirement. */
++            || (IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_ALAC)
++                && wfx.Format.cbSize < 36 + CBSIZE(WAVEFORMATEXTENSIBLE))
++            || (wfx.Format.cbSize < 2 + CBSIZE(WAVEFORMATEXTENSIBLE)
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_Dolby_AC3)
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_Dolby_DDPlus)
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_DTS)
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_ALAW)
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_MULAW)
++                && !IsEqualGUID(&wfx.SubFormat, &MFAudioFormat_MPEG)))
+         return MF_E_INVALIDMEDIATYPE;
+     if (flags & MFT_SET_TYPE_TEST_ONLY)
+         return S_OK;
+@@ -472,7 +513,8 @@
+     if (i == ARRAY_SIZE(audio_decoder_output_types))
+         return MF_E_INVALIDMEDIATYPE;
+ 
+-    if (!wfx.Format.nChannels || !wfx.Format.nSamplesPerSec)
++    if (!wfx.Format.nChannels || wfx.Format.nChannels >= ARRAY_SIZE(default_channel_mask)
++            || !wfx.Format.nSamplesPerSec)
+         return MF_E_INVALIDMEDIATYPE;
+     if (flags & MFT_SET_TYPE_TEST_ONLY)
+         return S_OK;
+@@ -832,10 +874,32 @@
+     {.Format = {.wFormatTag = WAVE_FORMAT_OPUS, .nChannels = 6, .nSamplesPerSec = 48000, .nAvgBytesPerSec = 1152000,
+                 .nBlockAlign = 24, .wBitsPerSample = 32, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},
+     {.Format = {.wFormatTag = WAVE_FORMAT_ADPCM, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_FLAC, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},
+     {.Format = {.wFormatTag = 0x0160, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},  /* WMA v1 */
+     {.Format = {.wFormatTag = 0x0161, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},  /* WMA v2/v8 */
+     {.Format = {.wFormatTag = 0x0162, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},  /* WMA Pro/v9 */
+     {.Format = {.wFormatTag = 0x0163, .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)}},  /* WMA Lossless */
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {0xe06d802c,0xdb46,0x11cf,{0xb4,0xd1,0x00,0x80,0x5f,0x6c,0xbb,0xea}}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {0xa7fb87af,0x2d02,0x42fb,{0xa4,0xd4,0x05,0xcd,0x93,0x84,0x3b,0xdd}}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {WAVE_FORMAT_DTS,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {WAVE_FORMAT_ALAC,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {WAVE_FORMAT_ALAW,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {WAVE_FORMAT_MULAW,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}}},
++    {.Format = {.wFormatTag = WAVE_FORMAT_EXTENSIBLE,
++                .cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)},
++     .SubFormat = {WAVE_FORMAT_MPEG,0,0x10,{0x80,0,0,0xaa,0,0x38,0x9b,0x71}}},
+ };
+ 
+ HRESULT audio_decoder_create(REFIID riid, void **ret)
+diff --git a/dlls/winedmo/video_decoder.c b/dlls/winedmo/video_decoder.c
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -534,11 +534,24 @@
+ static HRESULT create_mfvideoformat(IMFMediaType *type, union winedmo_format **format, UINT32 *format_size)
+ {
+     UINT32 user_data_size = 0, size = sizeof(MFVIDEOFORMAT);
++    const GUID *data_key = &MF_MT_USER_DATA;
+     union winedmo_format *fmt;
+-    HRESULT hr;
+-
+-    if (SUCCEEDED(IMFMediaType_GetBlobSize(type, &MF_MT_USER_DATA, &user_data_size)))
+-        size += user_data_size;
++    GUID subtype;
++    HRESULT hr;
++
++    /* Native MPEG media types use MPEG_SEQUENCE_HEADER; the demuxer's generic
++     * MFVIDEOFORMAT representation uses USER_DATA. Preserve either contract. */
++    if (SUCCEEDED(IMFMediaType_GetGUID(type, &MF_MT_SUBTYPE, &subtype))
++            && (IsEqualGUID(&subtype, &MEDIASUBTYPE_MPEG1Payload)
++                || IsEqualGUID(&subtype, &MFVideoFormat_MPG1)
++                || IsEqualGUID(&subtype, &MFVideoFormat_MPEG2))
++            && SUCCEEDED(IMFMediaType_GetBlobSize(type, &MF_MT_MPEG_SEQUENCE_HEADER, &user_data_size)))
++        data_key = &MF_MT_MPEG_SEQUENCE_HEADER;
++    else if (FAILED(IMFMediaType_GetBlobSize(type, data_key, &user_data_size)))
++        user_data_size = 0;
++    if (user_data_size > UINT32_MAX - size)
++        return E_INVALIDARG;
++    size += user_data_size;
+ 
+     if (!(fmt = calloc(1, size)))
+         return E_OUTOFMEMORY;
+@@ -548,7 +561,7 @@
+     {
+         fmt->video.dwSize = size;
+         if (user_data_size)
+-            hr = IMFMediaType_GetBlob(type, &MF_MT_USER_DATA, (BYTE *)(fmt + 1), user_data_size, NULL);
++            hr = IMFMediaType_GetBlob(type, data_key, (BYTE *)(fmt + 1), user_data_size, NULL);
+     }
+ 
+     if (FAILED(hr))
+@@ -2603,6 +2616,12 @@
+     &MFVideoFormat_mp43,
+     &MFVideoFormat_MP42,
+     &MFVideoFormat_mp42,
++    &MFVideoFormat_VP80,
++    &MFVideoFormat_HEVC,
++    &MFVideoFormat_MJPG,
++    &MEDIASUBTYPE_MPEG1Payload,
++    &MFVideoFormat_MPG1,
++    &MFVideoFormat_MPEG2,
+ };
+ static const GUID *const wmv_decoder_output_types[] =
+ {
+diff --git a/dlls/wmvdecod/wmvdecod.c b/dlls/wmvdecod/wmvdecod.c
+--- a/dlls/wmvdecod/wmvdecod.c
++++ b/dlls/wmvdecod/wmvdecod.c
+@@ -76,6 +76,12 @@
+         {MFMediaType_Video, MFVideoFormat_mp43},
+         {MFMediaType_Video, MFVideoFormat_MP42},
+         {MFMediaType_Video, MFVideoFormat_mp42},
++        {MFMediaType_Video, MFVideoFormat_VP80},
++        {MFMediaType_Video, MFVideoFormat_HEVC},
++        {MFMediaType_Video, MFVideoFormat_MJPG},
++        {MFMediaType_Video, MEDIASUBTYPE_MPEG1Payload},
++        {MFMediaType_Video, MFVideoFormat_MPG1},
++        {MFMediaType_Video, MFVideoFormat_MPEG2},
+     };
+     MFT_REGISTER_TYPE_INFO wmv_decoder_mft_outputs[] =
+     {
+@@ -122,6 +128,12 @@
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_mp43},
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_MP42},
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_mp42},
++        {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_VP80},
++        {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_HEVC},
++        {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_MJPG},
++        {.type = MEDIATYPE_Video, .subtype = MEDIASUBTYPE_MPEG1Payload},
++        {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_MPG1},
++        {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_MPEG2},
+     };
+     HRESULT hr;
+ 
+diff --git a/dlls/msauddecmft/msauddecmft.c b/dlls/msauddecmft/msauddecmft.c
+--- a/dlls/msauddecmft/msauddecmft.c
++++ b/dlls/msauddecmft/msauddecmft.c
+@@ -35,6 +35,8 @@
+ 
+ DEFINE_MEDIATYPE_GUID(MFAudioFormat_RAW_AAC,WAVE_FORMAT_RAW_AAC1);
+ DEFINE_MEDIATYPE_GUID(MFAudioFormat_ADPCM,WAVE_FORMAT_ADPCM);
++DEFINE_MEDIATYPE_GUID(MFAudioFormat_ALAW,WAVE_FORMAT_ALAW);
++DEFINE_MEDIATYPE_GUID(MFAudioFormat_MULAW,WAVE_FORMAT_MULAW);
+ static const GUID CLSID_WineAudioDecoder = {0x480b1517,0xc8e9,0x4eaf,{0xb0,0x06,0xe6,0x30,0x07,0x18,0xd8,0x5d}};
+ 
+ static HRESULT WINAPI audio_decoder_factory_CreateInstance(IClassFactory *iface, IUnknown *outer,
+@@ -127,6 +129,14 @@
+         {MFMediaType_Audio, MFAudioFormat_Vorbis},
+         {MFMediaType_Audio, MFAudioFormat_Opus},
+         {MFMediaType_Audio, MFAudioFormat_ADPCM},
++        {MFMediaType_Audio, MFAudioFormat_FLAC},
++        {MFMediaType_Audio, MFAudioFormat_Dolby_AC3},
++        {MFMediaType_Audio, MFAudioFormat_Dolby_DDPlus},
++        {MFMediaType_Audio, MFAudioFormat_DTS},
++        {MFMediaType_Audio, MFAudioFormat_ALAC},
++        {MFMediaType_Audio, MFAudioFormat_ALAW},
++        {MFMediaType_Audio, MFAudioFormat_MULAW},
++        {MFMediaType_Audio, MFAudioFormat_MPEG},
+     };
+     MFT_REGISTER_TYPE_INFO audio_decoder_mft_outputs[] =
+     {
+diff --git a/dlls/msmpeg2vdec/msmpeg2vdec.c b/dlls/msmpeg2vdec/msmpeg2vdec.c
+--- a/dlls/msmpeg2vdec/msmpeg2vdec.c
++++ b/dlls/msmpeg2vdec/msmpeg2vdec.c
+@@ -26,6 +26,14 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
+ 
+ static const GUID MFVideoFormat_mp4v = {MAKEFOURCC('m','p','4','v'), 0x0000, 0x0010,
++        {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID MFVideoFormat_DIVX = {MAKEFOURCC('D','I','V','X'), 0x0000, 0x0010,
++        {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID MFVideoFormat_DX50 = {MAKEFOURCC('D','X','5','0'), 0x0000, 0x0010,
++        {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID MFVideoFormat_FMP4 = {MAKEFOURCC('F','M','P','4'), 0x0000, 0x0010,
++        {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID MFVideoFormat_XVID = {MAKEFOURCC('X','V','I','D'), 0x0000, 0x0010,
+         {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+ static const GUID CLSID_MPEG4Part2DecoderMFT = {0x2d709e52, 0x123f, 0x49b5,
+         {0x9c, 0xbc, 0x9a, 0xf5, 0xcd, 0xe2, 0x8f, 0xb9}};
+@@ -81,6 +89,10 @@
+         {MFMediaType_Video, MFVideoFormat_MP4S},
+         {MFMediaType_Video, MFVideoFormat_MP4V},
+         {MFMediaType_Video, MFVideoFormat_mp4v},
++        {MFMediaType_Video, MFVideoFormat_DIVX},
++        {MFMediaType_Video, MFVideoFormat_DX50},
++        {MFMediaType_Video, MFVideoFormat_FMP4},
++        {MFMediaType_Video, MFVideoFormat_XVID},
+     };
+     HRESULT hr;
+ 

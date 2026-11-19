@@ -1,0 +1,57 @@
+Subject: [SE3-P3] winedmo: probe audio streams that lack a sample rate or channel count
+
+Raw FLAC never played: topology resolution failed with MF_E_NO_MORE_TYPES
+at every bit depth, while FLAC in Matroska played. FFmpeg's raw FLAC
+demuxer publishes only the time base, the duration and the STREAMINFO
+bytes when the file is opened; its parser fills in the sample rate and
+channel count while the stream is probed. Because the duration is already
+known, demuxer_create() skipped avformat_find_stream_info(), so the stream
+was published with 0 Hz and 0 channels and the audio decoder rejected it.
+
+Probe whenever an audio stream lacks its sample rate or channel count, as
+is already done for video without a frame rate. Containers that declare
+these fields (Matroska, MP4, Ogg) are not probed any more than before.
+
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -448,6 +448,29 @@
+     return av_rescale_q( 1, av_inv_q( frame_rate ), (AVRational){1, 10000000} );
+ }
+ 
++static BOOL context_has_audio_missing_format( const AVFormatContext *ctx )
++{
++    UINT i;
++
++    /* Raw FLAC publishes only its time base and duration when opened; sample
++     * rate and channels come from its parser while the stream is probed. */
++    for (i = 0; i < ctx->nb_streams; i++)
++    {
++        const AVCodecParameters *params = ctx->streams[i]->codecpar;
++
++        if (params->codec_type != AVMEDIA_TYPE_AUDIO)
++            continue;
++#if LIBAVUTIL_VERSION_MAJOR >= 58
++        if (!params->sample_rate || !params->ch_layout.nb_channels)
++#else
++        if (!params->sample_rate || !params->channels)
++#endif
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
+ static BOOL context_has_video_missing_frame_rate( const AVFormatContext *ctx )
+ {
+     UINT i;
+@@ -1165,7 +1188,7 @@
+     format = demuxer->ctx->iformat;
+     if ((params->duration = get_context_duration( demuxer->ctx, !demuxer->direct_url )) == AV_NOPTS_VALUE ||
+         strstr( format->name, "mp3" ) || strstr( format->name, "mpeg" ) || strstr( format->name, "hls" ) ||
+-        context_has_video_missing_frame_rate( demuxer->ctx ) ||
++        context_has_video_missing_frame_rate( demuxer->ctx ) || context_has_audio_missing_format( demuxer->ctx ) ||
+         (strstr( format->name, "mp4" ) && context_has_h264_codec_aligned_dimensions( demuxer->ctx )))
+     {
+         /* Opening and probing share one absolute network deadline. */
